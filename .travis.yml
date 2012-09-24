@@ -1,0 +1,4 @@
+language: c
+script: "make PREFIX=/usr IGNOREGIT=true MANDIR=/usr/share/man DOCDIR=/usr/share/doc/haproxy USE_PCRE=1 TARGET=linux26 USE_LINUX_SPLICE=1 USE_LINUX_TPROXY=1"
+before_script:
+  - sudo apt-get install -y libpcre-dev libc-dev adduser
