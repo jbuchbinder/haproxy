@@ -133,7 +133,8 @@ int get_backend_server(const char *bk_name, const char *sv_name,
  * "{cli|srv|con}timeout" in args[0].
  */
 static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
-                               struct proxy *defpx, char **err)
+                               struct proxy *defpx, const char *file, int line,
+                               char **err)
 {
 	unsigned timeout;
 	int retval, cap;
@@ -229,7 +230,8 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
  * parsed, and <defpx> to the default proxy or NULL.
  */
 static int proxy_parse_rate_limit(char **args, int section, struct proxy *proxy,
-                                  struct proxy *defpx, char **err)
+                                  struct proxy *defpx, const char *file, int line,
+                                  char **err)
 {
 	int retval, cap;
 	char *res;
@@ -444,6 +446,7 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->logformat);
 	LIST_INIT(&p->format_unique_id);
 	LIST_INIT(&p->conf.bind);
+	LIST_INIT(&p->conf.listeners);
 
 	/* Timeouts are defined as -1 */
 	proxy_reset_timeouts(p);
@@ -473,7 +476,7 @@ int start_proxies(int verbose)
 			continue; /* already initialized */
 
 		pxerr = 0;
-		for (listener = curproxy->listen; listener != NULL; listener = listener->next) {
+		list_for_each_entry(listener, &curproxy->conf.listeners, by_fe) {
 			if (listener->state != LI_ASSIGNED)
 				continue; /* already started */
 
@@ -637,7 +640,7 @@ int pause_proxy(struct proxy *p)
 	Warning("Pausing %s %s.\n", proxy_cap_str(p->cap), p->id);
 	send_log(p, LOG_WARNING, "Pausing %s %s.\n", proxy_cap_str(p->cap), p->id);
 
-	for (l = p->listen; l != NULL; l = l->next) {
+	list_for_each_entry(l, &p->conf.listeners, by_fe) {
 		if (!pause_listener(l))
 			p->state = PR_STERROR;
 	}
@@ -664,7 +667,7 @@ void stop_proxy(struct proxy *p)
 {
 	struct listener *l;
 
-	for (l = p->listen; l != NULL; l = l->next) {
+	list_for_each_entry(l, &p->conf.listeners, by_fe) {
 		unbind_listener(l);
 		if (l->state >= LI_ASSIGNED) {
 			delete_listener(l);
@@ -692,7 +695,7 @@ int resume_proxy(struct proxy *p)
 	send_log(p, LOG_WARNING, "Enabling %s %s.\n", proxy_cap_str(p->cap), p->id);
 
 	fail = 0;
-	for (l = p->listen; l != NULL; l = l->next) {
+	list_for_each_entry(l, &p->conf.listeners, by_fe) {
 		if (!resume_listener(l)) {
 			int port;
 

@@ -343,7 +343,7 @@ struct server *get_server_hh(struct session *s)
 	ctx.idx = 0;
 
 	/* if the message is chunked, we skip the chunk size, but use the value as len */
-	http_find_header2(px->hh_name, plen, b_ptr(&s->req->buf, s->req->buf.o), &txn->hdr_idx, &ctx);
+	http_find_header2(px->hh_name, plen, b_ptr(&s->req->buf, (int)-s->req->buf.o), &txn->hdr_idx, &ctx);
 
 	/* if the header is not found or empty, let's fallback to round robin */
 	if (!ctx.idx || !ctx.vlen)
@@ -1144,7 +1144,7 @@ int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->i,
+		req->buf.i,
 		req->analysers);
 
 	if (s->flags & SN_ASSIGNED)

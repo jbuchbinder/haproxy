@@ -105,17 +105,6 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 
 	proxy_inc_fe_conn_ctr(l, p);
 
-	/* if this session comes from a known monitoring system, we want to ignore
-	 * it as soon as possible, which means closing it immediately for TCP, but
-	 * cleanly.
-	 */
-	if (unlikely((l->options & LI_O_CHK_MONNET) &&
-		     addr->ss_family == AF_INET &&
-		     (((struct sockaddr_in *)addr)->sin_addr.s_addr & p->mon_mask.s_addr) == p->mon_net.s_addr)) {
-		s->flags |= SN_MONITOR;
-		s->logs.logwait = 0;
-	}
-
 	/* now evaluate the tcp-request layer4 rules. Since we expect to be able
 	 * to abort right here as soon as possible, we check the rules before
 	 * even initializing the stream interfaces.
@@ -127,15 +116,43 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 		goto out_free_session;
 	}
 
+	/* Adjust some socket options */
+	if (unlikely(fcntl(cfd, F_SETFL, O_NONBLOCK) == -1))
+		goto out_free_session;
+
+	/* monitor-net and health mode are processed immediately after TCP
+	 * connection rules. This way it's possible to block them, but they
+	 * never use the lower data layers, they send directly over the socket,
+	 * as they were designed for. We first flush the socket receive buffer
+	 * in order to avoid emission of an RST by the system. We ignore any
+	 * error.
+	 */
+	if (unlikely((p->mode == PR_MODE_HEALTH) ||
+		     ((l->options & LI_O_CHK_MONNET) &&
+		      addr->ss_family == AF_INET &&
+		      (((struct sockaddr_in *)addr)->sin_addr.s_addr & p->mon_mask.s_addr) == p->mon_net.s_addr))) {
+		/* we have 4 possibilities here :
+		 *  - HTTP mode, from monitoring address => send "HTTP/1.0 200 OK"
+		 *  - HEALTH mode with HTTP check => send "HTTP/1.0 200 OK"
+		 *  - HEALTH mode without HTTP check => just send "OK"
+		 *  - TCP mode from monitoring address => just close
+		 */
+		recv(cfd, trash, trashlen, 0&MSG_DONTWAIT);
+		if (p->mode == PR_MODE_HTTP ||
+		    (p->mode == PR_MODE_HEALTH && (p->options2 & PR_O2_CHK_ANY) == PR_O2_HTTP_CHK))
+			send(cfd, "HTTP/1.0 200 OK\r\n\r\n", 19, MSG_DONTWAIT|MSG_NOSIGNAL|MSG_MORE);
+		else if (p->mode == PR_MODE_HEALTH)
+			send(cfd, "OK\n", 3, MSG_DONTWAIT|MSG_NOSIGNAL|MSG_MORE);
+		ret = 0;
+		goto out_free_session;
+	}
+
+
 	/* wait for a PROXY protocol header */
 	if (l->options & LI_O_ACC_PROXY) {
 		s->si[0].conn.flags |= CO_FL_ACCEPT_PROXY;
 		conn_sock_want_recv(&s->si[0].conn);
 	}
-
-	/* Adjust some socket options */
-	if (unlikely(fcntl(cfd, F_SETFL, O_NONBLOCK) == -1))
-		goto out_free_session;
 
 	if (unlikely((t = task_new()) == NULL))
 		goto out_free_session;
@@ -243,7 +260,7 @@ static void kill_mini_session(struct session *s)
  */
 int conn_session_complete(struct connection *conn, int flag)
 {
-	struct session *s = container_of(conn, struct session, si[0].conn);
+	struct session *s = container_of(conn->owner, struct session, si[0]);
 
 	if (!(conn->flags & CO_FL_ERROR) && (session_complete(s) > 0)) {
 		conn->flags &= ~flag;
@@ -863,7 +880,7 @@ static void sess_update_stream_int(struct session *s, struct stream_interface *s
 		s->req, s->rep,
 		s->req->rex, s->rep->wex,
 		s->req->flags, s->rep->flags,
-		s->req->i, s->req->o, s->rep->i, s->rep->o, s->rep->cons->state, s->req->cons->state);
+		s->req->buf.i, s->req->buf.o, s->rep->buf.i, s->rep->buf.o, s->rep->cons->state, s->req->cons->state);
 
 	if (si->state == SI_ST_ASS) {
 		/* Server assigned to connection request, we have to try to connect now */
@@ -1051,7 +1068,7 @@ static void sess_prepare_conn_req(struct session *s, struct stream_interface *si
 		s->req, s->rep,
 		s->req->rex, s->rep->wex,
 		s->req->flags, s->rep->flags,
-		s->req->i, s->req->o, s->rep->i, s->rep->o, s->rep->cons->state, s->req->cons->state);
+		s->req->buf.i, s->req->buf.o, s->rep->buf.i, s->rep->buf.o, s->rep->cons->state, s->req->cons->state);
 
 	if (si->state != SI_ST_REQ)
 		return;
@@ -1100,7 +1117,7 @@ static int process_switching_rules(struct session *s, struct channel *req, int a
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->i,
+		req->buf.i,
 		req->analysers);
 
 	/* now check whether we have some switching rules for this request */
@@ -1195,7 +1212,7 @@ static int process_server_rules(struct session *s, struct channel *req, int an_b
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->i + req->o,
+		req->buf.i + req->buf.o,
 		req->analysers);
 
 	if (!(s->flags & SN_ASSIGNED)) {
@@ -1244,7 +1261,7 @@ static int process_sticking_rules(struct session *s, struct channel *req, int an
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->i,
+		req->buf.i,
 		req->analysers);
 
 	list_for_each_entry(rule, &px->sticking_rules, list) {
@@ -1334,7 +1351,7 @@ static int process_store_rules(struct session *s, struct channel *rep, int an_bi
 		rep,
 		rep->rex, rep->wex,
 		rep->flags,
-		rep->i,
+		rep->buf.i,
 		rep->analysers);
 
 	list_for_each_entry(rule, &px->storersp_rules, list) {
@@ -1581,7 +1598,7 @@ struct task *process_session(struct task *t)
 		s->req, s->rep,
 		s->req->rex, s->rep->wex,
 		s->req->flags, s->rep->flags,
-		s->req->i, s->req->o, s->rep->i, s->rep->o, s->rep->cons->state, s->req->cons->state,
+		s->req->buf.i, s->req->buf.o, s->rep->buf.i, s->rep->buf.o, s->rep->cons->state, s->req->cons->state,
 		s->rep->cons->err_type, s->req->cons->err_type,
 		s->req->cons->conn_retries);
 

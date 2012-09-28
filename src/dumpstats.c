@@ -151,7 +151,7 @@ static int stats_accept(struct session *s)
 /* allocate a new stats frontend named <name>, and return it
  * (or NULL in case of lack of memory).
  */
-static struct proxy *alloc_stats_fe(const char *name)
+static struct proxy *alloc_stats_fe(const char *name, const char *file, int line)
 {
 	struct proxy *fe;
 
@@ -166,7 +166,9 @@ static struct proxy *alloc_stats_fe(const char *name)
 	fe->cap = PR_CAP_FE;
 	fe->maxconn = 10;                 /* default to 10 concurrent connections */
 	fe->timeout.client = MS_TO_TICKS(10000); /* default timeout of 10 seconds */
-
+	fe->conf.file = strdup(file);
+	fe->conf.line = line;
+	fe->accept = stats_accept;
 	return fe;
 }
 
@@ -177,109 +179,84 @@ static struct proxy *alloc_stats_fe(const char *name)
  * the first word after "stats".
  */
 static int stats_parse_global(char **args, int section_type, struct proxy *curpx,
-			      struct proxy *defpx, char **err)
+                              struct proxy *defpx, const char *file, int line,
+                              char **err)
 {
+	struct bind_conf *bind_conf;
+	struct listener *l;
+
 	if (!strcmp(args[1], "socket")) {
-		struct sockaddr_un *su;
 		int cur_arg;
 
 		if (*args[2] == 0) {
-			memprintf(err, "'%s %s' in global section expects a path to a UNIX socket", args[0], args[1]);
+			memprintf(err, "'%s %s' in global section expects an address or a path to a UNIX socket", args[0], args[1]);
 			return -1;
 		}
-
-		if (global.stats_sock.state != LI_NEW) {
-			memprintf(err, "'%s %s' already specified in global section", args[0], args[1]);
-			return -1;
-		}
-
-		su = str2sun(args[2]);
-		if (!su) {
-			memprintf(err, "'%s %s' : path would require truncation", args[0], args[1]);
-			return -1;
-		}
-		memcpy(&global.stats_sock.addr, su, sizeof(struct sockaddr_un)); // guaranteed to fit
 
 		if (!global.stats_fe) {
-			if ((global.stats_fe = alloc_stats_fe("GLOBAL")) == NULL) {
+			if ((global.stats_fe = alloc_stats_fe("GLOBAL", file, line)) == NULL) {
 				memprintf(err, "'%s %s' : out of memory trying to allocate a frontend", args[0], args[1]);
 				return -1;
 			}
 		}
 
-		global.stats_sock.state = LI_INIT;
-		global.stats_sock.options = LI_O_UNLIMITED;
-		global.stats_sock.accept = session_accept;
-		global.stats_fe->accept = stats_accept;
-		global.stats_sock.handler = process_session;
-		global.stats_sock.analysers = 0;
-		global.stats_sock.nice = -64;  /* we want to boost priority for local stats */
-		global.stats_sock.frontend = global.stats_fe;
-		global.stats_sock.perm.ux.level = ACCESS_LVL_OPER; /* default access level */
-		global.stats_sock.maxconn = global.stats_fe->maxconn;
-		global.stats_sock.timeout = &global.stats_fe->timeout.client;
+		bind_conf = bind_conf_alloc(&global.stats_fe->conf.bind, file, line, args[2]);
+		bind_conf->level = ACCESS_LVL_OPER; /* default access level */
 
-		global.stats_sock.next  = global.stats_fe->listen;
-		global.stats_fe->listen = &global.stats_sock;
+		if (!str2listener(args[2], global.stats_fe, bind_conf, file, line, err)) {
+			memprintf(err, "parsing [%s:%d] : '%s %s' : %s\n",
+			          file, line, args[0], args[1], err && *err ? *err : "error");
+			return -1;
+		}
 
 		cur_arg = 3;
 		while (*args[cur_arg]) {
-			if (!strcmp(args[cur_arg], "uid")) {
-				global.stats_sock.perm.ux.uid = atol(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "gid")) {
-				global.stats_sock.perm.ux.gid = atol(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "mode")) {
-				global.stats_sock.perm.ux.mode = strtol(args[cur_arg + 1], NULL, 8);
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "user")) {
-				struct passwd *user;
-				user = getpwnam(args[cur_arg + 1]);
-				if (!user) {
-					memprintf(err, "'%s %s' : unknown user '%s'", args[0], args[1], args[cur_arg + 1]);
+			static int bind_dumped;
+			struct bind_kw *kw;
+
+			kw = bind_find_kw(args[cur_arg]);
+			if (kw) {
+				if (!kw->parse) {
+					memprintf(err, "'%s %s' : '%s' option is not implemented in this version (check build options).",
+						  args[0], args[1], args[cur_arg]);
 					return -1;
 				}
-				global.stats_sock.perm.ux.uid = user->pw_uid;
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "group")) {
-				struct group *group;
-				group = getgrnam(args[cur_arg + 1]);
-				if (!group) {
-					memprintf(err, "'%s %s' : unknown group '%s'", args[0], args[1], args[cur_arg + 1]);
+
+				if (kw->parse(args, cur_arg, curpx, bind_conf, err) != 0) {
+					if (err && *err)
+						memprintf(err, "'%s %s' : '%s'", args[0], args[1], *err);
+					else
+						memprintf(err, "'%s %s' : error encountered while processing '%s'",
+						          args[0], args[1], args[cur_arg]);
 					return -1;
 				}
-				global.stats_sock.perm.ux.gid = group->gr_gid;
-				cur_arg += 2;
+
+				cur_arg += 1 + kw->skip;
+				continue;
 			}
-			else if (!strcmp(args[cur_arg], "level")) {
-				if (!strcmp(args[cur_arg+1], "user"))
-					global.stats_sock.perm.ux.level = ACCESS_LVL_USER;
-				else if (!strcmp(args[cur_arg+1], "operator"))
-					global.stats_sock.perm.ux.level = ACCESS_LVL_OPER;
-				else if (!strcmp(args[cur_arg+1], "admin"))
-					global.stats_sock.perm.ux.level = ACCESS_LVL_ADMIN;
-				else {
-					memprintf(err, "'%s %s' : '%s' only supports 'user', 'operator', and 'admin' (got '%s')",
-						  args[0], args[1], args[cur_arg], args[cur_arg+1]);
-					return -1;
-				}
-				cur_arg += 2;
+
+			if (!bind_dumped) {
+				bind_dump_kws(err);
+				indent_msg(err, 4);
+				bind_dumped = 1;
 			}
-			else {
-				memprintf(err, "'%s %s' only supports 'user', 'uid', 'group', 'gid', 'level', and 'mode' (got '%s')",
-					  args[0], args[1], args[cur_arg]);
-				return -1;
-			}
+
+			memprintf(err, "'%s %s' : unknown keyword '%s'.%s%s",
+			          args[0], args[1], args[cur_arg],
+			          err && *err ? " Registered keywords :" : "", err && *err ? *err : "");
+			return -1;
 		}
 
-		global.stats_sock.data = &raw_sock;
-		uxst_add_listener(&global.stats_sock);
-		global.maxsock++;
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			l->maxconn = global.stats_fe->maxconn;
+			l->backlog = global.stats_fe->backlog;
+			l->timeout = &global.stats_fe->timeout.client;
+			l->accept = session_accept;
+			l->handler = process_session;
+			l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
+			l->nice = -64;  /* we want to boost priority for local stats */
+			global.maxsock += l->maxconn;
+		}
 	}
 	else if (!strcmp(args[1], "timeout")) {
 		unsigned timeout;
@@ -295,7 +272,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 			return -1;
 		}
 		if (!global.stats_fe) {
-			if ((global.stats_fe = alloc_stats_fe("GLOBAL")) == NULL) {
+			if ((global.stats_fe = alloc_stats_fe("GLOBAL", file, line)) == NULL) {
 				memprintf(err, "'%s %s' : out of memory trying to allocate a frontend", args[0], args[1]);
 				return -1;
 			}
@@ -311,7 +288,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 		}
 
 		if (!global.stats_fe) {
-			if ((global.stats_fe = alloc_stats_fe("GLOBAL")) == NULL) {
+			if ((global.stats_fe = alloc_stats_fe("GLOBAL", file, line)) == NULL) {
 				memprintf(err, "'%s %s' : out of memory trying to allocate a frontend", args[0], args[1]);
 				return -1;
 			}
@@ -426,7 +403,7 @@ static int stats_dump_table_head_to_buffer(struct chunk *msg, struct stream_inte
 
 	/* any other information should be dumped here */
 
-	if (target && s->listener->perm.ux.level < ACCESS_LVL_OPER)
+	if (target && s->listener->bind_conf->level < ACCESS_LVL_OPER)
 		chunk_printf(msg, "# contents not dumped due to insufficient privileges\n");
 
 	if (bi_putchk(si->ib, msg) == -1)
@@ -575,7 +552,7 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 	}
 
 	/* check permissions */
-	if (s->listener->perm.ux.level < ACCESS_LVL_OPER) {
+	if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
 		si->applet.ctx.cli.msg = stats_permission_denied_msg;
 		si->applet.st0 = STAT_CLI_PRINT;
 		return;
@@ -763,7 +740,7 @@ static struct proxy *expect_frontend_admin(struct session *s, struct stream_inte
 {
 	struct proxy *px;
 
-	if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
+	if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
 		si->applet.ctx.cli.msg = stats_permission_denied_msg;
 		si->applet.st0 = STAT_CLI_PRINT;
 		return NULL;
@@ -795,7 +772,7 @@ static struct server *expect_server_admin(struct session *s, struct stream_inter
 	struct server *sv;
 	char *line;
 
-	if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
+	if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
 		si->applet.ctx.cli.msg = stats_permission_denied_msg;
 		si->applet.st0 = STAT_CLI_PRINT;
 		return NULL;
@@ -887,7 +864,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 		}
 		else if (strcmp(args[1], "sess") == 0) {
 			si->conn.data_st = STAT_ST_INIT;
-			if (s->listener->perm.ux.level < ACCESS_LVL_OPER) {
+			if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
 				si->applet.st0 = STAT_CLI_PRINT;
 				return 1;
@@ -901,7 +878,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			si->applet.st0 = STAT_CLI_O_SESS; // stats_dump_sess_to_buffer
 		}
 		else if (strcmp(args[1], "errors") == 0) {
-			if (s->listener->perm.ux.level < ACCESS_LVL_OPER) {
+			if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
 				si->applet.st0 = STAT_CLI_PRINT;
 				return 1;
@@ -932,8 +909,8 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				clrall = 1;
 
 			/* check permissions */
-			if (s->listener->perm.ux.level < ACCESS_LVL_OPER ||
-			    (clrall && s->listener->perm.ux.level < ACCESS_LVL_ADMIN)) {
+			if (s->listener->bind_conf->level < ACCESS_LVL_OPER ||
+			    (clrall && s->listener->bind_conf->level < ACCESS_LVL_ADMIN)) {
 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
 				si->applet.st0 = STAT_CLI_PRINT;
 				return 1;
@@ -967,7 +944,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 						sv->counters.sps_max = 0;
 					}
 
-				for (li = px->listen; li; li = li->next)
+				list_for_each_entry(li, &px->conf.listeners, by_fe)
 					if (li->counters) {
 						if (clrall)
 							memset(li->counters, 0, sizeof(*li->counters));
@@ -1136,8 +1113,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				}
 
 				v = atoi(args[4]);
-				/* check for unlimited values, we restore default setting (cfg_maxpconn) */
-				if (v < 1) {
+				if (v < 0) {
 					si->applet.ctx.cli.msg = "Value out of range.\n";
 					si->applet.st0 = STAT_CLI_PRINT;
 					return 1;
@@ -1147,7 +1123,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				 * its listeners. The blocked ones will be dequeued.
 				 */
 				px->maxconn = v;
-				for (l = px->listen; l != NULL; l = l->next) {
+				list_for_each_entry(l, &px->conf.listeners, by_fe) {
 					l->maxconn = v;
 					if (l->state == LI_FULL)
 						resume_listener(l);
@@ -1161,7 +1137,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			else if (strcmp(args[2], "global") == 0) {
 				int v;
 
-				if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
+				if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
 					si->applet.ctx.cli.msg = stats_permission_denied_msg;
 					si->applet.st0 = STAT_CLI_PRINT;
 					return 1;
@@ -1203,7 +1179,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				if (strcmp(args[3], "global") == 0) {
 					int v;
 
-					if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
+					if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
 						si->applet.ctx.cli.msg = stats_permission_denied_msg;
 						si->applet.st0 = STAT_CLI_PRINT;
 						return 1;
@@ -1382,7 +1358,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 		else if (strcmp(args[1], "session") == 0) {
 			struct session *sess, *ptr;
 
-			if (s->listener->perm.ux.level < ACCESS_LVL_ADMIN) {
+			if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
 				si->applet.ctx.cli.msg = stats_permission_denied_msg;
 				si->applet.st0 = STAT_CLI_PRINT;
 				return 1;
@@ -1637,7 +1613,7 @@ static void cli_io_handler(struct stream_interface *si)
  out:
 	DPRINTF(stderr, "%s@%d: st=%d, rqf=%x, rpf=%x, rqh=%d, rqs=%d, rh=%d, rs=%d\n",
 		__FUNCTION__, __LINE__,
-		si->state, req->flags, res->flags, req->i, req->o, res->i, res->o);
+		si->state, req->flags, res->flags, req->buf.i, req->buf.o, res->buf.i, res->buf.o);
 
 	if (unlikely(si->state == SI_ST_DIS || si->state == SI_ST_CLO)) {
 		/* check that we have released everything then unregister */
@@ -2506,17 +2482,17 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 				return 0;
 		}
 
-		si->applet.ctx.stats.l = px->listen; /* may be NULL */
+		si->applet.ctx.stats.l = px->conf.listeners.n;
 		si->applet.ctx.stats.px_st = STAT_PX_ST_LI;
 		/* fall through */
 
 	case STAT_PX_ST_LI:
 		/* stats.l has been initialized above */
-		for (; si->applet.ctx.stats.l != NULL; si->applet.ctx.stats.l = l->next) {
+		for (; si->applet.ctx.stats.l != &px->conf.listeners; si->applet.ctx.stats.l = l->by_fe.n) {
 			if (buffer_almost_full(&rep->buf))
 				return 0;
 
-			l = si->applet.ctx.stats.l;
+			l = LIST_ELEM(si->applet.ctx.stats.l, struct listener *, by_fe);
 			if (!l->counters)
 				continue;
 
@@ -3806,7 +3782,7 @@ static int stats_table_request(struct stream_interface *si, bool show)
 					return 0;
 
 				if (si->applet.ctx.table.target &&
-				    s->listener->perm.ux.level >= ACCESS_LVL_OPER) {
+				    s->listener->bind_conf->level >= ACCESS_LVL_OPER) {
 					/* dump entries only if table explicitly requested */
 					eb = ebmb_first(&si->applet.ctx.table.proxy->table.keys);
 					if (eb) {
@@ -4120,6 +4096,29 @@ static int stats_dump_errors_to_buffer(struct stream_interface *si)
 	return 1;
 }
 
+/* parse the "level" argument on the bind lines */
+static int bind_parse_level(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing level", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (!strcmp(args[cur_arg+1], "user"))
+		conf->level = ACCESS_LVL_USER;
+	else if (!strcmp(args[cur_arg+1], "operator"))
+		conf->level = ACCESS_LVL_OPER;
+	else if (!strcmp(args[cur_arg+1], "admin"))
+		conf->level = ACCESS_LVL_ADMIN;
+	else {
+		memprintf(err, "'%s' only supports 'user', 'operator', and 'admin' (got '%s')",
+			  args[cur_arg], args[cur_arg+1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	return 0;
+}
+
 struct si_applet http_stats_applet = {
 	.name = "<STATS>", /* used for logging */
 	.fct = http_stats_io_handler,
@@ -4137,10 +4136,16 @@ static struct cfg_kw_list cfg_kws = {{ },{
 	{ 0, NULL, NULL },
 }};
 
+static struct bind_kw_list bind_kws = { "STAT", { }, {
+	{ "level",    bind_parse_level,    1 }, /* set the unix socket admin level */
+	{ NULL, NULL, 0 },
+}};
+
 __attribute__((constructor))
 static void __dumpstats_module_init(void)
 {
 	cfg_register_keywords(&cfg_kws);
+	bind_register_keywords(&bind_kws);
 }
 
 /*

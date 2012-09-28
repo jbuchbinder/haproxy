@@ -190,9 +190,11 @@ static struct cfg_kw_list cfg_keywords = {
  *  - <port> is a numerical port from 1 to 65535 ;
  *  - <end> indicates to use the range from <port> to <end> instead (inclusive).
  * This can be repeated as many times as necessary, separated by a coma.
- * Function returns 1 for success or 0 if error.
+ * Function returns 1 for success or 0 if error. In case of errors, if <err> is
+ * not NULL, it must be a valid pointer to either NULL or a freeable area that
+ * will be replaced with an error message.
  */
-static int str2listener(char *str, struct proxy *curproxy, const char *file, int line)
+int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf, const char *file, int line, char **err)
 {
 	struct listener *l;
 	char *next, *dupstr;
@@ -216,8 +218,7 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 			int max_path_len = (sizeof(((struct sockaddr_un *)&ss)->sun_path) - 1) - (prefix_path_len + 1 + 5 + 1 + 3);
 
 			if (strlen(str) > max_path_len) {
-                                Alert("parsing [%s:%d] : socket path '%s' too long (max %d)\n",
-				      file, line, str, max_path_len);
+				memprintf(err, "socket path '%s' too long (max %d)\n", str, max_path_len);
 				goto fail;
 			}
 
@@ -237,14 +238,12 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 
 			ss2 = str2sa_range(str, &port, &end);
 			if (!ss2) {
-				Alert("parsing [%s:%d] : invalid listening address: '%s'\n",
-				      file, line, str);
+				memprintf(err, "invalid listening address: '%s'\n", str);
 				goto fail;
 			}
 
 			if (!port) {
-				Alert("parsing [%s:%d] : missing port number: '%s'\n",
-				      file, line, str);
+				memprintf(err, "missing port number: '%s'\n", str);
 				goto fail;
 			}
 
@@ -252,22 +251,22 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 			ss = *ss2;
 
 			if (port < 1 || port > 65535) {
-				Alert("parsing [%s:%d] : invalid port '%d' specified for address '%s'.\n",
-				      file, line, port, str);
+				memprintf(err, "invalid port '%d' specified for address '%s'.\n", port, str);
 				goto fail;
 			}
 
 			if (end < 1 || end > 65535) {
-				Alert("parsing [%s:%d] : invalid port '%d' specified for address '%s'.\n",
-				      file, line, end, str);
+				memprintf(err, "invalid port '%d' specified for address '%s'.\n", end, str);
 				goto fail;
 			}
 		}
 
 		for (; port <= end; port++) {
 			l = (struct listener *)calloc(1, sizeof(struct listener));
-			l->next = curproxy->listen;
-			curproxy->listen = l;
+			LIST_ADDQ(&curproxy->conf.listeners, &l->by_fe);
+			LIST_ADDQ(&bind_conf->listeners, &l->by_bind);
+			l->frontend = curproxy;
+			l->bind_conf = bind_conf;
 
 			l->fd = -1;
 			l->addr = ss;
@@ -283,8 +282,6 @@ static int str2listener(char *str, struct proxy *curproxy, const char *file, int
 				tcpv6_add_listener(l);
 			}
 			else {
-				l->perm.ux.gid = l->perm.ux.uid = -1;
-				l->perm.ux.mode = 0;
 				uxst_add_listener(l);
 			}
 
@@ -1069,7 +1066,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 					/* prepare error message just in case */
 					snprintf(trash, trashlen,
 						 "error near '%s' in '%s' section", args[0], "global");
-					rc = kwl->kw[index].parse(args, CFG_GLOBAL, NULL, NULL, &errmsg);
+					rc = kwl->kw[index].parse(args, CFG_GLOBAL, NULL, NULL, file, linenum, &errmsg);
 					if (rc < 0) {
 						Alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
 						err_code |= ERR_ALERT | ERR_FATAL;
@@ -1212,6 +1209,8 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	static struct peers *curpeers = NULL;
 	struct peer *newpeer = NULL;
 	const char *err;
+	struct bind_conf *bind_conf;
+	struct listener *l;
 	int err_code = 0;
 
 	if (strcmp(args[0], "peers") == 0) { /* new peers section */
@@ -1252,6 +1251,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		char *rport, *raddr;
 		short realport = 0;
 		struct sockaddr_storage *sk;
+		char *err_msg = NULL;
 
 		if (!*args[2]) {
 			Alert("parsing [%s:%d] : '%s' expects <name> and <addr>[:<port>] as arguments.\n",
@@ -1309,7 +1309,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		newpeer->data  = &raw_sock;
 		newpeer->sock_init_arg = NULL;
 
-		if (!sk) {
+		if (!newpeer->proto) {
 			Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
 			      file, linenum, newpeer->addr.ss_family, args[2]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -1340,19 +1340,32 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				curpeers->peers_fe->timeout.connect = 5000;
 				curpeers->peers_fe->accept = peer_accept;
 				curpeers->peers_fe->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON | PR_O2_SMARTACC;
-				if (!str2listener(args[2], curpeers->peers_fe, file, linenum)) {
+
+				bind_conf = bind_conf_alloc(&curpeers->peers_fe->conf.bind, file, linenum, args[2]);
+
+				if (!str2listener(args[2], curpeers->peers_fe, bind_conf, file, linenum, &err_msg)) {
+					if (err_msg && *err_msg) {
+						indent_msg(&err_msg, 2);
+						Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err_msg);
+					}
+					else
+						Alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
+						      file, linenum, args[0], args[1], args[2]);
+					free(err_msg);
 					err_code |= ERR_FATAL;
 					goto out;
 				}
-				curpeers->peers_fe->listen->maxconn = ((struct proxy *)curpeers->peers_fe)->maxconn;
-				curpeers->peers_fe->listen->backlog = ((struct proxy *)curpeers->peers_fe)->backlog;
-				curpeers->peers_fe->listen->timeout = &((struct proxy *)curpeers->peers_fe)->timeout.client;
-				curpeers->peers_fe->listen->accept = session_accept;
-				curpeers->peers_fe->listen->frontend =  ((struct proxy *)curpeers->peers_fe);
-				curpeers->peers_fe->listen->handler = process_session;
-				curpeers->peers_fe->listen->analysers |=  ((struct proxy *)curpeers->peers_fe)->fe_req_ana;
-				curpeers->peers_fe->listen->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
-				global.maxsock += curpeers->peers_fe->listen->maxconn;
+
+				list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+					l->maxconn = ((struct proxy *)curpeers->peers_fe)->maxconn;
+					l->backlog = ((struct proxy *)curpeers->peers_fe)->backlog;
+					l->timeout = &((struct proxy *)curpeers->peers_fe)->timeout.client;
+					l->accept = session_accept;
+					l->handler = process_session;
+					l->analysers |=  ((struct proxy *)curpeers->peers_fe)->fe_req_ana;
+					l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
+					global.maxsock += l->maxconn;
+				}
 			}
 		}
 	} /* neither "peer" nor "peers" */
@@ -1446,14 +1459,25 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		/* parse the listener address if any */
 		if ((curproxy->cap & PR_CAP_FE) && *args[2]) {
-			struct listener *new, *last = curproxy->listen;
-			if (!str2listener(args[2], curproxy, file, linenum)) {
+			struct listener *l;
+			char *err_msg = NULL;
+
+			bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[2]);
+
+			if (!str2listener(args[2], curproxy, bind_conf, file, linenum, &err_msg)) {
+				if (err_msg && *err_msg) {
+					indent_msg(&err_msg, 2);
+					Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err_msg);
+				}
+				else
+					Alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address '%s'.\n",
+					      file, linenum, args[0], args[1], args[2]);
+				free(err_msg);
 				err_code |= ERR_FATAL;
 				goto out;
 			}
-			new = curproxy->listen;
-			while (new != last) {
-				new = new->next;
+
+			list_for_each_entry(l, &bind_conf->listeners, by_bind) {
 				global.maxsock++;
 			}
 		}
@@ -1666,8 +1690,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 	/* Now let's parse the proxy-specific keywords */
 	if (!strcmp(args[0], "bind")) {  /* new listen addresses */
-		struct listener *new_listen, *last_listen;
+		struct listener *l;
 		int cur_arg;
+		char *err_msg = NULL;
 
 		if (curproxy == &defproxy) {
 			Alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
@@ -1684,29 +1709,31 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		last_listen = curproxy->listen;
 		bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[1]);
+		memcpy(&bind_conf->ux, &global.unix_bind.ux, sizeof(global.unix_bind.ux));
 
 		/* NOTE: the following line might create several listeners if there
 		 * are comma-separated IPs or port ranges. So all further processing
 		 * will have to be applied to all listeners created after last_listen.
 		 */
-		if (!str2listener(args[1], curproxy, file, linenum)) {
+		if (!str2listener(args[1], curproxy, bind_conf, file, linenum, &err_msg)) {
+			if (err_msg && *err_msg) {
+				indent_msg(&err_msg, 2);
+				Alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], err_msg);
+			}
+			else
+				Alert("parsing [%s:%d] : '%s' : error encountered while parsing listening address '%s'.\n",
+				      file, linenum, args[0], args[1]);
+			free(err_msg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
-		new_listen = curproxy->listen;
-		while (new_listen != last_listen) {
-			new_listen->bind_conf = bind_conf;
-			new_listen = new_listen->next;
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			/* Set default global rights and owner for unix bind  */
 			global.maxsock++;
 		}
 
-		/* Set default global rights and owner for unix bind  */
-		if (curproxy->listen->addr.ss_family == AF_UNIX) {
-			memcpy(&(curproxy->listen->perm.ux), &(global.unix_bind.ux), sizeof(global.unix_bind.ux));
-		}
 		cur_arg = 2;
 		while (*(args[cur_arg])) {
 			static int bind_dumped;
@@ -1726,7 +1753,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					goto out;
 				}
 
-				code = kw->parse(args, cur_arg, curproxy, last_listen, &err);
+				code = kw->parse(args, cur_arg, curproxy, bind_conf, &err);
 				err_code |= code;
 
 				if (code) {
@@ -3924,7 +3951,7 @@ stats_error_parsing:
 			newsrv->proto = protocol_by_family(newsrv->addr.ss_family);
 			newsrv->data  = &raw_sock;
 
-			if (!sk) {
+			if (!newsrv->proto) {
 				Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
 				      file, linenum, newsrv->addr.ss_family, args[2]);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -4512,9 +4539,13 @@ stats_error_parsing:
 				 * the server either. We'll check if we have
 				 * a known port on the first listener.
 				 */
-				struct listener *l = curproxy->listen;
-				while (l && !(newsrv->check_port = get_host_port(&l->addr)))
-					l = l->next;
+				struct listener *l;
+
+				list_for_each_entry(l, &curproxy->conf.listeners, by_fe) {
+					newsrv->check_port = get_host_port(&l->addr);
+					if (newsrv->check_port)
+						break;
+				}
 			}
 			if (!newsrv->check_port) {
 				Alert("parsing [%s:%d] : server %s has neither service port nor check port. Check has been disabled.\n",
@@ -4817,7 +4848,7 @@ stats_error_parsing:
 				continue;
 			}
 			Alert("parsing [%s:%d] : '%s' only supports optional keywords '%s' and '%s'.\n",
-			      file, linenum, args[0], "inteface", "usesrc");
+			      file, linenum, args[0], "interface", "usesrc");
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -5184,7 +5215,7 @@ stats_error_parsing:
 					/* prepare error message just in case */
 					snprintf(trash, trashlen,
 						 "error near '%s' in %s section", args[0], cursection);
-					rc = kwl->kw[index].parse(args, CFG_LISTEN, curproxy, &defproxy, &errmsg);
+					rc = kwl->kw[index].parse(args, CFG_LISTEN, curproxy, &defproxy, file, linenum, &errmsg);
 					if (rc < 0) {
 						Alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
 						err_code |= ERR_ALERT | ERR_FATAL;
@@ -5678,7 +5709,7 @@ int check_config_validity()
 			break;
 		}
 
-		if ((curproxy->cap & PR_CAP_FE) && (curproxy->listen == NULL))  {
+		if ((curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners))  {
 			Alert("config : %s '%s' has no listen address. Please either specify a valid address on the <listen> line, or use the <bind> keyword.\n",
 			      proxy_type_str(curproxy), curproxy->id);
 			cfgerr++;
@@ -6490,20 +6521,6 @@ out_uri_auth_compat:
 				curproxy->be_req_ana |= AN_REQ_PRST_RDP_COOKIE;
 		}
 
-		listener = NULL;
-		while (curproxy->listen) {
-			struct listener *next;
-
-			next = curproxy->listen->next;
-			curproxy->listen->next = listener;
-			listener = curproxy->listen;
-
-			if (!next)
-				break;
-
-			curproxy->listen = next;
-		}
-
 		/* Configure SSL for each bind line.
 		 * Note: if configuration fails at some point, the ->ctx member
 		 * remains NULL so that listeners can later detach.
@@ -6532,8 +6549,7 @@ out_uri_auth_compat:
 
 		/* adjust this proxy's listeners */
 		next_id = 1;
-		listener = curproxy->listen;
-		while (listener) {
+		list_for_each_entry(listener, &curproxy->conf.listeners, by_fe) {
 			if (!listener->luid) {
 				/* listener ID not set, use automatic numbering with first
 				 * spare entry starting with next_luid.
@@ -6552,10 +6568,7 @@ out_uri_auth_compat:
 					listener->name = strdup(trash);
 				}
 			}
-#ifdef USE_OPENSSL
-			if (listener->bind_conf->is_ssl && listener->bind_conf->default_ctx)
-				listener->data = &ssl_sock; /* SSL data layer */
-#endif
+
 			if (curproxy->options & PR_O_TCP_NOLING)
 				listener->options |= LI_O_NOLINGER;
 			if (!listener->maxconn)
@@ -6564,7 +6577,6 @@ out_uri_auth_compat:
 				listener->backlog = curproxy->backlog;
 			listener->timeout = &curproxy->timeout.client;
 			listener->accept = session_accept;
-			listener->frontend = curproxy;
 			listener->handler = process_session;
 			listener->analysers |= curproxy->fe_req_ana;
 
@@ -6579,9 +6591,6 @@ out_uri_auth_compat:
 			    ((curproxy->mode == PR_MODE_HTTP || listener->bind_conf->is_ssl) &&
 			     !(curproxy->no_options2 & PR_O2_SMARTACC)))
 				listener->options |= LI_O_NOQUICKACK;
-
-			/* We want the use_backend and default_backend rules to apply */
-			listener = listener->next;
 		}
 
 		/* Release unused SSL configs */

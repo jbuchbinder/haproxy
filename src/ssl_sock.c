@@ -264,25 +264,22 @@ static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf
 
 	ctx = SSL_CTX_new(SSLv23_server_method());
 	if (!ctx) {
-		if (err)
-			memprintf(err, "%sunable to allocate SSL context for cert '%s'.\n",
-				  *err ? *err : "", path);
+		memprintf(err, "%sunable to allocate SSL context for cert '%s'.\n",
+		          err && *err ? *err : "", path);
 		return 1;
 	}
 
 	if (SSL_CTX_use_PrivateKey_file(ctx, path, SSL_FILETYPE_PEM) <= 0) {
-		if (err)
-			memprintf(err, "%sunable to load SSL private key from PEM file '%s'.\n",
-				  *err ? *err : "", path);
+		memprintf(err, "%sunable to load SSL private key from PEM file '%s'.\n",
+		          err && *err ? *err : "", path);
 		SSL_CTX_free(ctx);
 		return 1;
 	}
 
 	ret = ssl_sock_load_cert_chain_file(ctx, path, bind_conf);
 	if (ret <= 0) {
-		if (err)
-			memprintf(err, "%sunable to load SSL certificate from PEM file '%s'.\n",
-				  *err ? *err : "", path);
+		memprintf(err, "%sunable to load SSL certificate from PEM file '%s'.\n",
+		          err && *err ? *err : "", path);
 		if (ret < 0) /* serious error, must do that ourselves */
 			SSL_CTX_free(ctx);
 		return 1;
@@ -292,9 +289,8 @@ static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf
 	 */
 #ifndef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	if (bind_conf->default_ctx) {
-		if (err)
-			memprintf(err, "%sthis version of openssl cannot load multiple SSL certificates.\n",
-				  *err ? *err : "");
+		memprintf(err, "%sthis version of openssl cannot load multiple SSL certificates.\n",
+		          err && *err ? *err : "");
 		return 1;
 	}
 #endif
@@ -327,9 +323,8 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, struct proxy *cu
 	while ((de = readdir(dir))) {
 		snprintf(fp, pathlen + 1 + NAME_MAX + 1, "%s/%s", path, de->d_name);
 		if (stat(fp, &buf) != 0) {
-			if (err)
-				memprintf(err, "%sunable to stat SSL certificate from file '%s' : %s.\n",
-					  *err ? *err : "", fp, strerror(errno));
+			memprintf(err, "%sunable to stat SSL certificate from file '%s' : %s.\n",
+			          err && *err ? *err : "", fp, strerror(errno));
 			cfgerr++;
 			continue;
 		}
@@ -819,58 +814,61 @@ smp_fetch_ssl_sni(struct proxy *px, struct session *l4, void *l7, unsigned int o
 }
 
 /* parse the "ciphers" bind keyword */
-static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	if (!*args[cur_arg + 1]) {
-		if (err)
-			memprintf(err, "'%s' : missing cipher suite", args[cur_arg]);
+		memprintf(err, "'%s' : missing cipher suite", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	px->listen->bind_conf->ciphers = strdup(args[cur_arg + 1]);
+	conf->ciphers = strdup(args[cur_arg + 1]);
 	return 0;
 }
 
 /* parse the "crt" bind keyword */
-static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	if (!*args[cur_arg + 1]) {
-		if (err)
-			memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
+		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if (ssl_sock_load_cert(args[cur_arg + 1], px->listen->bind_conf, px, err) > 0)
+	if (ssl_sock_load_cert(args[cur_arg + 1], conf, px, err) > 0)
 		return ERR_ALERT | ERR_FATAL;
 
 	return 0;
 }
 
 /* parse the "nosslv3" bind keyword */
-static int bind_parse_nosslv3(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_nosslv3(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	px->listen->bind_conf->nosslv3 = 1;
+	conf->nosslv3 = 1;
 	return 0;
 }
 
 /* parse the "notlsv1" bind keyword */
-static int bind_parse_notlsv1(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_notlsv1(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	px->listen->bind_conf->notlsv1 = 1;
+	conf->notlsv1 = 1;
 	return 0;
 }
 
 /* parse the "prefer-server-ciphers" bind keyword */
-static int bind_parse_psc(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_psc(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	px->listen->bind_conf->prefer_server_ciphers = 1;
+	conf->prefer_server_ciphers = 1;
 	return 0;
 }
 
 /* parse the "ssl" bind keyword */
-static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	px->listen->bind_conf->is_ssl = 1;
+	struct listener *l;
+
+	conf->is_ssl = 1;
+	list_for_each_entry(l, &conf->listeners, by_bind)
+		l->data = &ssl_sock;
+
 	return 0;
 }
 

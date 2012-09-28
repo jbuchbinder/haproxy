@@ -782,7 +782,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->i,
+		req->buf.i,
 		req->analysers);
 
 	/* We don't know whether we have enough data, so must proceed
@@ -901,7 +901,7 @@ int tcp_inspect_response(struct session *s, struct channel *rep, int an_bit)
 		rep,
 		rep->rex, rep->wex,
 		rep->flags,
-		rep->i,
+		rep->buf.i,
 		rep->analysers);
 
 	/* We don't know whether we have enough data, so must proceed
@@ -1167,7 +1167,8 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
  * keyword.
  */
 static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
-                             struct proxy *defpx, char **err)
+                             struct proxy *defpx, const char *file, int line,
+                             char **err)
 {
 	const char *ptr = NULL;
 	unsigned int val;
@@ -1248,7 +1249,8 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
  * keyword.
  */
 static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
-                             struct proxy *defpx, char **err)
+                             struct proxy *defpx, const char *file, int line,
+                             char **err)
 {
 	const char *ptr = NULL;
 	unsigned int val;
@@ -1664,8 +1666,7 @@ smp_fetch_payload(struct proxy *px, struct session *l4, void *l7, unsigned int o
 static int val_payload(struct arg *arg, char **err_msg)
 {
 	if (!arg[1].data.uint) {
-		if (err_msg)
-			memprintf(err_msg, "payload length must be > 0");
+		memprintf(err_msg, "payload length must be > 0");
 		return 0;
 	}
 	return 1;
@@ -1683,15 +1684,13 @@ static int val_payload(struct arg *arg, char **err_msg)
 static int val_payload_lv(struct arg *arg, char **err_msg)
 {
 	if (!arg[1].data.uint) {
-		if (err_msg)
-			memprintf(err_msg, "payload length must be > 0");
+		memprintf(err_msg, "payload length must be > 0");
 		return 0;
 	}
 
 	if (arg[2].type == ARGT_SINT &&
 	    (int)(arg[0].data.uint + arg[1].data.uint + arg[2].data.sint) < 0) {
-		if (err_msg)
-			memprintf(err_msg, "payload offset too negative");
+		memprintf(err_msg, "payload offset too negative");
 		return 0;
 	}
 	return 1;
@@ -1699,18 +1698,14 @@ static int val_payload_lv(struct arg *arg, char **err_msg)
 
 #ifdef CONFIG_HAP_LINUX_TPROXY
 /* parse the "transparent" bind keyword */
-static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	struct listener *l;
 
-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
-		if (err)
-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_FOREIGN;
 	}
-
-	for (l = px->listen; l != last; l = l->next)
-		l->options |= LI_O_FOREIGN;
 
 	return 0;
 }
@@ -1718,18 +1713,14 @@ static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, st
 
 #ifdef TCP_DEFER_ACCEPT
 /* parse the "defer-accept" bind keyword */
-static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	struct listener *l;
 
-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
-		if (err)
-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_DEF_ACCEPT;
 	}
-
-	for (l = px->listen; l != last; l = l->next)
-		l->options |= LI_O_DEF_ACCEPT;
 
 	return 0;
 }
@@ -1737,32 +1728,26 @@ static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, s
 
 #ifdef TCP_MAXSEG
 /* parse the "mss" bind keyword */
-static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	struct listener *l;
 	int mss;
 
-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
-		if (err)
-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
 	if (!*args[cur_arg + 1]) {
-		if (err)
-			memprintf(err, "'%s' : missing MSS value", args[cur_arg]);
+		memprintf(err, "'%s' : missing MSS value", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
 	mss = atoi(args[cur_arg + 1]);
 	if (!mss || abs(mss) > 65535) {
-		if (err)
-			memprintf(err, "'%s' : expects an MSS with and absolute value between 1 and 65535", args[cur_arg]);
+		memprintf(err, "'%s' : expects an MSS with and absolute value between 1 and 65535", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	for (l = px->listen; l != last; l = l->next)
-		l->maxseg = mss;
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->maxseg = mss;
+	}
 
 	return 0;
 }
@@ -1770,24 +1755,19 @@ static int bind_parse_mss(char **args, int cur_arg, struct proxy *px, struct lis
 
 #ifdef SO_BINDTODEVICE
 /* parse the "mss" bind keyword */
-static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, struct listener *last, char **err)
+static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	struct listener *l;
 
-	if (px->listen->addr.ss_family != AF_INET && px->listen->addr.ss_family != AF_INET6) {
-		if (err)
-			memprintf(err, "'%s' option is only supported on IPv4 and IPv6 sockets", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
 	if (!*args[cur_arg + 1]) {
-		if (err)
-			memprintf(err, "'%s' : missing interface name", args[cur_arg]);
+		memprintf(err, "'%s' : missing interface name", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	for (l = px->listen; l != last; l = l->next)
-		l->interface = strdup(args[cur_arg + 1]);
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET || l->addr.ss_family == AF_INET6)
+			l->interface = strdup(args[cur_arg + 1]);
+	}
 
 	global.last_checks |= LSTCHK_NETADM;
 	return 0;

@@ -43,6 +43,8 @@ struct cfg_keyword {
 		     int section_type,          /* current section CFG_{GLOBAL|LISTEN} */
 		     struct proxy *curpx,       /* current proxy (NULL in GLOBAL) */
 		     struct proxy *defpx,       /* default proxy (NULL in GLOBAL) */
+		     const char *file,          /* config file name */
+		     int line,                  /* config file line number */
 		     char **err);               /* error or warning message output pointer */
 };
 
@@ -67,6 +69,7 @@ void cfg_register_keywords(struct cfg_kw_list *kwl);
 void cfg_unregister_keywords(struct cfg_kw_list *kwl);
 void init_default_instance();
 int check_config_validity();
+int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf, const char *file, int line, char **err);
 
 #endif /* _COMMON_CFGPARSE_H */
 

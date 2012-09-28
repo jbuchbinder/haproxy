@@ -1319,6 +1319,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 				bi_fast_delete(&buf->buf, ptr - buf->buf.p);
 			}
 			msg->sol = 0;
+			msg->sl.st.l = 0; /* used in debug mode */
 			hdr_idx_init(idx);
 			state = HTTP_MSG_RPVER;
 			goto http_msg_rpver;
@@ -1384,9 +1385,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 				bi_fast_delete(&buf->buf, ptr - buf->buf.p);
 			}
 			msg->sol = 0;
-			/* we will need this when keep-alive will be supported
-			   hdr_idx_init(idx);
-			 */
+			msg->sl.rq.l = 0; /* used in debug mode */
 			state = HTTP_MSG_RQMETH;
 			goto http_msg_rqmeth;
 		}
@@ -1827,6 +1826,8 @@ int http_parse_chunk_size(struct http_msg *msg)
 	 * which may or may not be present. We save that into ->next and
 	 * ->sov.
 	 */
+	if (ptr < ptr_old)
+		msg->sov += buf->buf.size;
 	msg->sov += ptr - ptr_old;
 	msg->next = buffer_count(&buf->buf, buf->buf.p, ptr);
 	msg->chunk_len = chunk;
@@ -2068,7 +2069,11 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		char *eol, *sol;
 
 		sol = req->buf.p;
-		eol = sol + msg->sl.rq.l;
+		/* this is a bit complex : in case of error on the request line,
+		 * we know that rq.l is still zero, so we display only the part
+		 * up to the end of the line (truncated by debug_hdr).
+		 */
+		eol = sol + (msg->sl.rq.l ? msg->sl.rq.l : req->buf.i);
 		debug_hdr("clireq", s, sol, eol);
 
 		sol += hdr_idx_first_pos(&txn->hdr_idx);
@@ -4598,7 +4603,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 		char *eol, *sol;
 
 		sol = rep->buf.p;
-		eol = sol + msg->sl.st.l;
+		eol = sol + (msg->sl.st.l ? msg->sl.st.l : rep->buf.i);
 		debug_hdr("srvrep", s, sol, eol);
 
 		sol += hdr_idx_first_pos(&txn->hdr_idx);
@@ -7421,15 +7426,21 @@ unsigned int http_get_hdr(const struct http_msg *msg, const char *hname, int hle
 }
 
 /*
- * Print a debug line with a header
+ * Print a debug line with a header. Always stop at the first CR or LF char,
+ * so it is safe to pass it a full buffer if needed. If <err> is not NULL, an
+ * arrow is printed after the line which contains the pointer.
  */
 void debug_hdr(const char *dir, struct session *t, const char *start, const char *end)
 {
 	int len, max;
 	len = sprintf(trash, "%08x:%s.%s[%04x:%04x]: ", t->uniq_id, t->be->id,
 		      dir, (unsigned  short)si_fd(t->req->prod), (unsigned short)si_fd(t->req->cons));
-	max = end - start;
-	UBOUND(max, trashlen - len - 1);
+
+	for (max = 0; start + max < end; max++)
+		if (start[max] == '\r' || start[max] == '\n')
+			break;
+
+	UBOUND(max, trashlen - len - 3);
 	len += strlcpy2(trash + len, start, max + 1);
 	trash[len++] = '\n';
 	if (write(1, trash, len) < 0) /* shut gcc warning */;
@@ -7743,8 +7754,7 @@ static int acl_parse_meth(const char **text, struct acl_pattern *pattern, int *o
 	if (meth == HTTP_METH_OTHER) {
 		pattern->ptr.str = strdup(*text);
 		if (!pattern->ptr.str) {
-			if (err)
-				memprintf(err, "out of memory while loading pattern");
+			memprintf(err, "out of memory while loading pattern");
 			return 0;
 		}
 		pattern->len = len;
@@ -7819,8 +7829,7 @@ static int acl_parse_ver(const char **text, struct acl_pattern *pattern, int *op
 {
 	pattern->ptr.str = strdup(*text);
 	if (!pattern->ptr.str) {
-		if (err)
-			memprintf(err, "out of memory while loading pattern");
+		memprintf(err, "out of memory while loading pattern");
 		return 0;
 	}
 	pattern->len = strlen(*text);
@@ -8643,8 +8652,7 @@ smp_fetch_url_param_val(struct proxy *px, struct session *l4, void *l7, unsigned
 static int val_hdr(struct arg *arg, char **err_msg)
 {
 	if (arg && arg[1].type == ARGT_SINT && arg[1].data.sint < -MAX_HDR_HISTORY) {
-		if (err_msg)
-			memprintf(err_msg, "header occurrence must be >= %d", -MAX_HDR_HISTORY);
+		memprintf(err_msg, "header occurrence must be >= %d", -MAX_HDR_HISTORY);
 		return 0;
 	}
 	return 1;
