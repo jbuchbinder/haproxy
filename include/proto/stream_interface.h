@@ -36,17 +36,14 @@ int stream_int_check_timeouts(struct stream_interface *si);
 void stream_int_report_error(struct stream_interface *si);
 void stream_int_retnclose(struct stream_interface *si, const struct chunk *msg);
 int conn_si_send_proxy(struct connection *conn, unsigned int flag);
-void conn_notify_si(struct connection *conn);
 int stream_int_shutr(struct stream_interface *si);
 int stream_int_shutw(struct stream_interface *si);
-void si_conn_recv_cb(struct connection *conn);
-void si_conn_send_cb(struct connection *conn);
 void stream_sock_read0(struct stream_interface *si);
 
 extern struct si_ops si_embedded_ops;
 extern struct si_ops si_task_ops;
 extern struct si_ops si_conn_ops;
-extern struct app_cb si_conn_cb;
+extern struct data_cb si_conn_cb;
 
 struct task *stream_int_register_handler(struct stream_interface *si,
 					 struct si_applet *app);
@@ -64,10 +61,16 @@ static inline int si_fd(struct stream_interface *si)
 	return si->conn.t.sock.fd;
 }
 
-static inline void si_prepare_conn(struct stream_interface *si, const struct protocol *ctrl, const struct data_ops *ops)
+static inline void si_prepare_conn(struct stream_interface *si, const struct protocol *ctrl, const struct xprt_ops *xprt)
 {
 	si->ops = &si_conn_ops;
-	conn_prepare(&si->conn, &si_conn_cb, ctrl, ops, si);
+	conn_prepare(&si->conn, &si_conn_cb, ctrl, xprt, si);
+}
+
+static inline void si_takeover_conn(struct stream_interface *si, const struct protocol *ctrl, const struct xprt_ops *xprt)
+{
+	si->ops = &si_conn_ops;
+	conn_assign(&si->conn, &si_conn_cb, ctrl, xprt, si);
 }
 
 static inline void si_prepare_embedded(struct stream_interface *si)
@@ -135,7 +138,7 @@ static inline int si_connect(struct stream_interface *si)
 		si->conn.flags |= CO_FL_SI_SEND_PROXY;
 
 	/* we need to be notified about connection establishment */
-	si->conn.flags |= CO_FL_NOTIFY_SI;
+	si->conn.flags |= CO_FL_WAKE_DATA;
 
 	/* we're in the process of establishing a connection */
 	si->state = SI_ST_CON;

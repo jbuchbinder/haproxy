@@ -50,8 +50,18 @@
 struct pool_head *pool2_session;
 struct list sessions;
 
+static int conn_session_complete(struct connection *conn);
+static int conn_session_update(struct connection *conn);
 static struct task *expire_mini_session(struct task *t);
 int session_complete(struct session *s);
+
+/* data layer callbacks for an embryonic session */
+struct data_cb sess_conn_cb = {
+	.recv = NULL,
+	.send = NULL,
+	.wake = conn_session_update,
+	.init = conn_session_complete,
+};
 
 /* This function is called from the protocol layer accept() in order to
  * instanciate a new embryonic session on behalf of a given listener and
@@ -161,18 +171,18 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	t->nice = l->nice;
 	s->task = t;
 
-	/* add the various callbacks. Right now the data layer is present but
-	 * not initialized. Also note we need to be careful as the stream int
-	 * is not initialized yet.
+	/* Add the various callbacks. Right now the transport layer is present
+	 * but not initialized. Also note we need to be careful as the stream
+	 * int is not initialized yet.
 	 */
-	si_prepare_conn(&s->si[0], l->proto, l->data);
+	conn_prepare(&s->si[0].conn, &sess_conn_cb, l->proto, l->xprt, s);
 
 	/* finish initialization of the accepted file descriptor */
 	fd_insert(cfd);
 	fdtab[cfd].owner = &s->si[0].conn;
 	fdtab[cfd].iocb = conn_fd_handler;
 	conn_data_want_recv(&s->si[0].conn);
-	if (conn_data_init(&s->si[0].conn) < 0)
+	if (conn_xprt_init(&s->si[0].conn) < 0)
 		goto out_free_task;
 
 	/* OK, now either we have a pending handshake to execute with and
@@ -185,7 +195,7 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 		t->process = expire_mini_session;
 		t->expire = tick_add_ifset(now_ms, p->timeout.client);
 		task_queue(t);
-		s->si[0].conn.flags |= CO_FL_INIT_SESS;
+		s->si[0].conn.flags |= CO_FL_INIT_DATA;
 		return 1;
 	}
 
@@ -203,7 +213,7 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 		session_store_counters(s);
 	pool_free2(pool2_session, s);
  out_close:
-	if (ret < 0 && l->data == &raw_sock && p->mode == PR_MODE_HTTP) {
+	if (ret < 0 && l->xprt == &raw_sock && p->mode == PR_MODE_HTTP) {
 		/* critical error, no more memory, try to emit a 500 response */
 		struct chunk *err_msg = http_error_message(s, HTTP_ERR_500);
 		send(cfd, err_msg->str, err_msg->len, MSG_DONTWAIT|MSG_NOSIGNAL);
@@ -217,13 +227,13 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 }
 
 /* This function kills an existing embryonic session. It stops the connection's
- * data layer, releases assigned resources, resumes the listener if it was
+ * transport layer, releases assigned resources, resumes the listener if it was
  * disabled and finally kills the file descriptor.
  */
 static void kill_mini_session(struct session *s)
 {
 	/* kill the connection now */
-	conn_data_close(&s->si[0].conn);
+	conn_xprt_close(&s->si[0].conn);
 
 	s->fe->feconn--;
 	if (s->stkctr1_entry || s->stkctr2_entry)
@@ -258,18 +268,30 @@ static void kill_mini_session(struct session *s)
 /* Finish initializing a session from a connection, or kills it if the
  * connection shows and error. Returns <0 if the connection was killed.
  */
-int conn_session_complete(struct connection *conn, int flag)
+static int conn_session_complete(struct connection *conn)
 {
-	struct session *s = container_of(conn->owner, struct session, si[0]);
+	struct session *s = conn->owner;
 
 	if (!(conn->flags & CO_FL_ERROR) && (session_complete(s) > 0)) {
-		conn->flags &= ~flag;
+		conn->flags &= ~CO_FL_INIT_DATA;
 		return 0;
 	}
 
 	/* kill the connection now */
 	kill_mini_session(s);
 	return -1;
+}
+
+/* Update an embryonic session status. The connection is killed in case of
+ * error, and <0 will be returned. Otherwise it does nothing.
+ */
+static int conn_session_update(struct connection *conn)
+{
+	if (conn->flags & CO_FL_ERROR) {
+		kill_mini_session(conn->owner);
+		return -1;
+	}
+	return 0;
 }
 
 /* Manages embryonic sessions timeout. It is only called when the timeout
@@ -305,6 +327,7 @@ int session_complete(struct session *s)
 	/* OK, we're keeping the session, so let's properly initialize the session */
 	LIST_ADDQ(&sessions, &s->list);
 	LIST_INIT(&s->back_refs);
+	si_takeover_conn(&s->si[0], l->proto, l->xprt);
 	s->flags |= SN_INITIALIZED;
 
 	s->unique_id = NULL;
@@ -462,7 +485,7 @@ int session_complete(struct session *s)
 	}
 
 	/* we want the connection handler to notify the stream interface about updates. */
-	s->si[0].conn.flags |= CO_FL_NOTIFY_SI;
+	s->si[0].conn.flags |= CO_FL_WAKE_DATA;
 
 	/* it is important not to call the wakeup function directly but to
 	 * pass through task_wakeup(), because this one knows how to apply
@@ -697,7 +720,7 @@ static int sess_update_st_con_tcp(struct session *s, struct stream_interface *si
 		si->state = SI_ST_CER;
 		fd_delete(si_fd(si));
 
-		conn_data_close(&si->conn);
+		conn_xprt_close(&si->conn);
 		if (si->release)
 			si->release(si);
 
@@ -2014,8 +2037,8 @@ struct task *process_session(struct task *t)
 	if (!(s->req->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    s->req->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (s->si[0].conn.data && s->si[0].conn.data->rcv_pipe && s->si[0].conn.data->snd_pipe) &&
-	    (s->si[1].conn.data && s->si[1].conn.data->rcv_pipe && s->si[1].conn.data->snd_pipe) &&
+	    (s->si[0].conn.xprt && s->si[0].conn.xprt->rcv_pipe && s->si[0].conn.xprt->snd_pipe) &&
+	    (s->si[1].conn.xprt && s->si[1].conn.xprt->rcv_pipe && s->si[1].conn.xprt->snd_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_REQ) ||
 	     (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2160,8 +2183,8 @@ struct task *process_session(struct task *t)
 	if (!(s->rep->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    s->rep->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (s->si[0].conn.data && s->si[0].conn.data->rcv_pipe && s->si[0].conn.data->snd_pipe) &&
-	    (s->si[1].conn.data && s->si[1].conn.data->rcv_pipe && s->si[1].conn.data->snd_pipe) &&
+	    (s->si[0].conn.xprt && s->si[0].conn.xprt->rcv_pipe && s->si[0].conn.xprt->snd_pipe) &&
+	    (s->si[1].conn.xprt && s->si[1].conn.xprt->rcv_pipe && s->si[1].conn.xprt->snd_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_RTR) ||
 	     (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&

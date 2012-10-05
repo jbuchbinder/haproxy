@@ -852,6 +852,7 @@ void deinit(void)
 
 	deinit_signals();
 	while (p) {
+		free(p->conf.file);
 		free(p->id);
 		free(p->check_req);
 		free(p->cookie_name);
@@ -1006,9 +1007,9 @@ void deinit(void)
 		while (s) {
 			s_next = s->next;
 
-			if (s->check) {
-				task_delete(s->check);
-				task_free(s->check);
+			if (s->check.task) {
+				task_delete(s->check.task);
+				task_free(s->check.task);
 			}
 
 			if (s->warmup) {
@@ -1018,7 +1019,8 @@ void deinit(void)
 
 			free(s->id);
 			free(s->cookie);
-			free(s->check_data);
+			free(s->check.bi);
+			free(s->check.bo);
 			free(s);
 			s = s_next;
 		}/* end while(s) */
@@ -1037,7 +1039,10 @@ void deinit(void)
 		list_for_each_entry_safe(bind_conf, bind_back, &p->conf.bind, by_fe) {
 #ifdef USE_OPENSSL
 			ssl_sock_free_all_ctx(bind_conf);
+			free(bind_conf->cafile);
 			free(bind_conf->ciphers);
+			free(bind_conf->ecdhe);
+			free(bind_conf->crlfile);
 #endif /* USE_OPENSSL */
 			free(bind_conf->file);
 			free(bind_conf->arg);

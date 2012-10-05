@@ -108,7 +108,6 @@ struct server {
 
 	struct list pendconns;			/* pending connections */
 	struct list actconns;			/* active connections */
-	struct task *check;                     /* the task associated to the health check processing */
 	struct task *warmup;                    /* the task dedicated to the warmup when slowstart is set */
 
 	int iface_len;				/* bind interface name length */
@@ -117,8 +116,6 @@ struct server {
 
 	struct server *tracknext, *track;	/* next server in a tracking list, tracked server */
 	char *trackit;				/* temporary variable to make assignment deferrable */
-	struct sockaddr_storage check_addr;	/* the address to check, if different from <addr> */
-	short check_port;			/* the port to use for the health checks */
 	int health;				/* 0->rise-1 = bad; rise->rise+fall-1 = good */
 	int consecutive_errors;			/* current number of consecutive errors */
 	int rise, fall;				/* time in iterations */
@@ -129,7 +126,6 @@ struct server {
 	int inter, fastinter, downinter;	/* checks: time in milliseconds */
 	int slowstart;				/* slowstart time in seconds (ms in the conf) */
 	int result;				/* health-check result : SRV_CHK_* */
-	int curfd;				/* file desc used for current test, or -1 if not in test */
 
 	char *id;				/* just for identification */
 	unsigned iweight,uweight, eweight;	/* initial weight, user-specified weight, and effective weight */
@@ -154,19 +150,27 @@ struct server {
 	int bind_hdr_occ;			/* occurrence number of header above: >0 = from first, <0 = from end, 0=disabled */
 #endif
 	struct protocol *proto;	                /* server address protocol */
-	struct data_ops *data;                  /* data-layer operations */
+	struct xprt_ops *xprt;                  /* transport-layer operations */
 	unsigned down_time;			/* total time the server was down */
 	time_t last_change;			/* last time, when the state was changed */
-	struct timeval check_start;		/* last health check start time */
-	long check_duration;			/* time in ms took to finish last health check */
-	short check_status, check_code;		/* check result, check code */
-	char check_desc[HCHK_DESC_LEN];		/* health check descritpion */
 
 	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo */
 
-	char *check_data;			/* storage of partial check results */
-	struct connection *check_conn;		/* connection state for health checks */
-	int check_data_len;			/* length of partial check results stored in check_data */
+	struct {                                /* health-check specific configuration */
+		struct connection *conn;        /* connection state for health checks */
+		struct protocol *proto;	        /* server address protocol for health checks */
+		struct xprt_ops *xprt;          /* transport layer operations for health checks */
+		struct sockaddr_storage addr;   /* the address to check, if different from <addr> */
+		short port;                     /* the port to use for the health checks */
+		struct buffer *bi, *bo;         /* input and output buffers to send/recv check */
+		struct task *task;              /* the task associated to the health check processing, NULL if disabled */
+		struct timeval start;           /* last health check start time */
+		long duration;                  /* time in ms took to finish last health check */
+		short status, code;             /* check result, check code */
+		char desc[HCHK_DESC_LEN];       /* health check descritpion */
+		int use_ssl;                    /* use SSL for health checks */
+		int send_proxy;                 /* send a PROXY protocol header with checks */
+	} check;
 
 #ifdef USE_OPENSSL
 	int use_ssl;				/* ssl enabled */
@@ -175,7 +179,9 @@ struct server {
 		SSL_SESSION *reused_sess;
 		char *ciphers;			/* cipher suite to use if non-null */
 		int nosslv3;			/* disable SSLv3 */
-		int notlsv1;			/* disable TLSv1 */
+		int notlsv10;			/* disable TLSv1.0 */
+		int notlsv11;			/* disable TLSv1.1 */
+		int notlsv12;			/* disable TLSv1.2 */
 	} ssl_ctx;
 #endif
 	struct {

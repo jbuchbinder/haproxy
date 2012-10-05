@@ -270,7 +270,7 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 
 			l->fd = -1;
 			l->addr = ss;
-			l->data = &raw_sock;
+			l->xprt = &raw_sock;
 			l->state = LI_INIT;
 
 			if (ss.ss_family == AF_INET) {
@@ -1103,7 +1103,7 @@ void init_default_instance()
 	defproxy.defsrv.downinter = 0;
 	defproxy.defsrv.rise = DEF_RISETIME;
 	defproxy.defsrv.fall = DEF_FALLTIME;
-	defproxy.defsrv.check_port = 0;
+	defproxy.defsrv.check.port = 0;
 	defproxy.defsrv.maxqueue = 0;
 	defproxy.defsrv.minconn = 0;
 	defproxy.defsrv.maxconn = 0;
@@ -1242,7 +1242,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 
 		curpeers->next = peers;
 		peers = curpeers;
-		curpeers->conf.file = file;
+		curpeers->conf.file = strdup(file);
 		curpeers->conf.line = linenum;
 		curpeers->last_change = now.tv_sec;
 		curpeers->id = strdup(args[1]);
@@ -1279,7 +1279,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		newpeer->next = curpeers->remote;
 		curpeers->remote = newpeer;
 		newpeer->peers = curpeers;
-		newpeer->conf.file = file;
+		newpeer->conf.file = strdup(file);
 		newpeer->conf.line = linenum;
 
 		newpeer->last_change = now.tv_sec;
@@ -1306,7 +1306,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		}
 		newpeer->addr = *sk;
 		newpeer->proto = protocol_by_family(newpeer->addr.ss_family);
-		newpeer->data  = &raw_sock;
+		newpeer->xprt  = &raw_sock;
 		newpeer->sock_init_arg = NULL;
 
 		if (!newpeer->proto) {
@@ -1451,7 +1451,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		init_new_proxy(curproxy);
 		curproxy->next = proxy;
 		proxy = curproxy;
-		curproxy->conf.file = file;
+		curproxy->conf.file = strdup(file);
 		curproxy->conf.line = linenum;
 		curproxy->last_change = now.tv_sec;
 		curproxy->id = strdup(args[1]);
@@ -3913,7 +3913,7 @@ stats_error_parsing:
 			newsrv->next = curproxy->srv;
 			curproxy->srv = newsrv;
 			newsrv->proxy = curproxy;
-			newsrv->conf.file = file;
+			newsrv->conf.file = strdup(file);
 			newsrv->conf.line = linenum;
 
 			LIST_INIT(&newsrv->actconns);
@@ -3948,8 +3948,8 @@ stats_error_parsing:
 				goto out;
 			}
 			newsrv->addr = *sk;
-			newsrv->proto = protocol_by_family(newsrv->addr.ss_family);
-			newsrv->data  = &raw_sock;
+			newsrv->proto = newsrv->check.proto = protocol_by_family(newsrv->addr.ss_family);
+			newsrv->xprt  = newsrv->check.xprt  = &raw_sock;
 
 			if (!newsrv->proto) {
 				Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
@@ -3959,7 +3959,8 @@ stats_error_parsing:
 			}
 			set_host_port(&newsrv->addr, realport);
 
-			newsrv->check_port	= curproxy->defsrv.check_port;
+			newsrv->check.use_ssl	= curproxy->defsrv.check.use_ssl;
+			newsrv->check.port	= curproxy->defsrv.check.port;
 			newsrv->inter		= curproxy->defsrv.inter;
 			newsrv->fastinter	= curproxy->defsrv.fastinter;
 			newsrv->downinter	= curproxy->defsrv.downinter;
@@ -3978,7 +3979,6 @@ stats_error_parsing:
 			newsrv->uweight = newsrv->iweight
 						= curproxy->defsrv.iweight;
 
-			newsrv->curfd = -1;		/* no health-check in progress */
 			newsrv->health = newsrv->rise;	/* up, but will fall down at first failure */
 
 			cur_arg = 3;
@@ -4126,11 +4126,11 @@ stats_error_parsing:
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
-				newsrv->check_addr = *sk;
+				newsrv->check.addr = *sk;
 				cur_arg += 2;
 			}
 			else if (!strcmp(args[cur_arg], "port")) {
-				newsrv->check_port = atol(args[cur_arg + 1]);
+				newsrv->check.port = atol(args[cur_arg + 1]);
 				cur_arg += 2;
 			}
 			else if (!defsrv && !strcmp(args[cur_arg], "backup")) {
@@ -4143,6 +4143,10 @@ stats_error_parsing:
 			}
 			else if (!defsrv && !strcmp(args[cur_arg], "send-proxy")) {
 				newsrv->state |= SRV_SEND_PROXY;
+				cur_arg ++;
+			}
+			else if (!defsrv && !strcmp(args[cur_arg], "check-send-proxy")) {
+				newsrv->check.send_proxy = 1;
 				cur_arg ++;
 			}
 			else if (!strcmp(args[cur_arg], "weight")) {
@@ -4222,6 +4226,17 @@ stats_error_parsing:
 				goto out;
 #endif /* USE_OPENSSL */
 			}
+			else if (!strcmp(args[cur_arg], "check-ssl")) {
+#ifdef USE_OPENSSL
+				newsrv->check.use_ssl = 1;
+				cur_arg += 1;
+#else /* USE_OPENSSL */
+				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
+				      file, linenum, args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+#endif /* USE_OPENSSL */
+			}
 			else if (!strcmp(args[cur_arg], "ciphers")) { /* use this SSL cipher suite */
 #ifdef USE_OPENSSL
 				if (!*args[cur_arg + 1]) {
@@ -4253,9 +4268,31 @@ stats_error_parsing:
 				goto out;
 #endif /* USE_OPENSSL */
 			}
-			else if (!strcmp(args[cur_arg], "notlsv1")) {
+			else if (!strcmp(args[cur_arg], "notlsv10")) {
 #ifdef USE_OPENSSL
-				newsrv->ssl_ctx.notlsv1 = 1;
+				newsrv->ssl_ctx.notlsv10 = 1;
+				cur_arg += 1;
+#else /* USE_OPENSSL */
+				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
+				      file, linenum, args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+#endif /* USE_OPENSSL */
+			}
+			else if (!strcmp(args[cur_arg], "notlsv11")) {
+#ifdef USE_OPENSSL
+				newsrv->ssl_ctx.notlsv11 = 1;
+				cur_arg += 1;
+#else /* USE_OPENSSL */
+				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
+				      file, linenum, args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+#endif /* USE_OPENSSL */
+			}
+			else if (!strcmp(args[cur_arg], "notlsv12")) {
+#ifdef USE_OPENSSL
+				newsrv->ssl_ctx.notlsv12 = 1;
 				cur_arg += 1;
 #else /* USE_OPENSSL */
 				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
@@ -4528,13 +4565,23 @@ stats_error_parsing:
 				goto out;
 			}
 
-			/* try to get the port from check_addr if check_port not set */
-			if (!newsrv->check_port)
-				newsrv->check_port = get_host_port(&newsrv->check_addr);
+			/* If neither a port nor an addr was specified and no check transport
+			 * layer is forced, then the transport layer used by the checks is the
+			 * same as for the production traffic. Otherwise we use raw_sock by
+			 * default, unless one is specified.
+			 */
+			if (!newsrv->check.port && !is_addr(&newsrv->check.addr)) {
+				newsrv->check.use_ssl |= newsrv->use_ssl;
+				newsrv->check.send_proxy |= (newsrv->state & SRV_SEND_PROXY);
+			}
 
-			if (!newsrv->check_port && !(newsrv->state & SRV_MAPPORTS))
-				newsrv->check_port = realport; /* by default */
-			if (!newsrv->check_port) {
+			/* try to get the port from check.addr if check.port not set */
+			if (!newsrv->check.port)
+				newsrv->check.port = get_host_port(&newsrv->check.addr);
+
+			if (!newsrv->check.port && !(newsrv->state & SRV_MAPPORTS))
+				newsrv->check.port = realport; /* by default */
+			if (!newsrv->check.port) {
 				/* not yet valid, because no port was set on
 				 * the server either. We'll check if we have
 				 * a known port on the first listener.
@@ -4542,33 +4589,43 @@ stats_error_parsing:
 				struct listener *l;
 
 				list_for_each_entry(l, &curproxy->conf.listeners, by_fe) {
-					newsrv->check_port = get_host_port(&l->addr);
-					if (newsrv->check_port)
+					newsrv->check.port = get_host_port(&l->addr);
+					if (newsrv->check.port)
 						break;
 				}
 			}
-			if (!newsrv->check_port) {
+			if (!newsrv->check.port) {
 				Alert("parsing [%s:%d] : server %s has neither service port nor check port. Check has been disabled.\n",
 				      file, linenum, newsrv->id);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
 
-			/* Allocate buffer for partial check results... */
-			if ((newsrv->check_data = calloc(global.tune.chksize, sizeof(char))) == NULL) {
+			/* Allocate buffer for check requests... */
+			if ((newsrv->check.bi = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
 				Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
 				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
 			}
+			newsrv->check.bi->size = global.tune.chksize;
+
+			/* Allocate buffer for check responses... */
+			if ((newsrv->check.bo = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
+				Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+			newsrv->check.bo->size = global.tune.chksize;
 
 			/* Allocate buffer for partial check results... */
-			if ((newsrv->check_conn = calloc(1, sizeof(struct connection))) == NULL) {
+			if ((newsrv->check.conn = calloc(1, sizeof(struct connection))) == NULL) {
 				Alert("parsing [%s:%d] : out of memory while allocating check connection.\n", file, linenum);
 				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
 			}
 
-			newsrv->check_status = HCHK_STATUS_INI;
+			newsrv->check.conn->t.sock.fd = -1; /* no check in progress yet */
+			newsrv->check.status = HCHK_STATUS_INI;
 			newsrv->state |= SRV_CHECKED;
 		}
 
@@ -5668,7 +5725,7 @@ int check_config_validity()
 		struct listener *listener;
 		unsigned int next_id;
 
-		if (!curproxy->uuid) {
+		if (curproxy->uuid < 0) {
 			/* proxy ID not set, use automatic numbering with first
 			 * spare entry starting with next_pxid.
 			 */
@@ -5707,12 +5764,6 @@ int check_config_validity()
 		case PR_MODE_HTTP:
 			curproxy->acl_requires |= ACL_USE_L7_ANY;
 			break;
-		}
-
-		if ((curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners))  {
-			Alert("config : %s '%s' has no listen address. Please either specify a valid address on the <listen> line, or use the <bind> keyword.\n",
-			      proxy_type_str(curproxy), curproxy->id);
-			cfgerr++;
 		}
 
 		if ((curproxy->cap & PR_CAP_BE) && (curproxy->mode != PR_MODE_HEALTH)) {
@@ -6240,7 +6291,13 @@ out_uri_auth_compat:
 #ifndef SSL_OP_NO_COMPRESSION     /* needs OpenSSL >= 0.9.9 */
 #define SSL_OP_NO_COMPRESSION 0
 #endif
-			if (newsrv->use_ssl) {
+#ifndef SSL_OP_NO_TLSv1_1         /* needs OpenSSL >= 1.0.1 */
+#define SSL_OP_NO_TLSv1_1 0
+#endif
+#ifndef SSL_OP_NO_TLSv1_2         /* needs OpenSSL >= 1.0.1 */
+#define SSL_OP_NO_TLSv1_2 0
+#endif
+			if (newsrv->use_ssl || newsrv->check.use_ssl) {
 				int ssloptions =
 					SSL_OP_ALL | /* all known workarounds for bugs */
 					SSL_OP_NO_SSLv2 |
@@ -6252,7 +6309,10 @@ out_uri_auth_compat:
 
 				/* Initiate SSL context for current server */
 				newsrv->ssl_ctx.reused_sess = NULL;
-				newsrv->data = &ssl_sock;
+				if (newsrv->use_ssl)
+					newsrv->xprt = &ssl_sock;
+				if (newsrv->check.use_ssl)
+					newsrv->check.xprt = &ssl_sock;
 				newsrv->ssl_ctx.ctx = SSL_CTX_new(SSLv23_client_method());
 				if(!newsrv->ssl_ctx.ctx) {
 
@@ -6265,8 +6325,12 @@ out_uri_auth_compat:
 
 				if (newsrv->ssl_ctx.nosslv3)
 					ssloptions |= SSL_OP_NO_SSLv3;
-				if (newsrv->ssl_ctx.notlsv1)
+				if (newsrv->ssl_ctx.notlsv10)
 					ssloptions |= SSL_OP_NO_TLSv1;
+				if (newsrv->ssl_ctx.notlsv11)
+					ssloptions |= SSL_OP_NO_TLSv1_1;
+				if (newsrv->ssl_ctx.notlsv12)
+					ssloptions |= SSL_OP_NO_TLSv1_2;
 				SSL_CTX_set_options(newsrv->ssl_ctx.ctx, ssloptions);
 				SSL_CTX_set_mode(newsrv->ssl_ctx.ctx, sslmode);
 				SSL_CTX_set_verify(newsrv->ssl_ctx.ctx, SSL_VERIFY_NONE, NULL);
@@ -6486,7 +6550,8 @@ out_uri_auth_compat:
 		}
 
 		if (curproxy->cap & PR_CAP_FE) {
-			curproxy->accept = frontend_accept;
+			if (!curproxy->accept)
+				curproxy->accept = frontend_accept;
 
 			if (curproxy->tcp_req.inspect_delay ||
 			    !LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules))
@@ -6536,7 +6601,7 @@ out_uri_auth_compat:
 				continue;
 			}
 
-			if (shared_context_init(global.tune.sslcachesize) < 0) {
+			if (shared_context_init(global.tune.sslcachesize, (global.nbproc > 1) ? 1 : 0) < 0) {
 				Alert("Unable to allocate SSL session cache.\n");
 				cfgerr++;
 				continue;
@@ -6599,7 +6664,10 @@ out_uri_auth_compat:
 				continue;
 #ifdef USE_OPENSSL
 			ssl_sock_free_all_ctx(bind_conf);
+			free(bind_conf->cafile);
 			free(bind_conf->ciphers);
+			free(bind_conf->ecdhe);
+			free(bind_conf->crlfile);
 #endif /* USE_OPENSSL */
 		}
 

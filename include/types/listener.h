@@ -36,7 +36,7 @@
 /* Some pointer types reference below */
 struct task;
 struct protocol;
-struct data_ops;
+struct xprt_ops;
 struct proxy;
 struct licounters;
 
@@ -96,10 +96,19 @@ enum {
 /* "bind" line settings */
 struct bind_conf {
 #ifdef USE_OPENSSL
+	char *cafile;              /* CAfile to use on verify */
+	unsigned long long ca_ignerr;  /* ignored verify errors in handshake if depth > 0 */
+	unsigned long long crt_ignerr; /* ignored verify errors in handshake if depth == 0 */
 	char *ciphers;             /* cipher suite to use if non-null */
+	char *crlfile;             /* CRLfile to use on verify */
+	char *ecdhe;               /* named curve to use for ECDHE */
+	int no_tls_tickets;        /* disable session resumption tickets */
 	int nosslv3;               /* disable SSLv3 */
-	int notlsv1;               /* disable TLSv1 */
+	int notlsv10;              /* disable TLSv1.0 */
+	int notlsv11;              /* disable TLSv1.1 */
+	int notlsv12;              /* disable TLSv1.2 */
 	int prefer_server_ciphers; /* Prefer server ciphers */
+	int verify;                /* verify method (set of SSL_VERIFY_* flags) */
 	SSL_CTX *default_ctx;      /* SSL context of first/default certificate */
 	struct eb_root sni_ctx;    /* sni_ctx tree of all known certs full-names sorted by name */
 	struct eb_root sni_w_ctx;  /* sni_ctx tree of all known certs wildcards sorted by name */
@@ -130,7 +139,7 @@ struct listener {
 	int options;			/* socket options : LI_O_* */
 	struct licounters *counters;	/* statistics counters */
 	struct protocol *proto;		/* protocol this listener belongs to */
-	struct data_ops *data;          /* data-layer operations operations for this socket */
+	struct xprt_ops *xprt;          /* transport-layer operations for this socket */
 	int nbconn;			/* current number of connections on this listener */
 	int maxconn;			/* maximum connections allowed on this listener */
 	unsigned int backlog;		/* if set, listen backlog */
