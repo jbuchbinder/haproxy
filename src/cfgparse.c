@@ -465,6 +465,44 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		/* no option, nothing special to do */
 		goto out;
 	}
+	else if (!strcmp(args[0], "ca-base")) {
+#ifdef USE_OPENSSL
+		if (global.ca_base != NULL) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a directory path as an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.ca_base = strdup(args[1]);
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "crt-base")) {
+#ifdef USE_OPENSSL
+		if (global.crt_base != NULL) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a directory path as an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.crt_base = strdup(args[1]);
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
 	else if (!strcmp(args[0], "daemon")) {
 		global.mode |= MODE_DAEMON;
 	}
@@ -727,11 +765,9 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.maxsslconn = atol(args[1]);
 #else
-		if (*(args[1]) == 0) {
-			Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
 #endif
 	}
 	else if (!strcmp(args[0], "maxconnrate")) {
@@ -2909,6 +2945,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			}
 		}
 
+		/* check if we need to allocate an hdr_idx struct for HTTP parsing */
+		if (expr->fetch->cap & SMP_CAP_L7)
+			curproxy->acl_requires |= ACL_USE_L7_ANY;
+
 		if (strcmp(args[myidx], "table") == 0) {
 			myidx++;
 			name = args[myidx++];
@@ -3988,38 +4028,7 @@ stats_error_parsing:
 		}
 
 		while (*args[cur_arg]) {
-			if (!defsrv && !strcmp(args[cur_arg], "id")) {
-				struct eb32_node *node;
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d]: '%s' expects an integer argument.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->puid = atol(args[cur_arg + 1]);
-				newsrv->conf.id.key = newsrv->puid;
-
-				if (newsrv->puid <= 0) {
-					Alert("parsing [%s:%d]: custom id has to be > 0.\n",
-						file, linenum);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				node = eb32_lookup(&curproxy->conf.used_server_id, newsrv->puid);
-				if (node) {
-					struct server *target = container_of(node, struct server, conf.id);
-					Alert("parsing [%s:%d]: server %s reuses same custom id as server %s (declared at %s:%d).\n",
-					      file, linenum, newsrv->id, target->id, target->conf.file, target->conf.line);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				eb32_insert(&curproxy->conf.used_server_id, &newsrv->conf.id);
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "cookie")) {
+			if (!defsrv && !strcmp(args[cur_arg], "cookie")) {
 				newsrv->cookie = strdup(args[cur_arg + 1]);
 				newsrv->cklen = strlen(args[cur_arg + 1]);
 				cur_arg += 2;
@@ -4214,92 +4223,6 @@ stats_error_parsing:
 				newsrv->state &= ~SRV_RUNNING;
 				newsrv->health = 0;
 				cur_arg += 1;
-			}
-			else if (!strcmp(args[cur_arg], "ssl")) {
-#ifdef USE_OPENSSL
-				newsrv->use_ssl = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
-			}
-			else if (!strcmp(args[cur_arg], "check-ssl")) {
-#ifdef USE_OPENSSL
-				newsrv->check.use_ssl = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
-			}
-			else if (!strcmp(args[cur_arg], "ciphers")) { /* use this SSL cipher suite */
-#ifdef USE_OPENSSL
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' : '%s' : missing cipher suite.\n",
-					      file, linenum, args[0], args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->ssl_ctx.ciphers = strdup(args[cur_arg + 1]);
-
-				cur_arg += 2;
-				continue;
-#else
-				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-				      file, linenum, args[0], args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif
-			}
-			else if (!strcmp(args[cur_arg], "nosslv3")) {
-#ifdef USE_OPENSSL
-				newsrv->ssl_ctx.nosslv3 = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
-			}
-			else if (!strcmp(args[cur_arg], "notlsv10")) {
-#ifdef USE_OPENSSL
-				newsrv->ssl_ctx.notlsv10 = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
-			}
-			else if (!strcmp(args[cur_arg], "notlsv11")) {
-#ifdef USE_OPENSSL
-				newsrv->ssl_ctx.notlsv11 = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
-			}
-			else if (!strcmp(args[cur_arg], "notlsv12")) {
-#ifdef USE_OPENSSL
-				newsrv->ssl_ctx.notlsv12 = 1;
-				cur_arg += 1;
-#else /* USE_OPENSSL */
-				Alert("parsing [%s:%d]: '%s' option not implemented.\n",
-				      file, linenum, args[cur_arg]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-#endif /* USE_OPENSSL */
 			}
 			else if (!defsrv && !strcmp(args[cur_arg], "observe")) {
 				if (!strcmp(args[cur_arg + 1], "none"))
@@ -4545,12 +4468,64 @@ stats_error_parsing:
 				goto out;
 			}
 			else {
-				if (!defsrv)
-					Alert("parsing [%s:%d] : server %s only supports options 'backup', 'cookie', 'redir', 'observer', 'on-error', 'on-marked-down', 'error-limit', 'check', 'disabled', 'track', 'id', 'inter', 'fastinter', 'downinter', 'rise', 'fall', 'addr', 'port', 'source', 'send-proxy', 'minconn', 'maxconn', 'maxqueue', 'slowstart' and 'weight'.\n",
-					      file, linenum, newsrv->id);
-				else
-					Alert("parsing [%s:%d]: default-server only supports options 'on-error', 'error-limit', 'inter', 'fastinter', 'downinter', 'rise', 'fall', 'port', 'minconn', 'maxconn', 'maxqueue', 'slowstart' and 'weight'.\n",
-					      file, linenum);
+				static int srv_dumped;
+				struct srv_kw *kw;
+				char *err;
+
+				kw = srv_find_kw(args[cur_arg]);
+				if (kw) {
+					char *err = NULL;
+					int code;
+
+					if (!kw->parse) {
+						Alert("parsing [%s:%d] : '%s %s' : '%s' option is not implemented in this version (check build options).\n",
+						      file, linenum, args[0], args[1], args[cur_arg]);
+						cur_arg += 1 + kw->skip ;
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+
+					if (defsrv && !kw->default_ok) {
+						Alert("parsing [%s:%d] : '%s %s' : '%s' option is not accepted in default-server sections.\n",
+						      file, linenum, args[0], args[1], args[cur_arg]);
+						cur_arg += 1 + kw->skip ;
+						err_code |= ERR_ALERT;
+						continue;
+					}
+
+					code = kw->parse(args, &cur_arg, curproxy, newsrv, &err);
+					err_code |= code;
+
+					if (code) {
+						if (err && *err) {
+							indent_msg(&err, 2);
+							Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
+						}
+						else
+							Alert("parsing [%s:%d] : '%s %s' : error encountered while processing '%s'.\n",
+							      file, linenum, args[0], args[1], args[cur_arg]);
+						if (code & ERR_FATAL) {
+							free(err);
+							cur_arg += 1 + kw->skip;
+							goto out;
+						}
+					}
+					free(err);
+					cur_arg += 1 + kw->skip;
+					continue;
+				}
+
+				err = NULL;
+				if (!srv_dumped) {
+					srv_dump_kws(&err);
+					indent_msg(&err, 4);
+					srv_dumped = 1;
+				}
+
+				Alert("parsing [%s:%d] : '%s %s' unknown keyword '%s'.%s%s\n",
+				      file, linenum, args[0], args[1], args[cur_arg],
+				      err ? " Registered keywords :" : "", err ? err : "");
+				free(err);
 
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
@@ -4571,10 +4546,11 @@ stats_error_parsing:
 			 * default, unless one is specified.
 			 */
 			if (!newsrv->check.port && !is_addr(&newsrv->check.addr)) {
+#ifdef USE_OPENSSL
 				newsrv->check.use_ssl |= newsrv->use_ssl;
+#endif
 				newsrv->check.send_proxy |= (newsrv->state & SRV_SEND_PROXY);
 			}
-
 			/* try to get the port from check.addr if check.port not set */
 			if (!newsrv->check.port)
 				newsrv->check.port = get_host_port(&newsrv->check.addr);
@@ -6323,14 +6299,27 @@ out_uri_auth_compat:
 						goto next_srv;
 				}
 
-				if (newsrv->ssl_ctx.nosslv3)
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_NO_SSLV3)
 					ssloptions |= SSL_OP_NO_SSLv3;
-				if (newsrv->ssl_ctx.notlsv10)
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_NO_TLSV10)
 					ssloptions |= SSL_OP_NO_TLSv1;
-				if (newsrv->ssl_ctx.notlsv11)
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_NO_TLSV11)
 					ssloptions |= SSL_OP_NO_TLSv1_1;
-				if (newsrv->ssl_ctx.notlsv12)
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_NO_TLSV12)
 					ssloptions |= SSL_OP_NO_TLSv1_2;
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_USE_SSLV3)
+					SSL_CTX_set_ssl_version(newsrv->ssl_ctx.ctx, SSLv3_client_method());
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_USE_TLSV10)
+					SSL_CTX_set_ssl_version(newsrv->ssl_ctx.ctx, TLSv1_client_method());
+#if SSL_OP_NO_TLSv1_1
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_USE_TLSV11)
+					SSL_CTX_set_ssl_version(newsrv->ssl_ctx.ctx, TLSv1_1_client_method());
+#endif
+#if SSL_OP_NO_TLSv1_2
+				if (newsrv->ssl_ctx.options & SRV_SSL_O_USE_TLSV12)
+					SSL_CTX_set_ssl_version(newsrv->ssl_ctx.ctx, TLSv1_2_client_method());
+#endif
+
 				SSL_CTX_set_options(newsrv->ssl_ctx.ctx, ssloptions);
 				SSL_CTX_set_mode(newsrv->ssl_ctx.ctx, sslmode);
 				SSL_CTX_set_verify(newsrv->ssl_ctx.ctx, SSL_VERIFY_NONE, NULL);
@@ -6664,10 +6653,10 @@ out_uri_auth_compat:
 				continue;
 #ifdef USE_OPENSSL
 			ssl_sock_free_all_ctx(bind_conf);
-			free(bind_conf->cafile);
+			free(bind_conf->ca_file);
 			free(bind_conf->ciphers);
 			free(bind_conf->ecdhe);
-			free(bind_conf->crlfile);
+			free(bind_conf->crl_file);
 #endif /* USE_OPENSSL */
 		}
 

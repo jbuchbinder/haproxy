@@ -79,6 +79,21 @@
 #define SRV_EWGHT_RANGE (SRV_UWGHT_RANGE * BE_WEIGHT_SCALE)
 #define SRV_EWGHT_MAX   (SRV_UWGHT_MAX   * BE_WEIGHT_SCALE)
 
+#ifdef USE_OPENSSL
+/* server ssl options */
+#define SRV_SSL_O_NONE         0x0000
+#define SRV_SSL_O_NO_SSLV3     0x0001 /* disable SSLv3 */
+#define SRV_SSL_O_NO_TLSV10    0x0002 /* disable TLSv1.0 */
+#define SRV_SSL_O_NO_TLSV11    0x0004 /* disable TLSv1.1 */
+#define SRV_SSL_O_NO_TLSV12    0x0008 /* disable TLSv1.2 */
+/* 0x000F reserved for 'no' protocol version options */
+#define SRV_SSL_O_USE_SSLV3    0x0001 /* force SSLv3 */
+#define SRV_SSL_O_USE_TLSV10   0x0002 /* force TLSv1.0 */
+#define SRV_SSL_O_USE_TLSV11   0x0004 /* force TLSv1.1 */
+#define SRV_SSL_O_USE_TLSV12   0x0008 /* force TLSv1.2 */
+/* 0x00F0 reserved for 'force' protocol version options */
+#endif
+
 /* A tree occurrence is a descriptor of a place in a tree, with a pointer back
  * to the server itself.
  */
@@ -178,10 +193,7 @@ struct server {
 		SSL_CTX *ctx;
 		SSL_SESSION *reused_sess;
 		char *ciphers;			/* cipher suite to use if non-null */
-		int nosslv3;			/* disable SSLv3 */
-		int notlsv10;			/* disable TLSv1.0 */
-		int notlsv11;			/* disable TLSv1.1 */
-		int notlsv12;			/* disable TLSv1.2 */
+		int options;			/* ssl options */
 	} ssl_ctx;
 #endif
 	struct {
@@ -191,6 +203,31 @@ struct server {
 	} conf;					/* config information */
 };
 
+/* Descriptor for a "server" keyword. The ->parse() function returns 0 in case of
+ * success, or a combination of ERR_* flags if an error is encountered. The
+ * function pointer can be NULL if not implemented. The function also has an
+ * access to the current "server" config line. The ->skip value tells the parser
+ * how many words have to be skipped after the keyword. If the function needs to
+ * parse more keywords, it needs to update cur_arg.
+ */
+struct srv_kw {
+	const char *kw;
+	int (*parse)(char **args, int *cur_arg, struct proxy *px, struct server *srv, char **err);
+	int skip; /* nb min of args to skip, for use when kw is not handled */
+	int default_ok; /* non-zero if kw is supported in default-server section */
+};
+
+/*
+ * A keyword list. It is a NULL-terminated array of keywords. It embeds a
+ * struct list in order to be linked to other lists, allowing it to easily
+ * be declared where it is needed, and linked without duplicating data nor
+ * allocating memory. It is also possible to indicate a scope for the keywords.
+ */
+struct srv_kw_list {
+	const char *scope;
+	struct list list;
+	struct srv_kw kw[VAR_ARRAY];
+};
 
 #endif /* _TYPES_SERVER_H */
 

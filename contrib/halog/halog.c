@@ -1,7 +1,7 @@
 /*
  * haproxy log statistics reporter
  *
- * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2012 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -113,17 +113,21 @@ struct url_stat {
 			      FILT_COUNT_URL_TTOT|FILT_COUNT_URL_TAVG|FILT_COUNT_URL_TTOTO|FILT_COUNT_URL_TAVGO| \
 			      FILT_COUNT_URL_BAVG|FILT_COUNT_URL_BTOT)
 
+#define FILT_COUNT_COOK_CODES 0x40000000
+
 unsigned int filter = 0;
 unsigned int filter_invert = 0;
 const char *line;
 int linenum = 0;
 int parse_err = 0;
 int lines_out = 0;
+int lines_max = -1;
 
 const char *fgets2(FILE *stream);
 
 void filter_count_url(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_count_srv_status(const char *accept_field, const char *time_field, struct timer **tptr);
+void filter_count_cook_codes(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_count_term_codes(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_count_status(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_graphs(const char *accept_field, const char *time_field, struct timer **tptr);
@@ -135,8 +139,8 @@ void usage(FILE *output, const char *msg)
 	fprintf(output,
 		"%s"
 		"Usage: halog [-h|--help] for long help\n"
-		"       halog [-q] [-c]\n"
-		"       {-gt|-pct|-st|-tc|-srv|-u|-uc|-ue|-ua|-ut|-uao|-uto|-uba|-ubt}\n"
+		"       halog [-q] [-c] [-m <lines>]\n"
+		"       {-cc|-gt|-pct|-st|-tc|-srv|-u|-uc|-ue|-ua|-ut|-uao|-uto|-uba|-ubt}\n"
 		"       [-s <skip>] [-e|-E] [-H] [-rt|-RT <time>] [-ad <delay>] [-ac <count>]\n"
 		"       [-v] [-Q|-QS] [-tcn|-TCN <termcode>] [ -hs|-HS [min][:[max]] ] < log\n"
 		"\n",
@@ -167,17 +171,18 @@ void help()
 	       "Modifiers\n"
 	       " -v                      invert the input filtering condition\n"
 	       " -q                      don't report errors/warnings\n"
-	       "\n"
+	       " -m <lines>              limit output to the first <lines> lines\n"
 	       "Output filters - only one may be used at a time\n"
 	       " -c    only report the number of lines that would have been printed\n"
 	       " -pct  output connect and response times percentiles\n"
 	       " -st   output number of requests per HTTP status code\n"
+	       " -cc   output number of requests per cookie code (2 chars)\n"
 	       " -tc   output number of requests per termination code (2 chars)\n"
 	       " -srv  output statistics per server (time, requests, errors)\n"
 	       " -u*   output statistics per URL (time, requests, errors)\n"
 	       "       Additional characters indicate the output sorting key :\n"
 	       "       -u : by URL, -uc : request count, -ue : error count\n"
-	       "       -ua : average response time, -uto : average total time\n"
+	       "       -ua : average response time, -ut : average total time\n"
 	       "       -uao, -uto: average times computed on valid ('OK') requests\n"
 	       "       -uba, -ubt: average bytes returned, total bytes returned\n"
 	       );
@@ -571,6 +576,11 @@ int main(int argc, char **argv)
 			argc--; argv++;
 			skip_fields = atol(*argv);
 		}
+		else if (strcmp(argv[0], "-m") == 0) {
+			if (argc < 2) die("missing option for -m");
+			argc--; argv++;
+			lines_max = atol(*argv);
+		}
 		else if (strcmp(argv[0], "-e") == 0)
 			filter |= FILT_ERRORS_ONLY;
 		else if (strcmp(argv[0], "-E") == 0)
@@ -595,6 +605,8 @@ int main(int argc, char **argv)
 			filter |= FILT_COUNT_STATUS;
 		else if (strcmp(argv[0], "-srv") == 0)
 			filter |= FILT_COUNT_SRV_STATUS;
+		else if (strcmp(argv[0], "-cc") == 0)
+			filter |= FILT_COUNT_COOK_CODES;
 		else if (strcmp(argv[0], "-tc") == 0)
 			filter |= FILT_COUNT_TERM_CODES;
 		else if (strcmp(argv[0], "-tcn") == 0) {
@@ -676,6 +688,8 @@ int main(int argc, char **argv)
 		line_filter = filter_graphs;
 	else if (filter & FILT_COUNT_STATUS)
 		line_filter = filter_count_status;
+	else if (filter & FILT_COUNT_COOK_CODES)
+		line_filter = filter_count_cook_codes;
 	else if (filter & FILT_COUNT_TERM_CODES)
 		line_filter = filter_count_term_codes;
 	else if (filter & FILT_COUNT_SRV_STATUS)
@@ -694,7 +708,7 @@ int main(int argc, char **argv)
 	posix_fadvise(0, 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
 
-	if (!line_filter &&
+	if (!line_filter && lines_max >= 0 &&
 	    !(filter & (FILT_HTTP_ONLY|FILT_TIME_RESP|FILT_ERRORS_ONLY|FILT_HTTP_STATUS|FILT_QUEUE_ONLY|FILT_QUEUE_SRV_ONLY|FILT_TERM_CODE_NAME))) {
 		/* read the whole file at once first */
 		if (!filter_invert)
@@ -859,6 +873,8 @@ int main(int argc, char **argv)
 			line_filter(accept_field, time_field, &t);
 		else
 			lines_out++; /* we're just counting lines */
+		if (lines_out >= lines_max)
+			break;
 	}
 
  skip_filters:
@@ -896,8 +912,10 @@ int main(int argc, char **argv)
 				ms = h % 1000; h = h / 1000;
 				s = h % 60; h = h / 60;
 				m = h % 60; h = h / 60;
-				lines_out++;
 				printf("%02d:%02d:%02d.%03d %d %d %d\n", h, m, s, ms, last, d, t->count);
+				lines_out++;
+				if (lines_out >= lines_max)
+					break;
 			}
 			n = eb32_next(n);
 		}
@@ -929,6 +947,8 @@ int main(int argc, char **argv)
 				if (d > 0.0) {
 					printf("%d %d %f\n", f, last, d+1.0);
 					lines_out++;
+					if (lines_out >= lines_max)
+						break;
 				}
 
 				n = eb32_next(n);
@@ -986,6 +1006,8 @@ int main(int argc, char **argv)
 			t = container_of(n, struct timer, node);
 			printf("%d %d\n", n->key, t->count);
 			lines_out++;
+			if (lines_out >= lines_max)
+				break;
 			n = eb32_next(n);
 		}
 	}
@@ -1013,15 +1035,19 @@ int main(int argc, char **argv)
 			       (int)(srv->cum_ct / (srv->nb_ct?srv->nb_ct:1)), (int)(srv->cum_rt / (srv->nb_rt?srv->nb_rt:1)));
 			srv_node = ebmb_next(srv_node);
 			lines_out++;
+			if (lines_out >= lines_max)
+				break;
 		}
 	}
-	else if (filter & FILT_COUNT_TERM_CODES) {
+	else if (filter & (FILT_COUNT_TERM_CODES|FILT_COUNT_COOK_CODES)) {
 		/* output all statuses in the form of <code> <occurrences> */
 		n = eb32_first(&timers[0]);
 		while (n) {
 			t = container_of(n, struct timer, node);
 			printf("%c%c %d\n", (n->key >> 8), (n->key) & 255, t->count);
 			lines_out++;
+			if (lines_out >= lines_max)
+				break;
 			n = eb32_next(n);
 		}
 	}
@@ -1084,6 +1110,8 @@ int main(int argc, char **argv)
 
 			node = eb_prev(node);
 			lines_out++;
+			if (lines_out >= lines_max)
+				break;
 		}
 	}
 
@@ -1113,7 +1141,6 @@ void filter_accept_holes(const char *accept_field, const char *time_field, struc
 
 	t2 = insert_value(&timers[0], tptr, val);
 	t2->count++;
-	lines_out++;
 	return;
 }
 
@@ -1134,6 +1161,28 @@ void filter_count_status(const char *accept_field, const char *time_field, struc
 	}
 
 	val = str2ic(b);
+
+	t2 = insert_value(&timers[0], tptr, val);
+	t2->count++;
+}
+
+void filter_count_cook_codes(const char *accept_field, const char *time_field, struct timer **tptr)
+{
+	struct timer *t2;
+	const char *b;
+	int val;
+
+	if (time_field)
+		b = field_start(time_field, TERM_CODES_FIELD - TIME_FIELD + 1);
+	else
+		b = field_start(accept_field, TERM_CODES_FIELD - ACCEPT_FIELD + 1);
+
+	if (unlikely(!*b)) {
+		truncated_line(linenum, line);
+		return;
+	}
+
+	val = 256 * b[2] + b[3];
 
 	t2 = insert_value(&timers[0], tptr, val);
 	t2->count++;

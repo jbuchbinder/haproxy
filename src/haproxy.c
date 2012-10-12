@@ -125,8 +125,16 @@ struct global global = {
 		.sslcachesize = 20000,
 #endif
 	},
-#if defined (USE_OPENSSL) && defined(DEFAULT_MAXSSLCONN)
+#ifdef USE_OPENSSL
+#ifdef DEFAULT_MAXSSLCONN
 	.maxsslconn = DEFAULT_MAXSSLCONN,
+#endif
+#ifdef LISTEN_DEFAULT_CIPHERS
+	.listen_default_ciphers = LISTEN_DEFAULT_CIPHERS,
+#endif
+#ifdef CONNECT_DEFAULT_CIPHERS
+	.connect_default_ciphers = CONNECT_DEFAULT_CIPHERS,
+#endif
 #endif
 	/* others NULL OK */
 };
@@ -1039,10 +1047,10 @@ void deinit(void)
 		list_for_each_entry_safe(bind_conf, bind_back, &p->conf.bind, by_fe) {
 #ifdef USE_OPENSSL
 			ssl_sock_free_all_ctx(bind_conf);
-			free(bind_conf->cafile);
+			free(bind_conf->ca_file);
 			free(bind_conf->ciphers);
 			free(bind_conf->ecdhe);
-			free(bind_conf->crlfile);
+			free(bind_conf->crl_file);
 #endif /* USE_OPENSSL */
 			free(bind_conf->file);
 			free(bind_conf->arg);

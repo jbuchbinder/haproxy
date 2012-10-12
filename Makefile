@@ -28,6 +28,8 @@
 #   USE_GETADDRINFO      : use getaddrinfo() to resolve IPv6 host names.
 #   USE_OPENSSL          : enable use of OpenSSL. Recommended, but see below.
 #   USE_FUTEX            : enable use of futex on kernel 2.6. Automatic.
+#   USE_ACCEPT4          : enable use of accept4() on linux. Automatic.
+#   USE_MY_ACCEPT4       : use own implemention of accept4() if glibc < 2.10.
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -139,6 +141,11 @@ ADDLIB =
 # Use DEFINE=-Dxxx to set any tunable macro. Anything declared here will appear
 # in the build options reported by "haproxy -vv". Use SILENT_DEFINE if you do
 # not want to pollute the report with complex defines.
+# The following settings might be of interest when SSL is enabled :
+#   LISTEN_DEFAULT_CIPHERS is a cipher suite string used to set the default SSL
+#           ciphers on "bind" lines instead of using OpenSSL's defaults.
+#   CONNECT_DEFAULT_CIPHERS is a cipher suite string used to set the default
+#           SSL ciphers on "server" lines instead of using OpenSSL's defaults.
 DEFINE =
 SILENT_DEFINE =
 
@@ -235,6 +242,7 @@ ifeq ($(TARGET),linux2628)
   USE_LIBCRYPT    = implicit
   USE_LINUX_SPLICE= implicit
   USE_LINUX_TPROXY= implicit
+  USE_ACCEPT4     = implicit
   USE_FUTEX       = implicit
 else
 ifeq ($(TARGET),solaris)
@@ -432,6 +440,16 @@ endif
 ifneq ($(USE_MY_SPLICE),)
 OPTIONS_CFLAGS += -DUSE_MY_SPLICE
 BUILD_OPTIONS  += $(call ignore_implicit,USE_MY_SPLICE)
+endif
+
+ifneq ($(USE_ACCEPT4),)
+OPTIONS_CFLAGS += -DUSE_ACCEPT4
+BUILD_OPTIONS  += $(call ignore_implicit,USE_ACCEPT4)
+endif
+
+ifneq ($(USE_MY_ACCEPT4),)
+OPTIONS_CFLAGS += -DUSE_MY_ACCEPT4
+BUILD_OPTIONS  += $(call ignore_implicit,USE_MY_ACCEPT4)
 endif
 
 ifneq ($(USE_NETFILTER),)

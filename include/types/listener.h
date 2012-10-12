@@ -88,26 +88,38 @@ enum {
 #define LI_O_CHK_MONNET 0x0020  /* check the source against a monitor-net rule */
 #define LI_O_ACC_PROXY  0x0040  /* find the proxied address in the first request line */
 #define LI_O_UNLIMITED  0x0080  /* listener not subject to global limits (peers & stats socket) */
+#define LI_O_TCP_FO     0x0100  /* enable TCP Fast Open (linux >= 3.6) */
 
 /* Note: if a listener uses LI_O_UNLIMITED, it is highly recommended that it adds its own
  * maxconn setting to the global.maxsock value so that its resources are reserved.
  */
 
+#ifdef USE_OPENSSL
+/* bind_conf ssl options */
+#define BC_SSL_O_NONE           0x0000
+#define BC_SSL_O_NO_SSLV3       0x0001	/* disable SSLv3 */
+#define BC_SSL_O_NO_TLSV10      0x0002	/* disable TLSv10 */
+#define BC_SSL_O_NO_TLSV11      0x0004	/* disable TLSv11 */
+#define BC_SSL_O_NO_TLSV12      0x0008	/* disable TLSv12 */
+/* 0x000F reserved for 'no' protocol version options */
+#define BC_SSL_O_USE_SSLV3      0x0010	/* force SSLv3 */
+#define BC_SSL_O_USE_TLSV10     0x0020	/* force TLSv10 */
+#define BC_SSL_O_USE_TLSV11     0x0040	/* force TLSv11 */
+#define BC_SSL_O_USE_TLSV12     0x0080	/* force TLSv12 */
+/* 0x00F0 reserved for 'force' protocol version options */
+#define BC_SSL_O_NO_TLS_TICKETS 0x0100	/* disable session resumption tickets */
+#endif
+
 /* "bind" line settings */
 struct bind_conf {
 #ifdef USE_OPENSSL
-	char *cafile;              /* CAfile to use on verify */
+	char *ca_file;             /* CAfile to use on verify */
 	unsigned long long ca_ignerr;  /* ignored verify errors in handshake if depth > 0 */
 	unsigned long long crt_ignerr; /* ignored verify errors in handshake if depth == 0 */
 	char *ciphers;             /* cipher suite to use if non-null */
-	char *crlfile;             /* CRLfile to use on verify */
+	char *crl_file;            /* CRLfile to use on verify */
 	char *ecdhe;               /* named curve to use for ECDHE */
-	int no_tls_tickets;        /* disable session resumption tickets */
-	int nosslv3;               /* disable SSLv3 */
-	int notlsv10;              /* disable TLSv1.0 */
-	int notlsv11;              /* disable TLSv1.1 */
-	int notlsv12;              /* disable TLSv1.2 */
-	int prefer_server_ciphers; /* Prefer server ciphers */
+	int ssl_options;           /* ssl options */
 	int verify;                /* verify method (set of SSL_VERIFY_* flags) */
 	SSL_CTX *default_ctx;      /* SSL context of first/default certificate */
 	struct eb_root sni_ctx;    /* sni_ctx tree of all known certs full-names sorted by name */

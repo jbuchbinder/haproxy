@@ -65,6 +65,7 @@
 #include <proto/freq_ctr.h>
 #include <proto/frontend.h>
 #include <proto/listener.h>
+#include <proto/server.h>
 #include <proto/log.h>
 #include <proto/shctx.h>
 #include <proto/ssl_sock.h>
@@ -477,46 +478,57 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 		SSL_OP_NO_COMPRESSION |
 		SSL_OP_SINGLE_DH_USE |
 		SSL_OP_SINGLE_ECDH_USE |
-		SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
+		SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION |
+		SSL_OP_CIPHER_SERVER_PREFERENCE;
 	int sslmode =
 		SSL_MODE_ENABLE_PARTIAL_WRITE |
 		SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
 		SSL_MODE_RELEASE_BUFFERS;
 
-	if (bind_conf->nosslv3)
+	if (bind_conf->ssl_options & BC_SSL_O_NO_SSLV3)
 		ssloptions |= SSL_OP_NO_SSLv3;
-	if (bind_conf->notlsv10)
+	if (bind_conf->ssl_options & BC_SSL_O_NO_TLSV10)
 		ssloptions |= SSL_OP_NO_TLSv1;
-	if (bind_conf->notlsv11)
+	if (bind_conf->ssl_options & BC_SSL_O_NO_TLSV11)
 		ssloptions |= SSL_OP_NO_TLSv1_1;
-	if (bind_conf->notlsv12)
+	if (bind_conf->ssl_options & BC_SSL_O_NO_TLSV12)
 		ssloptions |= SSL_OP_NO_TLSv1_2;
-	if (bind_conf->no_tls_tickets)
+	if (bind_conf->ssl_options & BC_SSL_O_NO_TLS_TICKETS)
 		ssloptions |= SSL_OP_NO_TICKET;
-	if (bind_conf->prefer_server_ciphers)
-		ssloptions |= SSL_OP_CIPHER_SERVER_PREFERENCE;
+	if (bind_conf->ssl_options & BC_SSL_O_USE_SSLV3)
+		SSL_CTX_set_ssl_version(ctx, SSLv3_server_method());
+	if (bind_conf->ssl_options & BC_SSL_O_USE_TLSV10)
+		SSL_CTX_set_ssl_version(ctx, TLSv1_server_method());
+#if SSL_OP_NO_TLSv1_1
+	if (bind_conf->ssl_options & BC_SSL_O_USE_TLSV11)
+		SSL_CTX_set_ssl_version(ctx, TLSv1_1_server_method());
+#endif
+#if SSL_OP_NO_TLSv1_2
+	if (bind_conf->ssl_options & BC_SSL_O_USE_TLSV12)
+		SSL_CTX_set_ssl_version(ctx, TLSv1_2_server_method());
+#endif
 
 	SSL_CTX_set_options(ctx, ssloptions);
 	SSL_CTX_set_mode(ctx, sslmode);
 	SSL_CTX_set_verify(ctx, bind_conf->verify ? bind_conf->verify : SSL_VERIFY_NONE, ssl_sock_verifycbk);
 	if (bind_conf->verify & SSL_VERIFY_PEER) {
-		if (bind_conf->cafile) {
+		if (bind_conf->ca_file) {
 			/* load CAfile to verify */
-			if (!SSL_CTX_load_verify_locations(ctx, bind_conf->cafile, NULL)) {
+			if (!SSL_CTX_load_verify_locations(ctx, bind_conf->ca_file, NULL)) {
 				Alert("Proxy '%s': unable to load CA file '%s' for bind '%s' at [%s:%d].\n",
-				      curproxy->id, bind_conf->cafile, bind_conf->arg, bind_conf->file, bind_conf->line);
+				      curproxy->id, bind_conf->ca_file, bind_conf->arg, bind_conf->file, bind_conf->line);
 				cfgerr++;
 			}
 			/* set CA names fo client cert request, function returns void */
-			SSL_CTX_set_client_CA_list(ctx, SSL_load_client_CA_file(bind_conf->cafile));
+			SSL_CTX_set_client_CA_list(ctx, SSL_load_client_CA_file(bind_conf->ca_file));
 		}
 #ifdef X509_V_FLAG_CRL_CHECK
-		if (bind_conf->crlfile) {
+		if (bind_conf->crl_file) {
 			X509_STORE *store = SSL_CTX_get_cert_store(ctx);
 
-			if (!store || !X509_STORE_load_locations(store, bind_conf->crlfile, NULL)) {
+			if (!store || !X509_STORE_load_locations(store, bind_conf->crl_file, NULL)) {
 				Alert("Proxy '%s': unable to configure CRL file '%s' for bind '%s' at [%s:%d].\n",
-				      curproxy->id, bind_conf->cafile, bind_conf->arg, bind_conf->file, bind_conf->line);
+				      curproxy->id, bind_conf->ca_file, bind_conf->arg, bind_conf->file, bind_conf->line);
 				cfgerr++;
 			}
 			else {
@@ -748,6 +760,12 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 	return 1;
 
  out_error:
+	/* free resumed session if exists */
+	if (target_srv(&conn->target) && target_srv(&conn->target)->ssl_ctx.reused_sess) {
+		SSL_SESSION_free(target_srv(&conn->target)->ssl_ctx.reused_sess);
+		target_srv(&conn->target)->ssl_ctx.reused_sess = NULL;
+	}
+
 	/* Fail on all other handshake errors */
 	conn->flags |= CO_FL_ERROR;
 	conn->flags &= ~flag;
@@ -1093,8 +1111,8 @@ smp_fetch_verify_result(struct proxy *px, struct session *l4, void *l7, unsigned
 	return 1;
 }
 
-/* parse the "cafile" bind keyword */
-static int bind_parse_cafile(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+/* parse the "ca-file" bind keyword */
+static int bind_parse_ca_file(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	if (!*args[cur_arg + 1]) {
 		if (err)
@@ -1102,7 +1120,14 @@ static int bind_parse_cafile(char **args, int cur_arg, struct proxy *px, struct 
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	conf->cafile = strdup(args[cur_arg + 1]);
+	if ((*args[cur_arg + 1] != '/') && global.ca_base) {
+		conf->ca_file = malloc(strlen(global.ca_base) + 1 + strlen(args[cur_arg + 1]) + 1);
+		if (conf->ca_file)
+			sprintf(conf->ca_file, "%s/%s", global.ca_base, args[cur_arg + 1]);
+		return 0;
+	}
+
+	conf->ca_file = strdup(args[cur_arg + 1]);
 	return 0;
 }
 
@@ -1114,6 +1139,7 @@ static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct
 		return ERR_ALERT | ERR_FATAL;
 	}
 
+	free(conf->ciphers);
 	conf->ciphers = strdup(args[cur_arg + 1]);
 	return 0;
 }
@@ -1121,9 +1147,22 @@ static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct
 /* parse the "crt" bind keyword */
 static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
+	char path[PATH_MAX];
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if ((*args[cur_arg + 1] != '/' ) && global.crt_base) {
+		if ((strlen(global.crt_base) + 1 + strlen(args[cur_arg + 1]) + 1) > PATH_MAX) {
+			memprintf(err, "'%s' : path too long", args[cur_arg]);
+			return ERR_ALERT | ERR_FATAL;
+		}
+		sprintf(path, "%s/%s",  global.crt_base, args[cur_arg + 1]);
+		if (ssl_sock_load_cert(path, conf, px, err) > 0)
+			return ERR_ALERT | ERR_FATAL;
+
+		return 0;
 	}
 
 	if (ssl_sock_load_cert(args[cur_arg + 1], conf, px, err) > 0)
@@ -1132,8 +1171,8 @@ static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bin
 	return 0;
 }
 
-/* parse the "crlfile" bind keyword */
-static int bind_parse_crlfile(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+/* parse the "crl-file" bind keyword */
+static int bind_parse_crl_file(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 #ifndef X509_V_FLAG_CRL_CHECK
 	if (err)
@@ -1146,7 +1185,14 @@ static int bind_parse_crlfile(char **args, int cur_arg, struct proxy *px, struct
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	conf->crlfile = strdup(args[cur_arg + 1]);
+	if ((*args[cur_arg + 1] != '/') && global.ca_base) {
+		conf->crl_file = malloc(strlen(global.ca_base) + 1 + strlen(args[cur_arg + 1]) + 1);
+		if (conf->crl_file)
+			sprintf(conf->crl_file, "%s/%s", global.ca_base, args[cur_arg + 1]);
+		return 0;
+	}
+
+	conf->crl_file = strdup(args[cur_arg + 1]);
 	return 0;
 #endif
 }
@@ -1213,46 +1259,80 @@ static int bind_parse_ignore_err(char **args, int cur_arg, struct proxy *px, str
 	return 0;
 }
 
+/* parse the "force-sslv3" bind keyword */
+static int bind_parse_force_sslv3(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	conf->ssl_options |= BC_SSL_O_USE_SSLV3;
+	return 0;
+}
+
+/* parse the "force-tlsv10" bind keyword */
+static int bind_parse_force_tlsv10(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	conf->ssl_options |= BC_SSL_O_USE_TLSV10;
+	return 0;
+}
+
+/* parse the "force-tlsv11" bind keyword */
+static int bind_parse_force_tlsv11(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+#if SSL_OP_NO_TLSv1_1
+	conf->ssl_options |= BC_SSL_O_USE_TLSV11;
+	return 0;
+#else
+	if (err)
+		memprintf(err, "'%s' : library does not support protocol TLSv1.1", args[cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+
+/* parse the "force-tlsv12" bind keyword */
+static int bind_parse_force_tlsv12(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+#if SSL_OP_NO_TLSv1_2
+	conf->ssl_options |= BC_SSL_O_USE_TLSV12;
+	return 0;
+#else
+	if (err)
+		memprintf(err, "'%s' : library does not support protocol TLSv1.2", args[cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+
+
 /* parse the "no-tls-tickets" bind keyword */
 static int bind_parse_no_tls_tickets(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->no_tls_tickets = 1;
+	conf->ssl_options |= BC_SSL_O_NO_TLS_TICKETS;
 	return 0;
 }
 
 
-/* parse the "nosslv3" bind keyword */
-static int bind_parse_nosslv3(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+/* parse the "no-sslv3" bind keyword */
+static int bind_parse_no_sslv3(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->nosslv3 = 1;
+	conf->ssl_options |= BC_SSL_O_NO_SSLV3;
 	return 0;
 }
 
-/* parse the "notlsv1" bind keyword */
-static int bind_parse_notlsv10(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+/* parse the "no-tlsv10" bind keyword */
+static int bind_parse_no_tlsv10(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->notlsv10 = 1;
+	conf->ssl_options |= BC_SSL_O_NO_TLSV10;
 	return 0;
 }
 
-/* parse the "notlsv11" bind keyword */
-static int bind_parse_notlsv11(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+/* parse the "no-tlsv11" bind keyword */
+static int bind_parse_no_tlsv11(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->notlsv11 = 1;
+	conf->ssl_options |= BC_SSL_O_NO_TLSV11;
 	return 0;
 }
 
-/* parse the "notlsv12" bind keyword */
-static int bind_parse_notlsv12(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+/* parse the "no-tlsv12" bind keyword */
+static int bind_parse_no_tlsv12(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->notlsv12 = 1;
-	return 0;
-}
-
-/* parse the "prefer-server-ciphers" bind keyword */
-static int bind_parse_psc(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	conf->prefer_server_ciphers = 1;
+	conf->ssl_options |= BC_SSL_O_NO_TLSV12;
 	return 0;
 }
 
@@ -1262,6 +1342,10 @@ static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct bin
 	struct listener *l;
 
 	conf->is_ssl = 1;
+
+	if (global.listen_default_ciphers && !conf->ciphers)
+		conf->ciphers = strdup(global.listen_default_ciphers);
+
 	list_for_each_entry(l, &conf->listeners, by_bind)
 		l->xprt = &ssl_sock;
 
@@ -1290,6 +1374,107 @@ static int bind_parse_verify(char **args, int cur_arg, struct proxy *px, struct 
 		return ERR_ALERT | ERR_FATAL;
 	}
 
+	return 0;
+}
+
+/************** "server" keywords ****************/
+
+/* parse the "check-ssl" server keyword */
+static int srv_parse_check_ssl(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->check.use_ssl = 1;
+	if (global.connect_default_ciphers && !newsrv->ssl_ctx.ciphers)
+		newsrv->ssl_ctx.ciphers = strdup(global.connect_default_ciphers);
+	return 0;
+}
+
+/* parse the "ciphers" server keyword */
+static int srv_parse_ciphers(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' : missing cipher suite", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	free(newsrv->ssl_ctx.ciphers);
+	newsrv->ssl_ctx.ciphers = strdup(args[*cur_arg + 1]);
+	return 0;
+}
+
+/* parse the "force-sslv3" server keyword */
+static int srv_parse_force_sslv3(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_USE_SSLV3;
+	return 0;
+}
+
+/* parse the "force-tlsv10" server keyword */
+static int srv_parse_force_tlsv10(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_USE_TLSV10;
+	return 0;
+}
+
+/* parse the "force-tlsv11" server keyword */
+static int srv_parse_force_tlsv11(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+#if SSL_OP_NO_TLSv1_1
+	newsrv->ssl_ctx.options |= SRV_SSL_O_USE_TLSV11;
+	return 0;
+#else
+	if (err)
+		memprintf(err, "'%s' : library does not support protocol TLSv1.1", args[*cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+
+/* parse the "force-tlsv12" server keyword */
+static int srv_parse_force_tlsv12(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+#if SSL_OP_NO_TLSv1_2
+	newsrv->ssl_ctx.options |= SRV_SSL_O_USE_TLSV12;
+	return 0;
+#else
+	if (err)
+		memprintf(err, "'%s' : library does not support protocol TLSv1.2", args[*cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+
+/* parse the "no-sslv3" server keyword */
+static int srv_parse_no_sslv3(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_NO_SSLV3;
+	return 0;
+}
+
+/* parse the "no-tlsv10" server keyword */
+static int srv_parse_no_tlsv10(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_NO_TLSV10;
+	return 0;
+}
+
+/* parse the "no-tlsv11" server keyword */
+static int srv_parse_no_tlsv11(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_NO_TLSV11;
+	return 0;
+}
+
+/* parse the "no-tlsv12" server keyword */
+static int srv_parse_no_tlsv12(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_NO_TLSV12;
+	return 0;
+}
+
+/* parse the "ssl" server keyword */
+static int srv_parse_ssl(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->use_ssl = 1;
+	if (global.connect_default_ciphers && !newsrv->ssl_ctx.ciphers)
+		newsrv->ssl_ctx.ciphers = strdup(global.connect_default_ciphers);
 	return 0;
 }
 
@@ -1333,22 +1518,47 @@ static struct acl_kw_list acl_kws = {{ },{
  * not enabled.
  */
 static struct bind_kw_list bind_kws = { "SSL", { }, {
-	{ "cafile",                bind_parse_cafile,         1 }, /* set CAfile to process verify on client cert */
+	{ "ca-file",               bind_parse_ca_file,        1 }, /* set CAfile to process verify on client cert */
 	{ "ca-ignore-err",         bind_parse_ignore_err,     1 }, /* set error IDs to ignore on verify depth > 0 */
 	{ "ciphers",               bind_parse_ciphers,        1 }, /* set SSL cipher suite */
-	{ "crlfile",               bind_parse_crlfile,        1 }, /* set certificat revocation list file use on client cert verify */
+	{ "crl-file",              bind_parse_crl_file,       1 }, /* set certificat revocation list file use on client cert verify */
 	{ "crt",                   bind_parse_crt,            1 }, /* load SSL certificates from this location */
 	{ "crt-ignore-err",        bind_parse_ignore_err,     1 }, /* set error IDs to ingore on verify depth == 0 */
 	{ "ecdhe",                 bind_parse_ecdhe,          1 }, /* defines named curve for elliptic curve Diffie-Hellman */
+	{ "force-sslv3",           bind_parse_force_sslv3,    0 }, /* force SSLv3 */
+	{ "force-tlsv10",          bind_parse_force_tlsv10,   0 }, /* force TLSv10 */
+	{ "force-tlsv11",          bind_parse_force_tlsv11,   0 }, /* force TLSv11 */
+	{ "force-tlsv12",          bind_parse_force_tlsv12,   0 }, /* force TLSv12 */
+	{ "no-sslv3",              bind_parse_no_sslv3,       0 }, /* disable SSLv3 */
+	{ "no-tlsv10",             bind_parse_no_tlsv10,      0 }, /* disable TLSv10 */
+	{ "no-tlsv11",             bind_parse_no_tlsv11,      0 }, /* disable TLSv11 */
+	{ "no-tlsv12",             bind_parse_no_tlsv12,      0 }, /* disable TLSv12 */
 	{ "no-tls-tickets",        bind_parse_no_tls_tickets, 0 }, /* disable session resumption tickets */
-	{ "nosslv3",               bind_parse_nosslv3,        0 }, /* disable SSLv3 */
-	{ "notlsv10",              bind_parse_notlsv10,       0 }, /* disable TLSv10 */
-	{ "notlsv11",              bind_parse_notlsv11,       0 }, /* disable TLSv11 */
-	{ "notlsv12",              bind_parse_notlsv12,       0 }, /* disable TLSv12 */
-	{ "prefer-server-ciphers", bind_parse_psc,            0 }, /* prefer server ciphers */
 	{ "ssl",                   bind_parse_ssl,            0 }, /* enable SSL processing */
 	{ "verify",                bind_parse_verify,         1 }, /* set SSL verify method */
 	{ NULL, NULL, 0 },
+}};
+
+/* Note: must not be declared <const> as its list will be overwritten.
+ * Please take care of keeping this list alphabetically sorted, doing so helps
+ * all code contributors.
+ * Optional keywords are also declared with a NULL ->parse() function so that
+ * the config parser can report an appropriate error when a known keyword was
+ * not enabled.
+ */
+static struct srv_kw_list srv_kws = { "SSL", { }, {
+	{ "check-ssl",             srv_parse_check_ssl,      0, 1 }, /* enable SSL for health checks */
+	{ "ciphers",               srv_parse_ciphers,        1, 1 }, /* select the cipher suite */
+	{ "force-sslv3",           srv_parse_force_sslv3,    0, 1 }, /* force SSLv3 */
+	{ "force-tlsv10",          srv_parse_force_tlsv10,   0, 1 }, /* force TLSv10 */
+	{ "force-tlsv11",          srv_parse_force_tlsv11,   0, 1 }, /* force TLSv11 */
+	{ "force-tlsv12",          srv_parse_force_tlsv12,   0, 1 }, /* force TLSv12 */
+	{ "no-sslv3",              srv_parse_no_sslv3,       0, 1 }, /* disable SSLv3 */
+	{ "no-tlsv10",             srv_parse_no_tlsv10,      0, 1 }, /* disable TLSv10 */
+	{ "no-tlsv11",             srv_parse_no_tlsv11,      0, 1 }, /* disable TLSv11 */
+	{ "no-tlsv12",             srv_parse_no_tlsv12,      0, 1 }, /* disable TLSv12 */
+	{ "ssl",                   srv_parse_ssl,            0, 1 }, /* enable SSL processing */
+	{ NULL, NULL, 0, 0 },
 }};
 
 /* transport-layer operations for SSL sockets */
@@ -1364,7 +1574,8 @@ struct xprt_ops ssl_sock = {
 };
 
 __attribute__((constructor))
-static void __ssl_sock_init(void) {
+static void __ssl_sock_init(void)
+{
 	STACK_OF(SSL_COMP)* cm;
 
 	SSL_library_init();
@@ -1373,6 +1584,7 @@ static void __ssl_sock_init(void) {
 	sample_register_fetches(&sample_fetch_keywords);
 	acl_register_keywords(&acl_kws);
 	bind_register_keywords(&bind_kws);
+	srv_register_keywords(&srv_kws);
 }
 
 /*

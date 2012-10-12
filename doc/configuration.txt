@@ -434,7 +434,9 @@ of them have command-line equivalents.
 The following keywords are supported in the "global" section :
 
  * Process management and security
+   - ca-base
    - chroot
+   - crt-base
    - daemon
    - gid
    - group
@@ -481,6 +483,11 @@ The following keywords are supported in the "global" section :
 3.1. Process management and security
 ------------------------------------
 
+ca-base <dir>
+  Assigns a default directory to fetch SSL CA certificates and CRLs from when a
+  relative path is used with "cafile" or "crlfile" directives. Absolute
+  locations specified in "cafile" and "crlfile" prevail and ignore "ca-base".
+
 chroot <jail dir>
   Changes current directory to <jail dir> and performs a chroot() there before
   dropping privileges. This increases the security level in case an unknown
@@ -488,6 +495,11 @@ chroot <jail dir>
   attacker to exploit the system. This only works when the process is started
   with superuser privileges. It is important to ensure that <jail_dir> is both
   empty and unwritable to anyone.
+
+crt-base <dir>
+  Assigns a default directory to fetch SSL certificates from when a relative
+  path is used with "crtfile" directives. Absolute locations specified after
+  "crtfile" prevail and ignore "crt-base".
 
 daemon
   Makes the process fork into background. This is the recommended mode of
@@ -1521,7 +1533,7 @@ bind /<path> [, ...] [param*]
 
         listen http_https_proxy
             bind :80
-            bind :443 ssl crt /etc/haproxy/site.pem prefer-server-ciphers
+            bind :443 ssl crt /etc/haproxy/site.pem
 
   See also : "source", "option forwardfor", "unix-bind" and the PROXY protocol
              documentation, and section 5 about bind options.
@@ -6807,6 +6819,23 @@ defer-accept
   an established connection while the proxy will only see it in SYN_RECV. This
   option is only supported on TCPv4/TCPv6 sockets and ignored by other ones.
 
+force-sslv3
+  This option enforces use of SSLv3 only on SSL connections instanciated from
+  this listener. SSLv3 is generally less expensive than the TLS counterparts
+  for high connection rates. See also "force-tls*", "no-sslv3", and "no-tls*".
+
+force-tlsv10
+  This option enforces use of TLSv1.0 only on SSL connections instanciated from
+  this listener. See also "force-tls*", "no-sslv3", and "no-tls*".
+
+force-tlsv11
+  This option enforces use of TLSv1.1 only on SSL connections instanciated from
+  this listener. See also "force-tls*", "no-sslv3", and "no-tls*".
+
+force-tlsv12
+  This option enforces use of TLSv1.2 only on SSL connections instanciated from
+  this listener. See also "force-tls*", "no-sslv3", and "no-tls*".
+
 gid <gid>
   Sets the group of the UNIX sockets to the designated system gid. It can also
   be set by default in the global section's "unix-bind" statement. Note that
@@ -6895,11 +6924,12 @@ nice <nice>
   it may make sense to use a positive value for an SMTP socket and a negative
   one for an RDP socket.
 
-nosslv3
+no-sslv3
   This setting is only available when support for OpenSSL was built in. It
   disables support for SSLv3 on any sockets instanciated from the listener when
   SSL is supported. Note that SSLv2 is forced disabled in the code and cannot
-  be enabled using any configuration option.
+  be enabled using any configuration option. See also "force-tls*",
+  and "force-sslv3".
 
 no-tls-tickets
   This setting is only available when support for OpenSSL was built in. It
@@ -6907,28 +6937,26 @@ no-tls-tickets
   extension) and force to use stateful session resumption. Stateless
   session resumption is more expensive in CPU usage.
 
-notlsv10
+no-tlsv10
   This setting is only available when support for OpenSSL was built in. It
-  disables support for TLSv10 on any sockets instanciated from the listener when
-  SSL is supported. Note that SSLv2 is forced disabled in the code and cannot
-  be enabled using any configuration option.
+  disables support for TLSv1.0 on any sockets instanciated from the listener
+  when SSL is supported. Note that SSLv2 is forced disabled in the code and
+  cannot be enabled using any configuration option. See also "force-tls*",
+  and "force-sslv3".
 
-notlsv11
+no-tlsv11
   This setting is only available when support for OpenSSL was built in. It
-  disables support for TLSv11 on any sockets instanciated from the listener when
-  SSL is supported. Note that SSLv2 is forced disabled in the code and cannot
-  be enabled using any configuration option.
+  disables support for TLSv1.1 on any sockets instanciated from the listener
+  when SSL is supported. Note that SSLv2 is forced disabled in the code and
+  cannot be enabled using any configuration option. See also "force-tls*",
+  and "force-sslv3".
 
-notlsv12
+no-tlsv12
   This setting is only available when support for OpenSSL was built in. It
-  disables support for TLSv12 on any sockets instanciated from the listener when
-  SSL is supported. Note that SSLv2 is forced disabled in the code and cannot
-  be enabled using any configuration option.
-
-prefer-server-ciphers
-  This setting is only available when support for OpenSSL was built in. It
-  tells the SSL/TLS layer that our set of cipher algorithms is preferred over
-  the client's ones.
+  disables support for TLSv1.2 on any sockets instanciated from the listener
+  when SSL is supported. Note that SSLv2 is forced disabled in the code and
+  cannot be enabled using any configuration option. See also "force-tls*",
+  and "force-sslv3".
 
 ssl
   This setting is only available when support for OpenSSL was built in. It
@@ -6936,6 +6964,17 @@ ssl
   certificate is necessary (see "crt" above). All contents in the buffers will
   appear in clear text, so that ACLs and HTTP processing will only have access
   to deciphered contents.
+
+tfo
+  Is an optional keyword which is supported only on Linux kernels >= 3.6. It
+  enables TCP Fast Open on the listening socket, which means that clients which
+  support this feature will be able to send a request and receive a response
+  during the 3-way handshake starting from second connection, thus saving one
+  round-trip after the first connection. This only makes sense with protocols
+  that use high connection rates and where each round trip matters. This can
+  possibly cause issues with many firewalls which do not accept data on SYN
+  packets, so this option should only be enabled once well tested. This option
+  is only supported on TCPv4/TCPv6 sockets and ignored by other ones.
 
 transparent
   Is an optional keyword which is supported only on certain Linux kernels. It
@@ -7096,6 +7135,31 @@ fall <count>
 
   Supported in default-server: Yes
 
+force-sslv3
+  This option enforces use of SSLv3 only when SSL is used to communicate with
+  the server. SSLv3 is generally less expensive than the TLS counterparts for
+  high connection rates. See also "no-tlsv*", "no-sslv3".
+
+  Supported in default-server: No
+
+force-tlsv10
+  This option enforces use of TLSv1.0 only when SSL is used to communicate with
+  the server. See also "no-tlsv*", "no-sslv3".
+
+  Supported in default-server: No
+
+force-tlsv11
+  This option enforces use of TLSv1.1 only when SSL is used to communicate with
+  the server. See also "no-tlsv*", "no-sslv3".
+
+  Supported in default-server: No
+
+force-tlsv12
+  This option enforces use of TLSv1.2 only when SSL is used to communicate with
+  the server. See also "no-tlsv*", "no-sslv3".
+
+  Supported in default-server: No
+
 id <value>
   Set a persistent ID for the server. This ID must be positive and unique for
   the proxy. An unused ID will automatically be assigned if unset. The first
@@ -7169,34 +7233,37 @@ minconn <minconn>
 
   Supported in default-server: Yes
 
-nosslv3
+no-sslv3
   This option disables support for SSLv3 when SSL is used to communicate with
   the server. Note that SSLv2 is disabled in the code and cannot be enabled
-  using any configuration option.
+  using any configuration option. See also "force-sslv3", "force-tlsv*".
 
   Supported in default-server: No
 
-notlsv10
-  This option disables support for TLSv10 when SSL is used to communicate with
+no-tlsv10
+  This option disables support for TLSv1.0 when SSL is used to communicate with
   the server. Note that SSLv2 is disabled in the code and cannot be enabled
   using any configuration option. TLSv1 is more expensive than SSLv3 so it
-  often makes sense to disable it when communicating with local servers.
+  often makes sense to disable it when communicating with local servers. See
+  also "force-sslv3", "force-tlsv*".
 
   Supported in default-server: No
 
-notlsv11
-  This option disables support for TLSv11 when SSL is used to communicate with
+no-tlsv11
+  This option disables support for TLSv1.1 when SSL is used to communicate with
   the server. Note that SSLv2 is disabled in the code and cannot be enabled
   using any configuration option. TLSv1 is more expensive than SSLv3 so it
-  often makes sense to disable it when communicating with local servers.
+  often makes sense to disable it when communicating with local servers. See
+  also "force-sslv3", "force-tlsv*".
 
   Supported in default-server: No
 
-notlsv12
-  This option disables support for TLSv12 when SSL is used to communicate with
+no-tlsv12
+  This option disables support for TLSv1.2 when SSL is used to communicate with
   the server. Note that SSLv2 is disabled in the code and cannot be enabled
   using any configuration option. TLSv1 is more expensive than SSLv3 so it
-  often makes sense to disable it when communicating with local servers.
+  often makes sense to disable it when communicating with local servers. See
+  also "force-sslv3", "force-tlsv*".
 
   Supported in default-server: No
 
@@ -8246,30 +8313,30 @@ ssl_sni <string>
   layer which deciphered it and found a Server Name Indication TLS extension
   sent by the client, matching the specified string. In HTTPS, the SNI field
   (when present) is equal to the requested host name. This match is different
-  from req_ssl_sni above in that it applies to the connection being deciphered
-  by haproxy and not to SSL contents being blindly forwarded. See also
-  ssl_sni_end and ssl_sni_req below. This requires that the SSL library is
-  build with support for TLS extensions enabled (check haproxy -vv).
+  from "req_ssl_sni" above in that it applies to the connection being
+  deciphered by haproxy and not to SSL contents being blindly forwarded.
+  See also "ssl_sni_end" and "ssl_sni_req" below. This requires that the SSL
+  library is build with support for TLS extensions enabled (check haproxy -vv).
 
 ssl_sni_end <string>
   Returns true when the incoming connection was made over an SSL/TLS transport
   layer which deciphered it and found a Server Name Indication TLS extension
   sent by the client, ending like the specified string. In HTTPS, the SNI field
   (when present) is equal to the requested host name. This match is different
-  from req_ssl_sni above in that it applies to the connection being deciphered
-  by haproxy and not to SSL contents being blindly forwarded. This requires
-  that the SSL library is build with support for TLS extensions enabled (check
-  haproxy -vv).
+  from "req_ssl_sni" above in that it applies to the connection being
+  deciphered by haproxy and not to SSL contents being blindly forwarded. This
+  requires that the SSL library is build with support for TLS extensions
+  enabled (check haproxy -vv).
 
 ssl_sni_req <regex>
   Returns true when the incoming connection was made over an SSL/TLS transport
   layer which deciphered it and found a Server Name Indication TLS extension
   sent by the client, matching the specified regex. In HTTPS, the SNI field
   (when present) is equal to the requested host name. This match is different
-  from req_ssl_sni above in that it applies to the connection being deciphered
-  by haproxy and not to SSL contents being blindly forwarded. This requires
-  that the SSL library is build with support for TLS extensions enabled (check
-  haproxy -vv).
+  from "req_ssl_sni" above in that it applies to the connection being
+  deciphered by haproxy and not to SSL contents being blindly forwarded. This
+  requires that the SSL library is build with support for TLS extensions
+  enabled (check haproxy -vv).
 
 ssl_verify_caerr <errorID>
   Returns true when the incoming connection was made over an SSL/TLS transport
@@ -8935,12 +9002,19 @@ The list of currently supported pattern fetch functions is the following :
   url_port     This extracts the port part from the request's URL. It probably
                is totally useless but it was available at no cost.
 
-  url_param(<name>)
+  url_param(<name>[,<delim>])
                This extracts the first occurrence of the parameter <name> in
-               the query string of the request and uses the corresponding value
-               to match. A typical use is to get sticky session through url
-               (e.g. http://example.com/foo?JESSIONID=some_id with
-               url_param(JSESSIONID)), for cases where cookies cannot be used.
+               the parameter string of the request and uses the corresponding
+               value to match. Optionally, a delimiter can be provided. If not
+               then the question mark '?' is used by default.
+               A typical use is to get sticky session through url for cases
+               where cookies cannot be used.
+
+               Example :
+                 # match http://example.com/foo?PHPSESSIONID=some_id
+                 stick on url_param(PHPSESSIONID)
+                 # match http://example.com/foo;JSESSIONID=some_id
+                 stick on url_param(JSESSIONID,;)
 
   rdp_cookie(<name>)
                This extracts the value of the rdp cookie <name> as a string
