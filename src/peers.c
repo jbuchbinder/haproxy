@@ -1119,7 +1119,6 @@ static struct session *peer_session_create(struct peer *peer, struct peer_sessio
 	LIST_INIT(&s->back_refs);
 
 	s->flags = SN_ASSIGNED|SN_ADDR_SET;
-	s->term_trace = 0;
 
 	/* if this session comes from a known monitoring system, we want to ignore
 	 * it as soon as possible, which means closing it immediately for TCP.
@@ -1221,7 +1220,10 @@ static struct session *peer_session_create(struct peer *peer, struct peer_sessio
 	if ((s->req = pool_alloc2(pool2_channel)) == NULL)
 		goto out_fail_req; /* no memory */
 
-	s->req->buf.size = global.tune.bufsize;
+	if ((s->req->buf = pool_alloc2(pool2_buffer)) == NULL)
+		goto out_fail_req_buf; /* no memory */
+
+	s->req->buf->size = global.tune.bufsize;
 	channel_init(s->req);
 	s->req->prod = &s->si[0];
 	s->req->cons = &s->si[1];
@@ -1244,7 +1246,10 @@ static struct session *peer_session_create(struct peer *peer, struct peer_sessio
 	if ((s->rep = pool_alloc2(pool2_channel)) == NULL)
 		goto out_fail_rep; /* no memory */
 
-	s->rep->buf.size = global.tune.bufsize;
+	if ((s->rep->buf = pool_alloc2(pool2_buffer)) == NULL)
+		goto out_fail_rep_buf; /* no memory */
+
+	s->rep->buf->size = global.tune.bufsize;
 	channel_init(s->rep);
 	s->rep->prod = &s->si[1];
 	s->rep->cons = &s->si[0];
@@ -1278,7 +1283,11 @@ static struct session *peer_session_create(struct peer *peer, struct peer_sessio
 	return s;
 
 	/* Error unrolling */
+ out_fail_rep_buf:
+	pool_free2(pool2_channel, s->rep);
  out_fail_rep:
+	pool_free2(pool2_buffer, s->req->buf);
+ out_fail_req_buf:
 	pool_free2(pool2_channel, s->req);
  out_fail_req:
 	task_free(t);

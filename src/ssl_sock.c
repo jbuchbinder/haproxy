@@ -67,6 +67,7 @@
 #include <proto/listener.h>
 #include <proto/server.h>
 #include <proto/log.h>
+#include <proto/proxy.h>
 #include <proto/shctx.h>
 #include <proto/ssl_sock.h>
 #include <proto/task.h>
@@ -572,6 +573,101 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 	return cfgerr;
 }
 
+/* prepare ssl context from servers options. Returns an error count */
+int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
+{
+	int cfgerr = 0;
+	int options =
+		SSL_OP_ALL | /* all known workarounds for bugs */
+		SSL_OP_NO_SSLv2 |
+		SSL_OP_NO_COMPRESSION;
+	int mode =
+		SSL_MODE_ENABLE_PARTIAL_WRITE |
+		SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+		SSL_MODE_RELEASE_BUFFERS;
+
+	 /* Initiate SSL context for current server */
+	srv->ssl_ctx.reused_sess = NULL;
+	if (srv->use_ssl)
+		srv->xprt = &ssl_sock;
+	if (srv->check.use_ssl)
+		srv->check.xprt = &ssl_sock;
+
+	srv->ssl_ctx.ctx = SSL_CTX_new(SSLv23_client_method());
+	if (!srv->ssl_ctx.ctx) {
+		Alert("config : %s '%s', server '%s': unable to allocate ssl context.\n",
+		      proxy_type_str(curproxy), curproxy->id,
+		      srv->id);
+		cfgerr++;
+		return cfgerr;
+	}
+
+
+	if (srv->ssl_ctx.options & SRV_SSL_O_NO_SSLV3)
+		options |= SSL_OP_NO_SSLv3;
+	if (srv->ssl_ctx.options & SRV_SSL_O_NO_TLSV10)
+		options |= SSL_OP_NO_TLSv1;
+	if (srv->ssl_ctx.options & SRV_SSL_O_NO_TLSV11)
+		options |= SSL_OP_NO_TLSv1_1;
+	if (srv->ssl_ctx.options & SRV_SSL_O_NO_TLSV12)
+		options |= SSL_OP_NO_TLSv1_2;
+	if (srv->ssl_ctx.options & SRV_SSL_O_NO_TLS_TICKETS)
+		options |= SSL_OP_NO_TICKET;
+	if (srv->ssl_ctx.options & SRV_SSL_O_USE_SSLV3)
+		SSL_CTX_set_ssl_version(srv->ssl_ctx.ctx, SSLv3_client_method());
+	if (srv->ssl_ctx.options & SRV_SSL_O_USE_TLSV10)
+		SSL_CTX_set_ssl_version(srv->ssl_ctx.ctx, TLSv1_client_method());
+#if SSL_OP_NO_TLSv1_1
+	if (srv->ssl_ctx.options & SRV_SSL_O_USE_TLSV11)
+		SSL_CTX_set_ssl_version(srv->ssl_ctx.ctx, TLSv1_1_client_method());
+#endif
+#if SSL_OP_NO_TLSv1_2
+	if (srv->ssl_ctx.options & SRV_SSL_O_USE_TLSV12)
+		SSL_CTX_set_ssl_version(srv->ssl_ctx.ctx, TLSv1_2_client_method());
+#endif
+
+	SSL_CTX_set_options(srv->ssl_ctx.ctx, options);
+	SSL_CTX_set_mode(srv->ssl_ctx.ctx, mode);
+	SSL_CTX_set_verify(srv->ssl_ctx.ctx, srv->ssl_ctx.verify ? srv->ssl_ctx.verify : SSL_VERIFY_NONE, NULL);
+	if (srv->ssl_ctx.verify & SSL_VERIFY_PEER) {
+		if (srv->ssl_ctx.ca_file) {
+			/* load CAfile to verify */
+			if (!SSL_CTX_load_verify_locations(srv->ssl_ctx.ctx, srv->ssl_ctx.ca_file, NULL)) {
+				Alert("Proxy '%s', server '%s' |%s:%d] unable to load CA file '%s'.\n",
+				      curproxy->id, srv->id,
+				      srv->conf.file, srv->conf.line, srv->ssl_ctx.ca_file);
+				cfgerr++;
+			}
+		}
+#ifdef X509_V_FLAG_CRL_CHECK
+		if (srv->ssl_ctx.crl_file) {
+			X509_STORE *store = SSL_CTX_get_cert_store(srv->ssl_ctx.ctx);
+
+			if (!store || !X509_STORE_load_locations(store, srv->ssl_ctx.crl_file, NULL)) {
+				Alert("Proxy '%s', server '%s' |%s:%d] unable to configure CRL file '%s'.\n",
+				      curproxy->id, srv->id,
+				      srv->conf.file, srv->conf.line, srv->ssl_ctx.crl_file);
+				cfgerr++;
+			}
+			else {
+				X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK|X509_V_FLAG_CRL_CHECK_ALL);
+			}
+		}
+#endif
+	}
+
+	SSL_CTX_set_session_cache_mode(srv->ssl_ctx.ctx, SSL_SESS_CACHE_OFF);
+	if (srv->ssl_ctx.ciphers &&
+		!SSL_CTX_set_cipher_list(srv->ssl_ctx.ctx, srv->ssl_ctx.ciphers)) {
+		Alert("Proxy '%s', server '%s' [%s:%d] : unable to set SSL cipher list to '%s'.\n",
+		      curproxy->id, srv->id,
+		      srv->conf.file, srv->conf.line, srv->ssl_ctx.ciphers);
+		cfgerr++;
+	}
+
+	return cfgerr;
+}
+
 /* Walks down the two trees in bind_conf and prepares all certs. The pointer may
  * be NULL, in which case nothing is done. Returns the number of errors
  * encountered.
@@ -957,6 +1053,22 @@ static void ssl_sock_shutw(struct connection *conn, int clean)
 	SSL_set_shutdown(conn->xprt_ctx, SSL_SENT_SHUTDOWN);
 }
 
+/* used for logging, may be changed for a sample fetch later */
+const char *ssl_sock_get_cipher_name(struct connection *conn)
+{
+	if (!conn->xprt && !conn->xprt_ctx)
+		return NULL;
+	return SSL_get_cipher_name(conn->xprt_ctx);
+}
+
+/* used for logging, may be changed for a sample fetch later */
+const char *ssl_sock_get_proto_version(struct connection *conn)
+{
+	if (!conn->xprt && !conn->xprt_ctx)
+		return NULL;
+	return SSL_get_version(conn->xprt_ctx);
+}
+
 /***** Below are some sample fetching functions for ACL/patterns *****/
 
 /* boolean, returns true if client cert was present */
@@ -1120,14 +1232,11 @@ static int bind_parse_ca_file(char **args, int cur_arg, struct proxy *px, struct
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global.ca_base) {
-		conf->ca_file = malloc(strlen(global.ca_base) + 1 + strlen(args[cur_arg + 1]) + 1);
-		if (conf->ca_file)
-			sprintf(conf->ca_file, "%s/%s", global.ca_base, args[cur_arg + 1]);
-		return 0;
-	}
+	if ((*args[cur_arg + 1] != '/') && global.ca_base)
+		memprintf(&conf->ca_file, "%s/%s", global.ca_base, args[cur_arg + 1]);
+	else
+		memprintf(&conf->ca_file, "%s", args[cur_arg + 1]);
 
-	conf->ca_file = strdup(args[cur_arg + 1]);
 	return 0;
 }
 
@@ -1185,14 +1294,11 @@ static int bind_parse_crl_file(char **args, int cur_arg, struct proxy *px, struc
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((*args[cur_arg + 1] != '/') && global.ca_base) {
-		conf->crl_file = malloc(strlen(global.ca_base) + 1 + strlen(args[cur_arg + 1]) + 1);
-		if (conf->crl_file)
-			sprintf(conf->crl_file, "%s/%s", global.ca_base, args[cur_arg + 1]);
-		return 0;
-	}
+	if ((*args[cur_arg + 1] != '/') && global.ca_base)
+		memprintf(&conf->crl_file, "%s/%s", global.ca_base, args[cur_arg + 1]);
+	else
+		memprintf(&conf->crl_file, "%s", args[cur_arg + 1]);
 
-	conf->crl_file = strdup(args[cur_arg + 1]);
 	return 0;
 #endif
 }
@@ -1379,6 +1485,23 @@ static int bind_parse_verify(char **args, int cur_arg, struct proxy *px, struct 
 
 /************** "server" keywords ****************/
 
+/* parse the "ca-file" server keyword */
+static int srv_parse_ca_file(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	if (!*args[*cur_arg + 1]) {
+		if (err)
+			memprintf(err, "'%s' : missing CAfile path", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if ((*args[*cur_arg + 1] != '/') && global.ca_base)
+		memprintf(&newsrv->ssl_ctx.ca_file, "%s/%s", global.ca_base, args[*cur_arg + 1]);
+	else
+		memprintf(&newsrv->ssl_ctx.ca_file, "%s", args[*cur_arg + 1]);
+
+	return 0;
+}
+
 /* parse the "check-ssl" server keyword */
 static int srv_parse_check_ssl(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
 {
@@ -1400,6 +1523,30 @@ static int srv_parse_ciphers(char **args, int *cur_arg, struct proxy *px, struct
 	newsrv->ssl_ctx.ciphers = strdup(args[*cur_arg + 1]);
 	return 0;
 }
+
+/* parse the "crl-file" server keyword */
+static int srv_parse_crl_file(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+#ifndef X509_V_FLAG_CRL_CHECK
+	if (err)
+		memprintf(err, "'%s' : library does not support CRL verify", args[*cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#else
+	if (!*args[*cur_arg + 1]) {
+		if (err)
+			memprintf(err, "'%s' : missing CRLfile path", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if ((*args[*cur_arg + 1] != '/') && global.ca_base)
+		memprintf(&newsrv->ssl_ctx.crl_file, "%s/%s", global.ca_base, args[*cur_arg + 1]);
+	else
+		memprintf(&newsrv->ssl_ctx.crl_file, "%s", args[*cur_arg + 1]);
+
+	return 0;
+#endif
+}
+
 
 /* parse the "force-sslv3" server keyword */
 static int srv_parse_force_sslv3(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
@@ -1469,12 +1616,42 @@ static int srv_parse_no_tlsv12(char **args, int *cur_arg, struct proxy *px, stru
 	return 0;
 }
 
+/* parse the "no-tls-tickets" server keyword */
+static int srv_parse_no_tls_tickets(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_NO_TLS_TICKETS;
+	return 0;
+}
+
 /* parse the "ssl" server keyword */
 static int srv_parse_ssl(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
 {
 	newsrv->use_ssl = 1;
 	if (global.connect_default_ciphers && !newsrv->ssl_ctx.ciphers)
 		newsrv->ssl_ctx.ciphers = strdup(global.connect_default_ciphers);
+	return 0;
+}
+
+/* parse the "verify" server keyword */
+static int srv_parse_verify(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	if (!*args[*cur_arg + 1]) {
+		if (err)
+			memprintf(err, "'%s' : missing verify method", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (strcmp(args[*cur_arg + 1], "none") == 0)
+		newsrv->ssl_ctx.verify = SSL_VERIFY_NONE;
+	else if (strcmp(args[*cur_arg + 1], "required") == 0)
+		newsrv->ssl_ctx.verify = SSL_VERIFY_PEER;
+	else {
+		if (err)
+			memprintf(err, "'%s' : unknown verify method '%s', only 'none' and 'required' are supported\n",
+			          args[*cur_arg], args[*cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
 	return 0;
 }
 
@@ -1547,17 +1724,21 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
  * not enabled.
  */
 static struct srv_kw_list srv_kws = { "SSL", { }, {
-	{ "check-ssl",             srv_parse_check_ssl,      0, 1 }, /* enable SSL for health checks */
-	{ "ciphers",               srv_parse_ciphers,        1, 1 }, /* select the cipher suite */
-	{ "force-sslv3",           srv_parse_force_sslv3,    0, 1 }, /* force SSLv3 */
-	{ "force-tlsv10",          srv_parse_force_tlsv10,   0, 1 }, /* force TLSv10 */
-	{ "force-tlsv11",          srv_parse_force_tlsv11,   0, 1 }, /* force TLSv11 */
-	{ "force-tlsv12",          srv_parse_force_tlsv12,   0, 1 }, /* force TLSv12 */
-	{ "no-sslv3",              srv_parse_no_sslv3,       0, 1 }, /* disable SSLv3 */
-	{ "no-tlsv10",             srv_parse_no_tlsv10,      0, 1 }, /* disable TLSv10 */
-	{ "no-tlsv11",             srv_parse_no_tlsv11,      0, 1 }, /* disable TLSv11 */
-	{ "no-tlsv12",             srv_parse_no_tlsv12,      0, 1 }, /* disable TLSv12 */
-	{ "ssl",                   srv_parse_ssl,            0, 1 }, /* enable SSL processing */
+	{ "ca-file",               srv_parse_ca_file,        1, 0 }, /* set CAfile to process verify server cert */
+	{ "check-ssl",             srv_parse_check_ssl,      0, 0 }, /* enable SSL for health checks */
+	{ "ciphers",               srv_parse_ciphers,        1, 0 }, /* select the cipher suite */
+	{ "crl-file",              srv_parse_crl_file,       1, 0 }, /* set certificate revocation list file use on server cert verify */
+	{ "force-sslv3",           srv_parse_force_sslv3,    0, 0 }, /* force SSLv3 */
+	{ "force-tlsv10",          srv_parse_force_tlsv10,   0, 0 }, /* force TLSv10 */
+	{ "force-tlsv11",          srv_parse_force_tlsv11,   0, 0 }, /* force TLSv11 */
+	{ "force-tlsv12",          srv_parse_force_tlsv12,   0, 0 }, /* force TLSv12 */
+	{ "no-sslv3",              srv_parse_no_sslv3,       0, 0 }, /* disable SSLv3 */
+	{ "no-tlsv10",             srv_parse_no_tlsv10,      0, 0 }, /* disable TLSv10 */
+	{ "no-tlsv11",             srv_parse_no_tlsv11,      0, 0 }, /* disable TLSv11 */
+	{ "no-tlsv12",             srv_parse_no_tlsv12,      0, 0 }, /* disable TLSv12 */
+	{ "no-tls-tickets",        srv_parse_no_tls_tickets, 0, 0 }, /* disable session resumption tickets */
+	{ "ssl",                   srv_parse_ssl,            0, 0 }, /* enable SSL processing */
+	{ "verify",                srv_parse_verify,         1, 0 }, /* set SSL verify method */
 	{ NULL, NULL, 0, 0 },
 }};
 

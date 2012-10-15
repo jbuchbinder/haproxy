@@ -86,61 +86,6 @@
 #define SN_BE_TRACK_SC1 0x00100000	/* backend tracks stick-counter 1 */
 #define SN_BE_TRACK_SC2 0x00200000	/* backend tracks stick-counter 2 */
 
-/* Termination sequence tracing.
- *
- * These values have to be set into the field term_trace of a session when
- * closing a session (half or full). They are only meant for post-mortem
- * analysis. The value must be assigned this way :
- *    trace_term(s, TT_XXX);
- *
- * One TT_XXX value is assigned to each location in the code which may be
- * involved in a connection closing. Since a full session close generally
- * involves 4 steps, we will be able to read these steps afterwards by simply
- * checking the code. Value TT_NONE is zero and must never be set, as it means
- * the connection was not closed. Value TT_ANON must be used when no value was
- * assigned to a specific code part. Never ever reuse an already assigned code
- * as it will defeat the purpose of this trace. It is wise to use a per-file
- * anonymous value though.
- */
-#define TT_BIT_SHIFT 8
-enum {
-	TT_NONE     = 0,
-	TT_ANON     = 1,
-	TT_CLIENT   = 0x10,
-	TT_CLIENT_1,
-	TT_CLIENT_2,
-	TT_HTTP_CLI = 0x20,
-	TT_HTTP_CLI_1,
-	TT_HTTP_CLI_2,
-	TT_HTTP_CLI_3,
-	TT_HTTP_CLI_4,
-	TT_HTTP_CLI_5,
-	TT_HTTP_CLI_6,
-	TT_HTTP_CLI_7,
-	TT_HTTP_CLI_8,
-	TT_HTTP_CLI_9,
-	TT_HTTP_CLI_10,
-	TT_HTTP_SRV = 0x30,
-	TT_HTTP_SRV_1,
-	TT_HTTP_SRV_2,
-	TT_HTTP_SRV_3,
-	TT_HTTP_SRV_4,
-	TT_HTTP_SRV_5,
-	TT_HTTP_SRV_6,
-	TT_HTTP_SRV_7,
-	TT_HTTP_SRV_8,
-	TT_HTTP_SRV_9,
-	TT_HTTP_SRV_10,
-	TT_HTTP_SRV_11,
-	TT_HTTP_SRV_12,
-	TT_HTTP_SRV_13,
-	TT_HTTP_SRV_14,
-	TT_HTTP_CNT = 0x40,
-	TT_HTTP_CNT_1,
-	TT_HTTP_URI = 0x50,
-	TT_HTTP_URI_1,
-};
-
 
 /* WARNING: if new fields are added, they must be initialized in event_accept()
  * and freed in session_free() !
@@ -159,23 +104,25 @@ enum {
  *    server should eventually be released.
  */
 struct session {
+	int flags;				/* some flags describing the session */
+	struct target target;			/* target to use for this session */
+
+	struct channel *req;			/* request buffer */
+	struct channel *rep;			/* response buffer */
+
+	struct proxy *fe;			/* the proxy this session depends on for the client side */
+	struct proxy *be;			/* the proxy this session depends on for the server side */
+
+	struct listener *listener;		/* the listener by which the request arrived */
+	struct server *srv_conn;		/* session already has a slot on a server and is not in queue */
+	struct pendconn *pend_pos;		/* if not NULL, points to the position in the pending queue */
+
+	struct http_txn txn;			/* current HTTP transaction being processed. Should become a list. */
+
+	struct task *task;			/* the task associated with this session */
 	struct list list;			/* position in global sessions list */
 	struct list by_srv;			/* position in server session list */
 	struct list back_refs;			/* list of users tracking this session */
-	struct task *task;			/* the task associated with this session */
-	/* application specific below */
-	struct listener *listener;		/* the listener by which the request arrived */
-	struct proxy *fe;			/* the proxy this session depends on for the client side */
-	struct proxy *be;			/* the proxy this session depends on for the server side */
-	int flags;				/* some flags describing the session */
-	unsigned term_trace;			/* term trace: 4*8 bits indicating which part of the code closed */
-	struct channel *req;			/* request buffer */
-	struct channel *rep;			/* response buffer */
-	struct stream_interface si[2];          /* client and server stream interfaces */
-	struct server *srv_conn;		/* session already has a slot on a server and is not in queue */
-	struct target target;			/* target to use for this session */
-	struct pendconn *pend_pos;		/* if not NULL, points to the position in the pending queue */
-	struct http_txn txn;			/* current HTTP transaction being processed. Should become a list. */
 
 	struct {
 		struct stksess *ts;
@@ -189,6 +136,7 @@ struct session {
 	struct stksess *stkctr2_entry;          /* entry containing counters currently being tracked as set 2 by this session */
 	struct stktable *stkctr2_table;         /* table the counters above belong to (undefined if counters are null) */
 
+	struct stream_interface si[2];          /* client and server stream interfaces */
 	struct {
 		int logwait;			/* log fields waiting to be collected : LW_* */
 		struct timeval accept_date;	/* date of the accept() in user date */

@@ -82,16 +82,19 @@
 #ifdef USE_OPENSSL
 /* server ssl options */
 #define SRV_SSL_O_NONE         0x0000
+#define SRV_SSL_O_NO_VMASK     0x000F /* force version mask */
 #define SRV_SSL_O_NO_SSLV3     0x0001 /* disable SSLv3 */
 #define SRV_SSL_O_NO_TLSV10    0x0002 /* disable TLSv1.0 */
 #define SRV_SSL_O_NO_TLSV11    0x0004 /* disable TLSv1.1 */
 #define SRV_SSL_O_NO_TLSV12    0x0008 /* disable TLSv1.2 */
 /* 0x000F reserved for 'no' protocol version options */
-#define SRV_SSL_O_USE_SSLV3    0x0001 /* force SSLv3 */
-#define SRV_SSL_O_USE_TLSV10   0x0002 /* force TLSv1.0 */
-#define SRV_SSL_O_USE_TLSV11   0x0004 /* force TLSv1.1 */
-#define SRV_SSL_O_USE_TLSV12   0x0008 /* force TLSv1.2 */
+#define SRV_SSL_O_USE_VMASK    0x00F0 /* force version mask */
+#define SRV_SSL_O_USE_SSLV3    0x0010 /* force SSLv3 */
+#define SRV_SSL_O_USE_TLSV10   0x0020 /* force TLSv1.0 */
+#define SRV_SSL_O_USE_TLSV11   0x0040 /* force TLSv1.1 */
+#define SRV_SSL_O_USE_TLSV12   0x0080 /* force TLSv1.2 */
 /* 0x00F0 reserved for 'force' protocol version options */
+#define SRV_SSL_O_NO_TLS_TICKETS 0x0100 /* disable session resumption tickets */
 #endif
 
 /* A tree occurrence is a descriptor of a place in a tree, with a pointer back
@@ -194,6 +197,9 @@ struct server {
 		SSL_SESSION *reused_sess;
 		char *ciphers;			/* cipher suite to use if non-null */
 		int options;			/* ssl options */
+		int verify;			/* verify method (set of SSL_VERIFY_* flags) */
+		char *ca_file;			/* CAfile to use on verify */
+		char *crl_file;			/* CRLfile to use on verify */
 	} ssl_ctx;
 #endif
 	struct {

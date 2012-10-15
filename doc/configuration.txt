@@ -485,8 +485,8 @@ The following keywords are supported in the "global" section :
 
 ca-base <dir>
   Assigns a default directory to fetch SSL CA certificates and CRLs from when a
-  relative path is used with "cafile" or "crlfile" directives. Absolute
-  locations specified in "cafile" and "crlfile" prevail and ignore "ca-base".
+  relative path is used with "ca-file" or "crl-file" directives. Absolute
+  locations specified in "ca-file" and "crl-file" prevail and ignore "ca-base".
 
 chroot <jail dir>
   Changes current directory to <jail dir> and performs a chroot() there before
@@ -6758,7 +6758,7 @@ ecdhe <named curve>
   the named curve (RFC 4492) used to generate ECDH ephemeral keys and makes
   ECDHE cipher suites usable.
 
-cafile <cafile>
+ca-file <cafile>
   This setting is only available when support for OpenSSL was built in. It
   designates a PEM file from which to load CA certificates used to verify
   client's certificate.
@@ -6776,7 +6776,7 @@ ciphers <ciphers>
   in "man 1 ciphers" from OpenSSL man pages, and can be for instance a string
   such as "AES:ALL:!aNULL:!eNULL:+RC4:@STRENGTH" (without quotes).
 
-crlfile <cafile>
+crl-file <crlfile>
   This setting is only available when support for OpenSSL was built in. It
   designates a PEM file from which to load certificate revocation list used
   to verify client's certificate.
@@ -7008,10 +7008,10 @@ verify [none|optional|required]
   cases, a client certificate is requested. If the client does not provide a
   certificate after the request and if 'verify' is set to 'required', then the
   handshake is aborted, while it would have succeeded if set to 'optional'. The
-  certificate provided by the client is always verified using CAs from 'cafile'
-  and optional CRLs from 'crlfile'. On verify failure the handshake is aborted,
-  regardless of the 'verify' option, unless the error code exactly matches one
-  of those listed with 'ca-ignore-err' or 'crt-ignore-err'.
+  certificate provided by the client is always verified using CAs from
+  'ca-file' and optional CRLs from 'crl-file'. On verify failure the handshake
+  is aborted, regardless of the 'verify' option, unless the error code exactly
+  matches one of those listed with 'ca-ignore-err' or 'crt-ignore-err'.
 
 5.2. Server and default-server options
 ------------------------------------
@@ -7045,6 +7045,13 @@ backup
   though. By default, only the first operational backup server is used, unless
   the "allbackups" option is set in the backend. See also the "allbackups"
   option.
+
+  Supported in default-server: No
+
+ca-file <cafile>
+  This setting is only available when support for OpenSSL was built in. It
+  designates a PEM file from which to load CA certificates used to verify
+  server's certificate.
 
   Supported in default-server: No
 
@@ -7107,6 +7114,13 @@ cookie <value>
   sent to the client. There is nothing wrong in having several servers sharing
   the same cookie value, and it is in fact somewhat common between normal and
   backup servers. See also the "cookie" keyword in backend section.
+
+  Supported in default-server: No
+
+crl-file <crlfile>
+  This setting is only available when support for OpenSSL was built in. It
+  designates a PEM file from which to load certificate revocation list used
+  to verify server's certificate.
 
   Supported in default-server: No
 
@@ -7237,6 +7251,14 @@ no-sslv3
   This option disables support for SSLv3 when SSL is used to communicate with
   the server. Note that SSLv2 is disabled in the code and cannot be enabled
   using any configuration option. See also "force-sslv3", "force-tlsv*".
+
+  Supported in default-server: No
+
+no-tls-tickets
+  This setting is only available when support for OpenSSL was built in. It
+  disables the stateless session resumption (RFC 5077 TLS Ticket
+  extension) and force to use stateful session resumption. Stateless
+  session resumption is more expensive in CPU usage for servers.
 
   Supported in default-server: No
 
@@ -7445,6 +7467,15 @@ track [<proxy>/]<server>
   so it is not possible for example to track a server that tracks another
   one. If <proxy> is omitted the current one is used. If disable-on-404 is
   used, it has to be enabled on both proxies.
+
+  Supported in default-server: No
+
+verify [none|required]
+  This setting is only available when support for OpenSSL was built in. If set
+  to 'none', server certificate is not verified. This is the default. In the
+  other case, The certificate provided by the server is verified using CAs from
+  'ca-file' and optional CRLs from 'crl-file'. On verify failure the handshake
+  is aborted.
 
   Supported in default-server: No
 
@@ -9668,24 +9699,24 @@ Flags are :
 
 At the moment, the default HTTP format is defined this way :
 
-    log-format %Ci:%Cp\ [%t]\ %f\ %b/%s\ %Tq/%Tw/%Tc/%Tr/%Tt\ %st\ %B\ %cc\ \
+    log-format %Ci:%Cp\ [%t]\ %ft\ %b/%s\ %Tq/%Tw/%Tc/%Tr/%Tt\ %st\ %B\ %cc\ \
                %cs\ %tsc\ %ac/%fc/%bc/%sc/%rc\ %sq/%bq\ %hr\ %hs\ %{+Q}r
 
 the default CLF format is defined this way :
 
     log-format %{+Q}o\ %{-Q}Ci\ -\ -\ [%T]\ %r\ %st\ %B\ \"\"\ \"\"\ %Cp\ \
-               %ms\ %f\ %b\ %s\ \%Tq\ %Tw\ %Tc\ %Tr\ %Tt\ %tsc\ %ac\ %fc\ \
+               %ms\ %ft\ %b\ %s\ \%Tq\ %Tw\ %Tc\ %Tr\ %Tt\ %tsc\ %ac\ %fc\ \
                %bc\ %sc\ %rc\ %sq\ %bq\ %cc\ %cs\ \%hrl\ %hsl
 
 and the default TCP format is defined this way :
 
-    log-format %Ci:%Cp\ [%t]\ %f\ %b/%s\ %Tw/%Tc/%Tt\ %B\ %ts\ \
+    log-format %Ci:%Cp\ [%t]\ %ft\ %b/%s\ %Tw/%Tc/%Tt\ %B\ %ts\ \
                %ac/%fc/%bc/%sc/%rc\ %sq/%bq
 
 Please refer to the table below for currently defined variables :
 
   +---+------+-----------------------------------------------+-------------+
-  | H | var  | field name (8.2.2 and 8.2.3 for description)  | type        |
+  | R | var  | field name (8.2.2 and 8.2.3 for description)  | type        |
   +---+------+-----------------------------------------------+-------------+
   |   | %o   | special variable, apply flags on all next var |             |
   +---+------+-----------------------------------------------+-------------+
@@ -9702,8 +9733,8 @@ Please refer to the table below for currently defined variables :
   |   | %Sp  | server_port                                   | numeric     |
   |   | %T   | gmt_date_time                                 | date        |
   |   | %Tc  | Tc                                            | numeric     |
-  | * | %Tq  | Tq                                            | numeric     |
-  | * | %Tr  | Tr                                            | numeric     |
+  | H | %Tq  | Tq                                            | numeric     |
+  | H | %Tr  | Tr                                            | numeric     |
   |   | %Ts  | timestamp                                     | numeric     |
   |   | %Tt  | Tt                                            | numeric     |
   |   | %Tw  | Tw                                            | numeric     |
@@ -9711,29 +9742,32 @@ Please refer to the table below for currently defined variables :
   |   | %b   | backend_name                                  | string      |
   |   | %bc  | beconn                                        | numeric     |
   |   | %bq  | backend_queue                                 | numeric     |
-  | * | %cc  | captured_request_cookie                       | string      |
-  | * | %rt  | http_request_counter                          | numeric     |
-  | * | %cs  | captured_response_cookie                      | string      |
+  | H | %cc  | captured_request_cookie                       | string      |
+  | H | %rt  | http_request_counter                          | numeric     |
+  | H | %cs  | captured_response_cookie                      | string      |
   |   | %f   | frontend_name                                 | string      |
+  |   | %ft  | frontend_name_transport ('~' suffix for SSL)  | string      |
   |   | %fc  | feconn                                        | numeric     |
-  | * | %hr  | captured_request_headers default style        | string      |
-  | * | %hrl | captured_request_headers CLF style            | string list |
-  | * | %hs  | captured_response_headers default style       | string      |
-  | * | %hsl | captured_response_headers CLF style           | string list |
+  | H | %hr  | captured_request_headers default style        | string      |
+  | H | %hrl | captured_request_headers CLF style            | string list |
+  | H | %hs  | captured_response_headers default style       | string      |
+  | H | %hsl | captured_response_headers CLF style           | string list |
   |   | %ms  | accept date milliseconds                      | numeric     |
   |   | %pid | PID                                           | numeric     |
-  | * | %r   | http_request                                  | string      |
+  | H | %r   | http_request                                  | string      |
   |   | %rc  | retries                                       | numeric     |
   |   | %s   | server_name                                   | string      |
   |   | %sc  | srv_conn                                      | numeric     |
   |   | %sq  | srv_queue                                     | numeric     |
-  | * | %st  | status_code                                   | numeric     |
+  | S | %sslc| ssl_ciphers (ex: AES-SHA)                     | string      |
+  | S | %sslv| ssl_version (ex: TLSv1)                       | string      |
+  | H | %st  | status_code                                   | numeric     |
   |   | %t   | date_time                                     | date        |
   |   | %ts  | termination_state                             | string      |
-  | * | %tsc | termination_state with cookie status          | string      |
+  | H | %tsc | termination_state with cookie status          | string      |
   +---+------+-----------------------------------------------+-------------+
 
-*: mode http only
+    R = Restrictions : H = mode http only ; S = SSL only
 
 8.3. Advanced logging options
 -----------------------------

@@ -394,14 +394,14 @@ static void http_silent_debug(int line, struct session *s)
 			 "[%04d] req: p=%d(%d) s=%d bf=%08x an=%08x data=%p size=%d l=%d w=%p r=%p o=%p sm=%d fw=%ld tf=%08x\n",
 			 line,
 			 s->si[0].state, s->si[0].fd, s->txn.req.msg_state, s->req->flags, s->req->analysers,
-			 s->req->buf.data, s->req->buf.size, s->req->l, s->req->w, s->req->r, s->req->buf.p, s->req->buf.o, s->req->to_forward, s->txn.flags);
+			 s->req->buf->data, s->req->buf->size, s->req->l, s->req->w, s->req->r, s->req->buf->p, s->req->buf->o, s->req->to_forward, s->txn.flags);
 	write(-1, trash, size);
 	size = 0;
 	size += snprintf(trash + size, trashlen - size,
 			 " %04d  rep: p=%d(%d) s=%d bf=%08x an=%08x data=%p size=%d l=%d w=%p r=%p o=%p sm=%d fw=%ld\n",
 			 line,
 			 s->si[1].state, s->si[1].fd, s->txn.rsp.msg_state, s->rep->flags, s->rep->analysers,
-			 s->rep->buf.data, s->rep->buf.size, s->rep->l, s->rep->w, s->rep->r, s->rep->buf.p, s->rep->buf.o, s->rep->to_forward);
+			 s->rep->buf->data, s->rep->buf->size, s->rep->l, s->rep->w, s->rep->r, s->rep->buf->p, s->rep->buf->o, s->rep->to_forward);
 
 	write(-1, trash, size);
 }
@@ -421,7 +421,7 @@ int http_header_add_tail(struct http_msg *msg, struct hdr_idx *hdr_idx, const ch
 	int bytes, len;
 
 	len = strlen(text);
-	bytes = buffer_insert_line2(&msg->buf->buf, msg->buf->buf.p + msg->eoh, text, len);
+	bytes = buffer_insert_line2(msg->chn->buf, msg->chn->buf->p + msg->eoh, text, len);
 	if (!bytes)
 		return -1;
 	http_msg_move_end(msg, bytes);
@@ -441,7 +441,7 @@ int http_header_add_tail2(struct http_msg *msg,
 {
 	int bytes;
 
-	bytes = buffer_insert_line2(&msg->buf->buf, msg->buf->buf.p + msg->eoh, text, len);
+	bytes = buffer_insert_line2(msg->chn->buf, msg->chn->buf->p + msg->eoh, text, len);
 	if (!bytes)
 		return -1;
 	http_msg_move_end(msg, bytes);
@@ -610,7 +610,7 @@ int http_remove_header2(struct http_msg *msg, struct hdr_idx *idx, struct hdr_ct
 	hdr = &idx->v[cur_idx];
 	if (sol[ctx->del] == ':' && ctx->val + ctx->vlen + ctx->tws == hdr->len) {
 		/* This was the only value of the header, we must now remove it entirely. */
-		delta = buffer_replace2(&msg->buf->buf, sol, sol + hdr->len + hdr->cr + 1, NULL, 0);
+		delta = buffer_replace2(msg->chn->buf, sol, sol + hdr->len + hdr->cr + 1, NULL, 0);
 		http_msg_move_end(msg, delta);
 		idx->used--;
 		hdr->len = 0;   /* unused entry */
@@ -630,7 +630,7 @@ int http_remove_header2(struct http_msg *msg, struct hdr_idx *idx, struct hdr_ct
 	 */
 
 	skip_comma = (ctx->val + ctx->vlen + ctx->tws == hdr->len) ? 0 : 1;
-	delta = buffer_replace2(&msg->buf->buf, sol + ctx->del + skip_comma,
+	delta = buffer_replace2(msg->chn->buf, sol + ctx->del + skip_comma,
 				sol + ctx->val + ctx->vlen + ctx->tws + skip_comma,
 				NULL, 0);
 	hdr->len += delta;
@@ -712,7 +712,7 @@ http_get_path(struct http_txn *txn)
 {
 	char *ptr, *end;
 
-	ptr = txn->req.buf->buf.p + txn->req.sl.rq.u;
+	ptr = txn->req.chn->buf->p + txn->req.sl.rq.u;
 	end = ptr + txn->req.sl.rq.u_l;
 
 	if (ptr >= end)
@@ -787,12 +787,12 @@ void perform_http_redirect(struct session *s, struct stream_interface *si)
 	 * to temporarily rewind the buffer.
 	 */
 	txn = &s->txn;
-	b_rew(&s->req->buf, rewind = s->req->buf.o);
+	b_rew(s->req->buf, rewind = s->req->buf->o);
 
 	path = http_get_path(txn);
-	len = buffer_count(&s->req->buf, path, b_ptr(&s->req->buf, txn->req.sl.rq.u + txn->req.sl.rq.u_l));
+	len = buffer_count(s->req->buf, path, b_ptr(s->req->buf, txn->req.sl.rq.u + txn->req.sl.rq.u_l));
 
-	b_adv(&s->req->buf, rewind);
+	b_adv(s->req->buf, rewind);
 
 	if (!path)
 		return;
@@ -962,7 +962,7 @@ const char *http_parse_stsline(struct http_msg *msg,
 			       unsigned int state, const char *ptr, const char *end,
 			       unsigned int *ret_ptr, unsigned int *ret_state)
 {
-	const char *msg_start = msg->buf->buf.p;
+	const char *msg_start = msg->chn->buf->p;
 
 	switch (state)	{
 	case HTTP_MSG_RPVER:
@@ -1072,7 +1072,7 @@ const char *http_parse_reqline(struct http_msg *msg,
 			       unsigned int state, const char *ptr, const char *end,
 			       unsigned int *ret_ptr, unsigned int *ret_state)
 {
-	const char *msg_start = msg->buf->buf.p;
+	const char *msg_start = msg->chn->buf->p;
 
 	switch (state)	{
 	case HTTP_MSG_RQMETH:
@@ -1234,7 +1234,7 @@ get_http_auth(struct session *s)
 		len = strlen(h);
 	}
 
-	if (!http_find_header2(h, len, s->req->buf.p, &txn->hdr_idx, &ctx))
+	if (!http_find_header2(h, len, s->req->buf->p, &txn->hdr_idx, &ctx))
 		return 0;
 
 	h = ctx.line + ctx.val;
@@ -1290,11 +1290,12 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 {
 	unsigned int state;       /* updated only when leaving the FSM */
 	register char *ptr, *end; /* request pointers, to avoid dereferences */
-	struct channel *buf = msg->buf;
+	struct buffer *buf;
 
 	state = msg->msg_state;
-	ptr = buf->buf.p + msg->next;
-	end = buf->buf.p + buf->buf.i;
+	buf = msg->chn->buf;
+	ptr = buf->p + msg->next;
+	end = buf->p + buf->i;
 
 	if (unlikely(ptr >= end))
 		goto http_msg_ood;
@@ -1312,11 +1313,11 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 			 * first if we need to remove some CRLF. We can only
 			 * do this when o=0.
 			 */
-			if (unlikely(ptr != buf->buf.p)) {
-				if (buf->buf.o)
+			if (unlikely(ptr != buf->p)) {
+				if (buf->o)
 					goto http_msg_ood;
 				/* Remove empty leading lines, as recommended by RFC2616. */
-				bi_fast_delete(&buf->buf, ptr - buf->buf.p);
+				bi_fast_delete(buf, ptr - buf->p);
 			}
 			msg->sol = 0;
 			msg->sl.st.l = 0; /* used in debug mode */
@@ -1356,7 +1357,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 		 */
 		hdr_idx_set_start(idx, msg->sl.st.l, *ptr == '\r');
 
-		msg->sol = ptr - buf->buf.p;
+		msg->sol = ptr - buf->p;
 		if (likely(*ptr == '\r'))
 			EAT_AND_JUMP_OR_RETURN(http_msg_rpline_end, HTTP_MSG_RPLINE_END);
 		goto http_msg_rpline_end;
@@ -1378,11 +1379,11 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 			 * first if we need to remove some CRLF. We can only
 			 * do this when o=0.
 			 */
-			if (likely(ptr != buf->buf.p)) {
-				if (buf->buf.o)
+			if (likely(ptr != buf->p)) {
+				if (buf->o)
 					goto http_msg_ood;
 				/* Remove empty leading lines, as recommended by RFC2616. */
-				bi_fast_delete(&buf->buf, ptr - buf->buf.p);
+				bi_fast_delete(buf, ptr - buf->p);
 			}
 			msg->sol = 0;
 			msg->sl.rq.l = 0; /* used in debug mode */
@@ -1421,7 +1422,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 		 */
 		hdr_idx_set_start(idx, msg->sl.rq.l, *ptr == '\r');
 
-		msg->sol = ptr - buf->buf.p;
+		msg->sol = ptr - buf->p;
 		if (likely(*ptr == '\r'))
 			EAT_AND_JUMP_OR_RETURN(http_msg_rqline_end, HTTP_MSG_RQLINE_END);
 		goto http_msg_rqline_end;
@@ -1443,7 +1444,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 	 */
 	case HTTP_MSG_HDR_FIRST:
 	http_msg_hdr_first:
-		msg->sol = ptr - buf->buf.p;
+		msg->sol = ptr - buf->p;
 		if (likely(!HTTP_IS_CRLF(*ptr))) {
 			goto http_msg_hdr_name;
 		}
@@ -1465,7 +1466,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 			goto http_msg_invalid;
 
 		if (msg->err_pos == -1) /* capture error pointer */
-			msg->err_pos = ptr - buf->buf.p; /* >= 0 now */
+			msg->err_pos = ptr - buf->p; /* >= 0 now */
 
 		/* and we still accept this non-token character */
 		EAT_AND_JUMP_OR_RETURN(http_msg_hdr_name, HTTP_MSG_HDR_NAME);
@@ -1477,7 +1478,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 			EAT_AND_JUMP_OR_RETURN(http_msg_hdr_l1_sp, HTTP_MSG_HDR_L1_SP);
 
 		/* header value can be basically anything except CR/LF */
-		msg->sov = ptr - buf->buf.p;
+		msg->sov = ptr - buf->p;
 
 		if (likely(!HTTP_IS_CRLF(*ptr))) {
 			goto http_msg_hdr_val;
@@ -1496,8 +1497,8 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 	http_msg_hdr_l1_lws:
 		if (likely(HTTP_IS_SPHT(*ptr))) {
 			/* replace HT,CR,LF with spaces */
-			for (; buf->buf.p + msg->sov < ptr; msg->sov++)
-				buf->buf.p[msg->sov] = ' ';
+			for (; buf->p + msg->sov < ptr; msg->sov++)
+				buf->p[msg->sov] = ' ';
 			goto http_msg_hdr_l1_sp;
 		}
 		/* we had a header consisting only in spaces ! */
@@ -1512,7 +1513,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 		if (likely(!HTTP_IS_CRLF(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_hdr_val, HTTP_MSG_HDR_VAL);
 
-		msg->eol = ptr - buf->buf.p;
+		msg->eol = ptr - buf->p;
 		/* Note: we could also copy eol into ->eoh so that we have the
 		 * real header end in case it ends with lots of LWS, but is this
 		 * really needed ?
@@ -1530,8 +1531,8 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 	http_msg_hdr_l2_lws:
 		if (unlikely(HTTP_IS_SPHT(*ptr))) {
 			/* LWS: replace HT,CR,LF with spaces */
-			for (; buf->buf.p + msg->eol < ptr; msg->eol++)
-				buf->buf.p[msg->eol] = ' ';
+			for (; buf->p + msg->eol < ptr; msg->eol++)
+				buf->p[msg->eol] = ' ';
 			goto http_msg_hdr_val;
 		}
 	http_msg_complete_header:
@@ -1542,11 +1543,11 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 		 * first CR or LF so we know how the line ends. We insert last
 		 * header into the index.
 		 */
-		if (unlikely(hdr_idx_add(msg->eol - msg->sol, buf->buf.p[msg->eol] == '\r',
+		if (unlikely(hdr_idx_add(msg->eol - msg->sol, buf->p[msg->eol] == '\r',
 					 idx, idx->tail) < 0))
 			goto http_msg_invalid;
 
-		msg->sol = ptr - buf->buf.p;
+		msg->sol = ptr - buf->p;
 		if (likely(!HTTP_IS_CRLF(*ptr))) {
 			goto http_msg_hdr_name;
 		}
@@ -1560,7 +1561,7 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
 		/* Assumes msg->sol points to the first of either CR or LF */
 		EXPECT_LF_HERE(ptr, http_msg_invalid);
 		ptr++;
-		msg->sov = msg->next = ptr - buf->buf.p;
+		msg->sov = msg->next = ptr - buf->p;
 		msg->eoh = msg->sol;
 		msg->sol = 0;
 		msg->msg_state = HTTP_MSG_BODY;
@@ -1579,13 +1580,13 @@ void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx)
  http_msg_ood:
 	/* out of data */
 	msg->msg_state = state;
-	msg->next = ptr - buf->buf.p;
+	msg->next = ptr - buf->p;
 	return;
 
  http_msg_invalid:
 	/* invalid message */
 	msg->msg_state = HTTP_MSG_ERROR;
-	msg->next = ptr - buf->buf.p;
+	msg->next = ptr - buf->p;
 	return;
 }
 
@@ -1602,22 +1603,22 @@ static int http_upgrade_v09_to_v10(struct http_txn *txn)
 	if (msg->sl.rq.v_l != 0)
 		return 1;
 
-	cur_end = msg->buf->buf.p + msg->sl.rq.l;
+	cur_end = msg->chn->buf->p + msg->sl.rq.l;
 	delta = 0;
 
 	if (msg->sl.rq.u_l == 0) {
 		/* if no URI was set, add "/" */
-		delta = buffer_replace2(&msg->buf->buf, cur_end, cur_end, " /", 2);
+		delta = buffer_replace2(msg->chn->buf, cur_end, cur_end, " /", 2);
 		cur_end += delta;
 		http_msg_move_end(msg, delta);
 	}
 	/* add HTTP version */
-	delta = buffer_replace2(&msg->buf->buf, cur_end, cur_end, " HTTP/1.0\r\n", 11);
+	delta = buffer_replace2(msg->chn->buf, cur_end, cur_end, " HTTP/1.0\r\n", 11);
 	http_msg_move_end(msg, delta);
 	cur_end += delta;
 	cur_end = (char *)http_parse_reqline(msg,
 					     HTTP_MSG_RQMETH,
-					     msg->buf->buf.p, cur_end + 1,
+					     msg->chn->buf->p, cur_end + 1,
 					     NULL, NULL);
 	if (unlikely(!cur_end))
 		return 0;
@@ -1655,7 +1656,7 @@ void http_parse_connection_header(struct http_txn *txn, struct http_msg *msg, in
 
 	ctx.idx = 0;
 	txn->flags &= ~(TX_CON_KAL_SET|TX_CON_CLO_SET);
-	while (http_find_header2(hdr_val, hdr_len, msg->buf->buf.p, &txn->hdr_idx, &ctx)) {
+	while (http_find_header2(hdr_val, hdr_len, msg->chn->buf->p, &txn->hdr_idx, &ctx)) {
 		if (ctx.vlen >= 10 && word_match(ctx.line + ctx.val, ctx.vlen, "keep-alive", 10)) {
 			txn->flags |= TX_HDR_CONN_KAL;
 			if (to_del & 2)
@@ -1696,7 +1697,7 @@ void http_change_connection_header(struct http_txn *txn, struct http_msg *msg, i
 	}
 
 	txn->flags &= ~(TX_CON_CLO_SET | TX_CON_KAL_SET);
-	while (http_find_header2(hdr_val, hdr_len, msg->buf->buf.p, &txn->hdr_idx, &ctx)) {
+	while (http_find_header2(hdr_val, hdr_len, msg->chn->buf->p, &txn->hdr_idx, &ctx)) {
 		if (ctx.vlen >= 10 && word_match(ctx.line + ctx.val, ctx.vlen, "keep-alive", 10)) {
 			if (wanted & TX_CON_KAL_SET)
 				txn->flags |= TX_CON_KAL_SET;
@@ -1746,11 +1747,11 @@ void http_change_connection_header(struct http_txn *txn, struct http_msg *msg, i
  */
 int http_parse_chunk_size(struct http_msg *msg)
 {
-	const struct channel *buf = msg->buf;
-	const char *ptr = b_ptr(&buf->buf, msg->next);
+	const struct buffer *buf = msg->chn->buf;
+	const char *ptr = b_ptr(buf, msg->next);
 	const char *ptr_old = ptr;
-	const char *end = buf->buf.data + buf->buf.size;
-	const char *stop = bi_end(&buf->buf);
+	const char *end = buf->data + buf->size;
+	const char *stop = bi_end(buf);
 	unsigned int chunk = 0;
 
 	/* The chunk size is in the following form, though we are only
@@ -1765,7 +1766,7 @@ int http_parse_chunk_size(struct http_msg *msg)
 		if (c < 0) /* not a hex digit anymore */
 			break;
 		if (++ptr >= end)
-			ptr = buf->buf.data;
+			ptr = buf->data;
 		if (chunk & 0xF8000000) /* integer overflow will occur if result >= 2GB */
 			goto error;
 		chunk = (chunk << 4) + c;
@@ -1777,7 +1778,7 @@ int http_parse_chunk_size(struct http_msg *msg)
 
 	while (http_is_spht[(unsigned char)*ptr]) {
 		if (++ptr >= end)
-			ptr = buf->buf.data;
+			ptr = buf->data;
 		if (ptr == stop)
 			return 0;
 	}
@@ -1790,7 +1791,7 @@ int http_parse_chunk_size(struct http_msg *msg)
 			/* we now have a CR or an LF at ptr */
 			if (likely(*ptr == '\r')) {
 				if (++ptr >= end)
-					ptr = buf->buf.data;
+					ptr = buf->data;
 				if (ptr == stop)
 					return 0;
 			}
@@ -1798,20 +1799,20 @@ int http_parse_chunk_size(struct http_msg *msg)
 			if (*ptr != '\n')
 				goto error;
 			if (++ptr >= end)
-				ptr = buf->buf.data;
+				ptr = buf->data;
 			/* done */
 			break;
 		}
 		else if (*ptr == ';') {
 			/* chunk extension, ends at next CRLF */
 			if (++ptr >= end)
-				ptr = buf->buf.data;
+				ptr = buf->data;
 			if (ptr == stop)
 				return 0;
 
 			while (!HTTP_IS_CRLF(*ptr)) {
 				if (++ptr >= end)
-					ptr = buf->buf.data;
+					ptr = buf->data;
 				if (ptr == stop)
 					return 0;
 			}
@@ -1827,15 +1828,15 @@ int http_parse_chunk_size(struct http_msg *msg)
 	 * ->sov.
 	 */
 	if (ptr < ptr_old)
-		msg->sov += buf->buf.size;
+		msg->sov += buf->size;
 	msg->sov += ptr - ptr_old;
-	msg->next = buffer_count(&buf->buf, buf->buf.p, ptr);
+	msg->next = buffer_count(buf, buf->p, ptr);
 	msg->chunk_len = chunk;
 	msg->body_len += chunk;
 	msg->msg_state = chunk ? HTTP_MSG_DATA : HTTP_MSG_TRAILERS;
 	return 1;
  error:
-	msg->err_pos = buffer_count(&buf->buf, buf->buf.p, ptr);
+	msg->err_pos = buffer_count(buf, buf->p, ptr);
 	return -1;
 }
 
@@ -1856,13 +1857,13 @@ int http_parse_chunk_size(struct http_msg *msg)
  */
 int http_forward_trailers(struct http_msg *msg)
 {
-	const struct channel *buf = msg->buf;
+	const struct buffer *buf = msg->chn->buf;
 
 	/* we have msg->next which points to next line. Look for CRLF. */
 	while (1) {
 		const char *p1 = NULL, *p2 = NULL;
-		const char *ptr = b_ptr(&buf->buf, msg->next);
-		const char *stop = bi_end(&buf->buf);
+		const char *ptr = b_ptr(buf, msg->next);
+		const char *stop = bi_end(buf);
 		int bytes;
 
 		/* scan current line and stop at LF or CRLF */
@@ -1879,42 +1880,42 @@ int http_forward_trailers(struct http_msg *msg)
 
 			if (*ptr == '\r') {
 				if (p1) {
-					msg->err_pos = buffer_count(&buf->buf, buf->buf.p, ptr);
+					msg->err_pos = buffer_count(buf, buf->p, ptr);
 					return -1;
 				}
 				p1 = ptr;
 			}
 
 			ptr++;
-			if (ptr >= buf->buf.data + buf->buf.size)
-				ptr = buf->buf.data;
+			if (ptr >= buf->data + buf->size)
+				ptr = buf->data;
 		}
 
 		/* after LF; point to beginning of next line */
 		p2++;
-		if (p2 >= buf->buf.data + buf->buf.size)
-			p2 = buf->buf.data;
+		if (p2 >= buf->data + buf->size)
+			p2 = buf->data;
 
-		bytes = p2 - b_ptr(&buf->buf, msg->next);
+		bytes = p2 - b_ptr(buf, msg->next);
 		if (bytes < 0)
-			bytes += buf->buf.size;
+			bytes += buf->size;
 
 		/* schedule this line for forwarding */
 		msg->sov += bytes;
-		if (msg->sov >= buf->buf.size)
-			msg->sov -= buf->buf.size;
+		if (msg->sov >= buf->size)
+			msg->sov -= buf->size;
 
-		if (p1 == b_ptr(&buf->buf, msg->next)) {
+		if (p1 == b_ptr(buf, msg->next)) {
 			/* LF/CRLF at beginning of line => end of trailers at p2.
 			 * Everything was scheduled for forwarding, there's nothing
 			 * left from this message.
 			 */
-			msg->next = buffer_count(&buf->buf, buf->buf.p, p2);
+			msg->next = buffer_count(buf, buf->p, p2);
 			msg->msg_state = HTTP_MSG_DONE;
 			return 1;
 		}
 		/* OK, next line then */
-		msg->next = buffer_count(&buf->buf, buf->buf.p, p2);
+		msg->next = buffer_count(buf, buf->p, p2);
 	}
 }
 
@@ -1930,7 +1931,7 @@ int http_forward_trailers(struct http_msg *msg)
  */
 int http_skip_chunk_crlf(struct http_msg *msg)
 {
-	const struct channel *buf = msg->buf;
+	const struct buffer *buf = msg->chn->buf;
 	const char *ptr;
 	int bytes;
 
@@ -1939,25 +1940,25 @@ int http_skip_chunk_crlf(struct http_msg *msg)
 	 * against the correct length.
 	 */
 	bytes = 1;
-	ptr = buf->buf.p;
+	ptr = buf->p;
 	if (*ptr == '\r') {
 		bytes++;
 		ptr++;
-		if (ptr >= buf->buf.data + buf->buf.size)
-			ptr = buf->buf.data;
+		if (ptr >= buf->data + buf->size)
+			ptr = buf->data;
 	}
 
-	if (bytes > buf->buf.i)
+	if (bytes > buf->i)
 		return 0;
 
 	if (*ptr != '\n') {
-		msg->err_pos = buffer_count(&buf->buf, buf->buf.p, ptr);
+		msg->err_pos = buffer_count(buf, buf->p, ptr);
 		return -1;
 	}
 
 	ptr++;
-	if (ptr >= buf->buf.data + buf->buf.size)
-		ptr = buf->buf.data;
+	if (ptr >= buf->data + buf->size)
+		ptr = buf->data;
 	/* prepare the CRLF to be forwarded (between ->sol and ->sov) */
 	msg->sol = 0;
 	msg->sov = msg->next = bytes;
@@ -1983,9 +1984,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 * For the parsing, we use a 28 states FSM.
 	 *
 	 * Here is the information we currently have :
-	 *   req->buf.p             = beginning of request
-	 *   req->buf.p + msg->eoh  = end of processed headers / start of current one
-	 *   req->buf.p + req->buf.i    = end of input data
+	 *   req->buf->p             = beginning of request
+	 *   req->buf->p + msg->eoh  = end of processed headers / start of current one
+	 *   req->buf->p + req->buf->i    = end of input data
 	 *   msg->eol           = end of current header or line (LF or CRLF)
 	 *   msg->next          = first non-visited byte
 	 *
@@ -2007,7 +2008,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->buf.i,
+		req->buf->i,
 		req->analysers);
 
 	/* we're speaking HTTP here, so let's speak HTTP to the client */
@@ -2018,12 +2019,12 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 * protected area is affected, because we may have to move processed
 	 * data later, which is much more complicated.
 	 */
-	if (buffer_not_empty(&req->buf) && msg->msg_state < HTTP_MSG_ERROR) {
+	if (buffer_not_empty(req->buf) && msg->msg_state < HTTP_MSG_ERROR) {
 		if ((txn->flags & TX_NOT_FIRST) &&
 		    unlikely(channel_full(req) ||
-			     bi_end(&req->buf) < b_ptr(&req->buf, msg->next) ||
-			     bi_end(&req->buf) > req->buf.data + req->buf.size - global.tune.maxrewrite)) {
-			if (req->buf.o) {
+			     bi_end(req->buf) < b_ptr(req->buf, msg->next) ||
+			     bi_end(req->buf) > req->buf->data + req->buf->size - global.tune.maxrewrite)) {
+			if (req->buf->o) {
 				if (req->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_WRITE_ERROR|CF_WRITE_TIMEOUT))
 					goto failed_keep_alive;
 				/* some data has still not left the buffer, wake us once that's done */
@@ -2031,9 +2032,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 				req->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
 				return 0;
 			}
-			if (bi_end(&req->buf) < b_ptr(&req->buf, msg->next) ||
-			    bi_end(&req->buf) > req->buf.data + req->buf.size - global.tune.maxrewrite)
-				buffer_slow_realign(&msg->buf->buf);
+			if (bi_end(req->buf) < b_ptr(req->buf, msg->next) ||
+			    bi_end(req->buf) > req->buf->data + req->buf->size - global.tune.maxrewrite)
+				buffer_slow_realign(msg->chn->buf);
 		}
 
 		/* Note that we have the same problem with the response ; we
@@ -2045,9 +2046,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		 */
 		if ((txn->flags & TX_NOT_FIRST) &&
 		    unlikely(channel_full(s->rep) ||
-			     bi_end(&s->rep->buf) < b_ptr(&s->rep->buf, txn->rsp.next) ||
-			     bi_end(&s->rep->buf) > s->rep->buf.data + s->rep->buf.size - global.tune.maxrewrite)) {
-			if (s->rep->buf.o) {
+			     bi_end(s->rep->buf) < b_ptr(s->rep->buf, txn->rsp.next) ||
+			     bi_end(s->rep->buf) > s->rep->buf->data + s->rep->buf->size - global.tune.maxrewrite)) {
+			if (s->rep->buf->o) {
 				if (s->rep->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_WRITE_ERROR|CF_WRITE_TIMEOUT))
 					goto failed_keep_alive;
 				/* don't let a connection request be initiated */
@@ -2058,7 +2059,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 			}
 		}
 
-		if (likely(msg->next < req->buf.i)) /* some unparsed data are available */
+		if (likely(msg->next < req->buf->i)) /* some unparsed data are available */
 			http_msg_analyzer(msg, &txn->hdr_idx);
 	}
 
@@ -2068,12 +2069,12 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		     (msg->msg_state >= HTTP_MSG_BODY || msg->msg_state == HTTP_MSG_ERROR))) {
 		char *eol, *sol;
 
-		sol = req->buf.p;
+		sol = req->buf->p;
 		/* this is a bit complex : in case of error on the request line,
 		 * we know that rq.l is still zero, so we display only the part
 		 * up to the end of the line (truncated by debug_hdr).
 		 */
-		eol = sol + (msg->sl.rq.l ? msg->sl.rq.l : req->buf.i);
+		eol = sol + (msg->sl.rq.l ? msg->sl.rq.l : req->buf->i);
 		debug_hdr("clireq", s, sol, eol);
 
 		sol += hdr_idx_first_pos(&txn->hdr_idx);
@@ -2120,7 +2121,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		 *    later, so the session will never terminate. We
 		 *    must terminate it now.
 		 */
-		if (unlikely(buffer_full(&req->buf, global.tune.maxrewrite))) {
+		if (unlikely(buffer_full(req->buf, global.tune.maxrewrite))) {
 			/* FIXME: check if URI is set and return Status
 			 * 414 Request URI too long instead.
 			 */
@@ -2128,7 +2129,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 			session_inc_http_err_ctr(s);
 			proxy_inc_fe_req_ctr(s->fe);
 			if (msg->err_pos < 0)
-				msg->err_pos = req->buf.i;
+				msg->err_pos = req->buf->i;
 			goto return_bad_req;
 		}
 
@@ -2220,7 +2221,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		req->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
 		s->rep->flags &= ~CF_EXPECT_MORE; /* speed up sending a previous response */
 #ifdef TCP_QUICKACK
-		if (s->listener->options & LI_O_NOQUICKACK && req->buf.i) {
+		if (s->listener->options & LI_O_NOQUICKACK && req->buf->i) {
 			/* We need more data, we have to re-enable quick-ack in case we
 			 * previously disabled it, otherwise we might cause the client
 			 * to delay next data.
@@ -2267,7 +2268,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 
 	/* OK now we have a complete HTTP request with indexed headers. Let's
 	 * complete the request parsing by setting a few fields we will need
-	 * later. At this point, we have the last CRLF at req->buf.data + msg->eoh.
+	 * later. At this point, we have the last CRLF at req->buf->data + msg->eoh.
 	 * If the request is in HTTP/0.9 form, the rule is still true, and eoh
 	 * points to the CRLF of the request line. msg->next points to the first
 	 * byte after the last LF. msg->sov points to the first byte of data.
@@ -2294,7 +2295,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	/*
 	 * 1: identify the method
 	 */
-	txn->meth = find_http_meth(req->buf.p, msg->sl.rq.m_l);
+	txn->meth = find_http_meth(req->buf->p, msg->sl.rq.m_l);
 
 	/* we can make use of server redirect on GET and HEAD */
 	if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
@@ -2307,7 +2308,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 */
 	if (unlikely((s->fe->monitor_uri_len != 0) &&
 		     (s->fe->monitor_uri_len == msg->sl.rq.u_l) &&
-		     !memcmp(req->buf.p + msg->sl.rq.u,
+		     !memcmp(req->buf->p + msg->sl.rq.u,
 			     s->fe->monitor_uri,
 			     s->fe->monitor_uri_len))) {
 		/*
@@ -2352,7 +2353,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 
 			if (urilen >= REQURI_LEN)
 				urilen = REQURI_LEN - 1;
-			memcpy(txn->uri, req->buf.p, urilen);
+			memcpy(txn->uri, req->buf->p, urilen);
 			txn->uri[urilen] = 0;
 
 			if (!(s->logs.logwait &= ~LW_REQ))
@@ -2372,9 +2373,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 
 	/* ... and check if the request is HTTP/1.1 or above */
 	if ((msg->sl.rq.v_l == 8) &&
-	    ((req->buf.p[msg->sl.rq.v + 5] > '1') ||
-	     ((req->buf.p[msg->sl.rq.v + 5] == '1') &&
-	      (req->buf.p[msg->sl.rq.v + 7] >= '1'))))
+	    ((req->buf->p[msg->sl.rq.v + 5] > '1') ||
+	     ((req->buf->p[msg->sl.rq.v + 5] == '1') &&
+	      (req->buf->p[msg->sl.rq.v + 7] >= '1'))))
 		msg->flags |= HTTP_MSGF_VER_11;
 
 	/* "connection" has not been parsed yet */
@@ -2390,7 +2391,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 * CONNECT ip:port.
 	 */
 	if ((s->fe->options2 & PR_O2_USE_PXHDR) &&
-	    req->buf.p[msg->sl.rq.u] != '/' && req->buf.p[msg->sl.rq.u] != '*')
+	    req->buf->p[msg->sl.rq.u] != '/' && req->buf->p[msg->sl.rq.u] != '*')
 		txn->flags |= TX_USE_PX_CONN;
 
 	/* transfer length unknown*/
@@ -2398,7 +2399,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 
 	/* 5: we may need to capture headers */
 	if (unlikely((s->logs.logwait & LW_REQHDR) && txn->req.cap))
-		capture_headers(req->buf.p, &txn->hdr_idx,
+		capture_headers(req->buf->p, &txn->hdr_idx,
 				txn->req.cap, s->fe->req_cap);
 
 	/* 6: determine the transfer-length.
@@ -2443,7 +2444,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	ctx.idx = 0;
 	/* set TE_CHNK and XFER_LEN only if "chunked" is seen last */
 	while ((msg->flags & HTTP_MSGF_VER_11) &&
-	       http_find_header2("Transfer-Encoding", 17, req->buf.p, &txn->hdr_idx, &ctx)) {
+	       http_find_header2("Transfer-Encoding", 17, req->buf->p, &txn->hdr_idx, &ctx)) {
 		if (ctx.vlen == 7 && strncasecmp(ctx.line + ctx.val, "chunked", 7) == 0)
 			msg->flags |= (HTTP_MSGF_TE_CHNK | HTTP_MSGF_XFER_LEN);
 		else if (msg->flags & HTTP_MSGF_TE_CHNK) {
@@ -2456,26 +2457,26 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 
 	ctx.idx = 0;
 	while (!(msg->flags & HTTP_MSGF_TE_CHNK) && !use_close_only &&
-	       http_find_header2("Content-Length", 14, req->buf.p, &txn->hdr_idx, &ctx)) {
+	       http_find_header2("Content-Length", 14, req->buf->p, &txn->hdr_idx, &ctx)) {
 		signed long long cl;
 
 		if (!ctx.vlen) {
-			msg->err_pos = ctx.line + ctx.val - req->buf.p;
+			msg->err_pos = ctx.line + ctx.val - req->buf->p;
 			goto return_bad_req;
 		}
 
 		if (strl2llrc(ctx.line + ctx.val, ctx.vlen, &cl)) {
-			msg->err_pos = ctx.line + ctx.val - req->buf.p;
+			msg->err_pos = ctx.line + ctx.val - req->buf->p;
 			goto return_bad_req; /* parse failure */
 		}
 
 		if (cl < 0) {
-			msg->err_pos = ctx.line + ctx.val - req->buf.p;
+			msg->err_pos = ctx.line + ctx.val - req->buf->p;
 			goto return_bad_req;
 		}
 
 		if ((msg->flags & HTTP_MSGF_CNT_LEN) && (msg->chunk_len != cl)) {
-			msg->err_pos = ctx.line + ctx.val - req->buf.p;
+			msg->err_pos = ctx.line + ctx.val - req->buf->p;
 			goto return_bad_req; /* already specified, was different */
 		}
 
@@ -2540,17 +2541,17 @@ int http_process_req_stat_post(struct stream_interface *si, struct http_txn *txn
 	char *st_cur_param = NULL;
 	char *st_next_param = NULL;
 
-	first_param = req->buf.p + txn->req.eoh + 2;
+	first_param = req->buf->p + txn->req.eoh + 2;
 	end_params  = first_param + txn->req.body_len;
 
 	cur_param = next_param = end_params;
 
-	if (end_params >= req->buf.data + req->buf.size - global.tune.maxrewrite) {
+	if (end_params >= req->buf->data + req->buf->size - global.tune.maxrewrite) {
 		/* Prevent buffer overflow */
 		si->applet.ctx.stats.st_code = STAT_STATUS_EXCD;
 		return 1;
 	}
-	else if (end_params > req->buf.p + req->buf.i) {
+	else if (end_params > req->buf->p + req->buf->i) {
 		/* we need more data */
 		si->applet.ctx.stats.st_code = STAT_STATUS_NONE;
 		return 0;
@@ -2802,7 +2803,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->buf.i,
+		req->buf->i,
 		req->analysers);
 
 	/* first check whether we have some ACLs set to block this request */
@@ -3011,7 +3012,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 						struct hdr_ctx ctx;
 						ctx.idx = 0;
 						/* Expect is allowed in 1.1, look for it */
-						if (http_find_header2("Expect", 6, req->buf.p, &txn->hdr_idx, &ctx) &&
+						if (http_find_header2("Expect", 6, req->buf->p, &txn->hdr_idx, &ctx) &&
 						    unlikely(ctx.vlen == 12 && strncasecmp(ctx.line+ctx.val, "100-continue", 12) == 0)) {
 							bo_inject(s->rep, http_100_chunk.str, http_100_chunk.len);
 						}
@@ -3087,7 +3088,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 				host = "";
 				hostlen = 0;
 				ctx.idx = 0;
-				if (http_find_header2("Host", 4, txn->req.buf->buf.p + txn->req.sol, &txn->hdr_idx, &ctx)) {
+				if (http_find_header2("Host", 4, txn->req.chn->buf->p + txn->req.sol, &txn->hdr_idx, &ctx)) {
 					host = ctx.line + ctx.val;
 					hostlen = ctx.vlen;
 				}
@@ -3095,7 +3096,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 				path = http_get_path(txn);
 				/* build message using path */
 				if (path) {
-					pathlen = txn->req.sl.rq.u_l + (req->buf.p + txn->req.sl.rq.u) - path;
+					pathlen = txn->req.sl.rq.u_l + (req->buf->p + txn->req.sl.rq.u) - path;
 					if (rule->flags & REDIRECT_FLAG_DROP_QS) {
 						int qs = 0;
 						while (qs < pathlen) {
@@ -3149,7 +3150,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 				path = http_get_path(txn);
 				/* build message using path */
 				if (path) {
-					pathlen = txn->req.sl.rq.u_l + (req->buf.p + txn->req.sl.rq.u) - path;
+					pathlen = txn->req.sl.rq.u_l + (req->buf->p + txn->req.sl.rq.u) - path;
 					if (rule->flags & REDIRECT_FLAG_DROP_QS) {
 						int qs = 0;
 						while (qs < pathlen) {
@@ -3240,7 +3241,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 				rdr.len += 4;
 				bo_inject(req->prod->ob, rdr.str, rdr.len);
 				/* "eat" the request */
-				bi_fast_delete(&req->buf, msg->sov);
+				bi_fast_delete(req->buf, msg->sov);
 				msg->sov = 0;
 				req->analysers = AN_REQ_HTTP_XFER_BODY;
 				s->rep->analysers = AN_RES_HTTP_XFER_BODY;
@@ -3324,7 +3325,7 @@ int http_process_request(struct session *s, struct channel *req, int an_bit)
 		req,
 		req->rex, req->wex,
 		req->flags,
-		req->buf.i,
+		req->buf->i,
 		req->analysers);
 
 	/*
@@ -3339,7 +3340,7 @@ int http_process_request(struct session *s, struct channel *req, int an_bit)
 	 * parsing incoming request.
 	 */
 	if ((s->be->options & PR_O_HTTP_PROXY) && !(s->flags & SN_ADDR_SET)) {
-		url2sa(req->buf.p + msg->sl.rq.u, msg->sl.rq.u_l, &s->req->cons->conn.addr.to);
+		url2sa(req->buf->p + msg->sl.rq.u, msg->sl.rq.u_l, &s->req->cons->conn.addr.to);
 	}
 
 	/*
@@ -3359,7 +3360,7 @@ int http_process_request(struct session *s, struct channel *req, int an_bit)
 
 	/* It needs to look into the URI unless persistence must be ignored */
 	if ((txn->sessid == NULL) && s->be->appsession_name && !(s->flags & SN_IGNORE_PRST)) {
-		get_srv_from_appsession(s, req->buf.p + msg->sl.rq.u, msg->sl.rq.u_l);
+		get_srv_from_appsession(s, req->buf->p + msg->sl.rq.u, msg->sl.rq.u_l);
 	}
 
 	/* add unique-id if "header-unique-id" is specified */
@@ -3384,7 +3385,7 @@ int http_process_request(struct session *s, struct channel *req, int an_bit)
 		if (!((s->fe->options | s->be->options) & PR_O_FF_ALWAYS) &&
 			http_find_header2(s->be->fwdfor_hdr_len ? s->be->fwdfor_hdr_name : s->fe->fwdfor_hdr_name,
 			                  s->be->fwdfor_hdr_len ? s->be->fwdfor_hdr_len : s->fe->fwdfor_hdr_len,
-			                  req->buf.p, &txn->hdr_idx, &ctx)) {
+			                  req->buf->p, &txn->hdr_idx, &ctx)) {
 			/* The header is set to be added only if none is present
 			 * and we found it, so don't do anything.
 			 */
@@ -3538,7 +3539,7 @@ int http_process_request(struct session *s, struct channel *req, int an_bit)
 		 */
 		if ((s->listener->options & LI_O_NOQUICKACK) &&
 		    ((msg->flags & HTTP_MSGF_TE_CHNK) ||
-		     (msg->body_len > req->buf.i - txn->req.eoh - 2)))
+		     (msg->body_len > req->buf->i - txn->req.eoh - 2)))
 			setsockopt(si_fd(&s->si[0]), IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 #endif
 	}
@@ -3656,7 +3657,7 @@ int http_process_request_body(struct session *s, struct channel *req, int an_bit
 			struct hdr_ctx ctx;
 			ctx.idx = 0;
 			/* Expect is allowed in 1.1, look for it */
-			if (http_find_header2("Expect", 6, req->buf.p, &txn->hdr_idx, &ctx) &&
+			if (http_find_header2("Expect", 6, req->buf->p, &txn->hdr_idx, &ctx) &&
 			    unlikely(ctx.vlen == 12 && strncasecmp(ctx.line+ctx.val, "100-continue", 12) == 0)) {
 				bo_inject(s->rep, http_100_chunk.str, http_100_chunk.len);
 			}
@@ -3666,7 +3667,7 @@ int http_process_request_body(struct session *s, struct channel *req, int an_bit
 
 	if (msg->msg_state < HTTP_MSG_CHUNK_SIZE) {
 		/* we have msg->sov which points to the first byte of message body.
-		 * req->buf.p still points to the beginning of the message and msg->sol
+		 * req->buf->p still points to the beginning of the message and msg->sol
 		 * is still null. We must save the body in msg->next because it
 		 * survives buffer re-alignments.
 		 */
@@ -3701,12 +3702,12 @@ int http_process_request_body(struct session *s, struct channel *req, int an_bit
 	if (msg->body_len < limit)
 		limit = msg->body_len;
 
-	if (req->buf.i - msg->sov >= limit)    /* we have enough bytes now */
+	if (req->buf->i - msg->sov >= limit)    /* we have enough bytes now */
 		goto http_end;
 
  missing_data:
 	/* we get here if we need to wait for more data */
-	if (buffer_full(&req->buf, global.tune.maxrewrite)) {
+	if (buffer_full(req->buf, global.tune.maxrewrite)) {
 		session_inc_http_err_ctr(s);
 		goto return_bad_req;
 	}
@@ -3723,7 +3724,7 @@ int http_process_request_body(struct session *s, struct channel *req, int an_bit
 	}
 
 	/* we get here if we need to wait for more data */
-	if (!(req->flags & (CF_SHUTR | CF_READ_ERROR)) && !buffer_full(&req->buf, global.tune.maxrewrite)) {
+	if (!(req->flags & (CF_SHUTR | CF_READ_ERROR)) && !buffer_full(req->buf, global.tune.maxrewrite)) {
 		/* Not enough data. We'll re-use the http-request
 		 * timeout here. Ideally, we should set the timeout
 		 * relative to the accept() date. We just set the
@@ -3772,20 +3773,20 @@ int http_send_name_header(struct http_txn *txn, struct proxy* be, const char* sr
 
 	char *hdr_name = be->server_id_hdr_name;
 	int hdr_name_len = be->server_id_hdr_len;
-	struct channel *req = txn->req.buf;
+	struct channel *chn = txn->req.chn;
 	char *hdr_val;
 	unsigned int old_o, old_i;
 
 	ctx.idx = 0;
 
-	old_o = req->buf.o;
+	old_o = chn->buf->o;
 	if (old_o) {
 		/* The request was already skipped, let's restore it */
-		b_rew(&req->buf, old_o);
+		b_rew(chn->buf, old_o);
 	}
 
-	old_i = req->buf.i;
-	while (http_find_header2(hdr_name, hdr_name_len, txn->req.buf->buf.p, &txn->hdr_idx, &ctx)) {
+	old_i = chn->buf->i;
+	while (http_find_header2(hdr_name, hdr_name_len, txn->req.chn->buf->p, &txn->hdr_idx, &ctx)) {
 		/* remove any existing values from the header */
 	        http_remove_header2(&txn->req, &txn->hdr_idx, &ctx);
 	}
@@ -3804,7 +3805,7 @@ int http_send_name_header(struct http_txn *txn, struct proxy* be, const char* sr
 		 * data to be forwarded in order to take into account the size
 		 * variations.
 		 */
-		b_adv(&req->buf, old_o + req->buf.i - old_i);
+		b_adv(chn->buf, old_o + chn->buf->i - old_i);
 	}
 
 	return 0;
@@ -3854,8 +3855,8 @@ void http_end_txn_clean_session(struct session *s)
 	}
 
 	/* don't count other requests' data */
-	s->logs.bytes_in  -= s->req->buf.i;
-	s->logs.bytes_out -= s->rep->buf.i;
+	s->logs.bytes_in  -= s->req->buf->i;
+	s->logs.bytes_out -= s->rep->buf->i;
 
 	/* let's do a final log if we need it */
 	if (s->logs.logwait &&
@@ -3874,8 +3875,8 @@ void http_end_txn_clean_session(struct session *s)
 	s->logs.prx_queue_size = 0;  /* we get the number of pending conns before us */
 	s->logs.srv_queue_size = 0; /* we will get this number soon */
 
-	s->logs.bytes_in = s->req->total = s->req->buf.i;
-	s->logs.bytes_out = s->rep->total = s->rep->buf.i;
+	s->logs.bytes_in = s->req->total = s->req->buf->i;
+	s->logs.bytes_out = s->rep->total = s->rep->buf->i;
 
 	if (s->pend_pos)
 		pendconn_free(s->pend_pos);
@@ -3921,10 +3922,10 @@ void http_end_txn_clean_session(struct session *s)
 	 * because the request will wait for it to flush a little
 	 * bit before proceeding.
 	 */
-	if (s->req->buf.i) {
-		if (s->rep->buf.o &&
-		    !buffer_full(&s->rep->buf, global.tune.maxrewrite) &&
-		    bi_end(&s->rep->buf) <= s->rep->buf.data + s->rep->buf.size - global.tune.maxrewrite)
+	if (s->req->buf->i) {
+		if (s->rep->buf->o &&
+		    !buffer_full(s->rep->buf, global.tune.maxrewrite) &&
+		    bi_end(s->rep->buf) <= s->rep->buf->data + s->rep->buf->size - global.tune.maxrewrite)
 			s->rep->flags |= CF_EXPECT_MORE;
 	}
 
@@ -3950,9 +3951,9 @@ void http_end_txn_clean_session(struct session *s)
  */
 int http_sync_req_state(struct session *s)
 {
-	struct channel *buf = s->req;
+	struct channel *chn = s->req;
 	struct http_txn *txn = &s->txn;
-	unsigned int old_flags = buf->flags;
+	unsigned int old_flags = chn->flags;
 	unsigned int old_state = txn->req.msg_state;
 
 	http_silent_debug(__LINE__, s);
@@ -3969,7 +3970,7 @@ int http_sync_req_state(struct session *s)
 		 * (eg: Linux).
 		 */
 		if (!(s->be->options & PR_O_ABRT_CLOSE) && txn->meth != HTTP_METH_POST)
-			channel_dont_read(buf);
+			channel_dont_read(chn);
 
 		if (txn->rsp.msg_state == HTTP_MSG_ERROR)
 			goto wait_other_side;
@@ -3983,7 +3984,7 @@ int http_sync_req_state(struct session *s)
 
 		if (txn->rsp.msg_state == HTTP_MSG_TUNNEL) {
 			/* if any side switches to tunnel mode, the other one does too */
-			channel_auto_read(buf);
+			channel_auto_read(chn);
 			txn->req.msg_state = HTTP_MSG_TUNNEL;
 			goto wait_other_side;
 		}
@@ -3996,8 +3997,8 @@ int http_sync_req_state(struct session *s)
 
 		if ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL) {
 			/* Server-close mode : queue a connection close to the server */
-			if (!(buf->flags & (CF_SHUTW|CF_SHUTW_NOW)))
-				channel_shutw_now(buf);
+			if (!(chn->flags & (CF_SHUTW|CF_SHUTW_NOW)))
+				channel_shutw_now(chn);
 		}
 		else if ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_CLO) {
 			/* Option forceclose is set, or either side wants to close,
@@ -4005,9 +4006,9 @@ int http_sync_req_state(struct session *s)
 			 * data to come. The caller knows the session is complete
 			 * once both states are CLOSED.
 			 */
-			if (!(buf->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
-				channel_shutr_now(buf);
-				channel_shutw_now(buf);
+			if (!(chn->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
+				channel_shutr_now(chn);
+				channel_shutw_now(chn);
 			}
 		}
 		else {
@@ -4016,15 +4017,15 @@ int http_sync_req_state(struct session *s)
 			 * in tunnel mode, so we're left with keep-alive only.
 			 * This mode is currently not implemented, we switch to tunnel mode.
 			 */
-			channel_auto_read(buf);
+			channel_auto_read(chn);
 			txn->req.msg_state = HTTP_MSG_TUNNEL;
 		}
 
-		if (buf->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
+		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
 			/* if we've just closed an output, let's switch */
-			buf->cons->flags |= SI_FL_NOLINGER;  /* we want to close ASAP */
+			chn->cons->flags |= SI_FL_NOLINGER;  /* we want to close ASAP */
 
-			if (!channel_is_empty(buf)) {
+			if (!channel_is_empty(chn)) {
 				txn->req.msg_state = HTTP_MSG_CLOSING;
 				goto http_msg_closing;
 			}
@@ -4041,11 +4042,11 @@ int http_sync_req_state(struct session *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shutw_now to take effect.
 		 */
-		if (channel_is_empty(buf)) {
+		if (channel_is_empty(chn)) {
 			txn->req.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}
-		else if (buf->flags & CF_SHUTW) {
+		else if (chn->flags & CF_SHUTW) {
 			txn->req.msg_state = HTTP_MSG_ERROR;
 			goto wait_other_side;
 		}
@@ -4058,7 +4059,7 @@ int http_sync_req_state(struct session *s)
 
  wait_other_side:
 	http_silent_debug(__LINE__, s);
-	return txn->req.msg_state != old_state || buf->flags != old_flags;
+	return txn->req.msg_state != old_state || chn->flags != old_flags;
 }
 
 
@@ -4071,9 +4072,9 @@ int http_sync_req_state(struct session *s)
  */
 int http_sync_res_state(struct session *s)
 {
-	struct channel *buf = s->rep;
+	struct channel *chn = s->rep;
 	struct http_txn *txn = &s->txn;
-	unsigned int old_flags = buf->flags;
+	unsigned int old_flags = chn->flags;
 	unsigned int old_state = txn->rsp.msg_state;
 
 	http_silent_debug(__LINE__, s);
@@ -4086,7 +4087,7 @@ int http_sync_res_state(struct session *s)
 		 * while the request is being uploaded, so we don't disable
 		 * reading.
 		 */
-		/* channel_dont_read(buf); */
+		/* channel_dont_read(chn); */
 
 		if (txn->req.msg_state == HTTP_MSG_ERROR)
 			goto wait_other_side;
@@ -4102,7 +4103,7 @@ int http_sync_res_state(struct session *s)
 
 		if (txn->req.msg_state == HTTP_MSG_TUNNEL) {
 			/* if any side switches to tunnel mode, the other one does too */
-			channel_auto_read(buf);
+			channel_auto_read(chn);
 			txn->rsp.msg_state = HTTP_MSG_TUNNEL;
 			goto wait_other_side;
 		}
@@ -4119,8 +4120,8 @@ int http_sync_res_state(struct session *s)
 			 * when we're in DONE and the other is in CLOSED and will
 			 * catch that for the final cleanup.
 			 */
-			if (!(buf->flags & (CF_SHUTR|CF_SHUTR_NOW)))
-				channel_shutr_now(buf);
+			if (!(chn->flags & (CF_SHUTR|CF_SHUTR_NOW)))
+				channel_shutr_now(chn);
 		}
 		else if ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_CLO) {
 			/* Option forceclose is set, or either side wants to close,
@@ -4128,9 +4129,9 @@ int http_sync_res_state(struct session *s)
 			 * data to come. The caller knows the session is complete
 			 * once both states are CLOSED.
 			 */
-			if (!(buf->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
-				channel_shutr_now(buf);
-				channel_shutw_now(buf);
+			if (!(chn->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
+				channel_shutr_now(chn);
+				channel_shutw_now(chn);
 			}
 		}
 		else {
@@ -4139,13 +4140,13 @@ int http_sync_res_state(struct session *s)
 			 * in tunnel mode, so we're left with keep-alive only.
 			 * This mode is currently not implemented, we switch to tunnel mode.
 			 */
-			channel_auto_read(buf);
+			channel_auto_read(chn);
 			txn->rsp.msg_state = HTTP_MSG_TUNNEL;
 		}
 
-		if (buf->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
+		if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
 			/* if we've just closed an output, let's switch */
-			if (!channel_is_empty(buf)) {
+			if (!channel_is_empty(chn)) {
 				txn->rsp.msg_state = HTTP_MSG_CLOSING;
 				goto http_msg_closing;
 			}
@@ -4162,11 +4163,11 @@ int http_sync_res_state(struct session *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shutw_now to take effect.
 		 */
-		if (channel_is_empty(buf)) {
+		if (channel_is_empty(chn)) {
 			txn->rsp.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}
-		else if (buf->flags & CF_SHUTW) {
+		else if (chn->flags & CF_SHUTW) {
 			txn->rsp.msg_state = HTTP_MSG_ERROR;
 			s->be->be_counters.cli_aborts++;
 			if (target_srv(&s->target))
@@ -4178,15 +4179,15 @@ int http_sync_res_state(struct session *s)
 	if (txn->rsp.msg_state == HTTP_MSG_CLOSED) {
 	http_msg_closed:
 		/* drop any pending data */
-		bi_erase(buf);
-		channel_auto_close(buf);
-		channel_auto_read(buf);
+		bi_erase(chn);
+		channel_auto_close(chn);
+		channel_auto_read(chn);
 		goto wait_other_side;
 	}
 
  wait_other_side:
 	http_silent_debug(__LINE__, s);
-	return txn->rsp.msg_state != old_state || buf->flags != old_flags;
+	return txn->rsp.msg_state != old_state || chn->flags != old_flags;
 }
 
 
@@ -4280,7 +4281,7 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
 		return 0;
 
 	if ((req->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) ||
-	    ((req->flags & CF_SHUTW) && (req->to_forward || req->buf.o))) {
+	    ((req->flags & CF_SHUTW) && (req->to_forward || req->buf->o))) {
 		/* Output closed while we were sending data. We must abort and
 		 * wake the other side up.
 		 */
@@ -4300,7 +4301,7 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
 
 	if (msg->msg_state < HTTP_MSG_CHUNK_SIZE) {
 		/* we have msg->sov which points to the first byte of message body.
-		 * req->buf.p still points to the beginning of the message and msg->sol
+		 * req->buf->p still points to the beginning of the message and msg->sol
 		 * is still null. We must save the body in msg->next because it
 		 * survives buffer re-alignments.
 		 */
@@ -4552,7 +4553,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 		rep,
 		rep->rex, rep->wex,
 		rep->flags,
-		rep->buf.i,
+		rep->buf->i,
 		rep->analysers);
 
 	/*
@@ -4564,9 +4565,9 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	 * For the parsing, we use a 28 states FSM.
 	 *
 	 * Here is the information we currently have :
-	 *   rep->buf.p             = beginning of response
-	 *   rep->buf.p + msg->eoh  = end of processed headers / start of current one
-	 *   rep->buf.p + rep->buf.i    = end of input data
+	 *   rep->buf->p             = beginning of response
+	 *   rep->buf->p + msg->eoh  = end of processed headers / start of current one
+	 *   rep->buf->p + rep->buf->i    = end of input data
 	 *   msg->eol           = end of current header or line (LF or CRLF)
 	 *   msg->next          = first non-visited byte
 	 */
@@ -4576,11 +4577,11 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	 * protected area is affected, because we may have to move processed
 	 * data later, which is much more complicated.
 	 */
-	if (buffer_not_empty(&rep->buf) && msg->msg_state < HTTP_MSG_ERROR) {
+	if (buffer_not_empty(rep->buf) && msg->msg_state < HTTP_MSG_ERROR) {
 		if (unlikely(channel_full(rep) ||
-			     bi_end(&rep->buf) < b_ptr(&rep->buf, msg->next) ||
-			     bi_end(&rep->buf) > rep->buf.data + rep->buf.size - global.tune.maxrewrite)) {
-			if (rep->buf.o) {
+			     bi_end(rep->buf) < b_ptr(rep->buf, msg->next) ||
+			     bi_end(rep->buf) > rep->buf->data + rep->buf->size - global.tune.maxrewrite)) {
+			if (rep->buf->o) {
 				/* some data has still not left the buffer, wake us once that's done */
 				if (rep->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_WRITE_ERROR|CF_WRITE_TIMEOUT))
 					goto abort_response;
@@ -4588,11 +4589,11 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 				rep->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
 				return 0;
 			}
-			if (rep->buf.i <= rep->buf.size - global.tune.maxrewrite)
-				buffer_slow_realign(&msg->buf->buf);
+			if (rep->buf->i <= rep->buf->size - global.tune.maxrewrite)
+				buffer_slow_realign(msg->chn->buf);
 		}
 
-		if (likely(msg->next < rep->buf.i))
+		if (likely(msg->next < rep->buf->i))
 			http_msg_analyzer(msg, &txn->hdr_idx);
 	}
 
@@ -4602,8 +4603,8 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 		     (msg->msg_state >= HTTP_MSG_BODY || msg->msg_state == HTTP_MSG_ERROR))) {
 		char *eol, *sol;
 
-		sol = rep->buf.p;
-		eol = sol + (msg->sl.st.l ? msg->sl.st.l : rep->buf.i);
+		sol = rep->buf->p;
+		eol = sol + (msg->sl.st.l ? msg->sl.st.l : rep->buf->i);
 		debug_hdr("srvrep", s, sol, eol);
 
 		sol += hdr_idx_first_pos(&txn->hdr_idx);
@@ -4662,9 +4663,9 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 		}
 
 		/* too large response does not fit in buffer. */
-		else if (buffer_full(&rep->buf, global.tune.maxrewrite)) {
+		else if (buffer_full(rep->buf, global.tune.maxrewrite)) {
 			if (msg->err_pos < 0)
-				msg->err_pos = rep->buf.i;
+				msg->err_pos = rep->buf->i;
 			goto hdr_response_bad;
 		}
 
@@ -4776,7 +4777,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	/*
 	 * 1: get the status code
 	 */
-	n = rep->buf.p[msg->sl.st.c] - '0';
+	n = rep->buf->p[msg->sl.st.c] - '0';
 	if (n < 1 || n > 5)
 		n = 0;
 	/* when the client triggers a 4xx from the server, it's most often due
@@ -4792,8 +4793,8 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 
 	/* check if the response is HTTP/1.1 or above */
 	if ((msg->sl.st.v_l == 8) &&
-	    ((rep->buf.p[5] > '1') ||
-	     ((rep->buf.p[5] == '1') && (rep->buf.p[7] >= '1'))))
+	    ((rep->buf->p[5] > '1') ||
+	     ((rep->buf->p[5] == '1') && (rep->buf->p[7] >= '1'))))
 		msg->flags |= HTTP_MSGF_VER_11;
 
 	/* "connection" has not been parsed yet */
@@ -4802,7 +4803,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	/* transfer length unknown*/
 	msg->flags &= ~HTTP_MSGF_XFER_LEN;
 
-	txn->status = strl2ui(rep->buf.p + msg->sl.st.c, msg->sl.st.c_l);
+	txn->status = strl2ui(rep->buf->p + msg->sl.st.c, msg->sl.st.c_l);
 
 	/* Adjust server's health based on status code. Note: status codes 501
 	 * and 505 are triggered on demand by client request, so we must not
@@ -4850,7 +4851,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	 */
 	s->logs.logwait &= ~LW_RESP;
 	if (unlikely((s->logs.logwait & LW_RSPHDR) && txn->rsp.cap))
-		capture_headers(rep->buf.p, &txn->hdr_idx,
+		capture_headers(rep->buf->p, &txn->hdr_idx,
 				txn->rsp.cap, s->fe->rsp_cap);
 
 	/* 4: determine the transfer-length.
@@ -4908,7 +4909,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	use_close_only = 0;
 	ctx.idx = 0;
 	while ((msg->flags & HTTP_MSGF_VER_11) &&
-	       http_find_header2("Transfer-Encoding", 17, rep->buf.p, &txn->hdr_idx, &ctx)) {
+	       http_find_header2("Transfer-Encoding", 17, rep->buf->p, &txn->hdr_idx, &ctx)) {
 		if (ctx.vlen == 7 && strncasecmp(ctx.line + ctx.val, "chunked", 7) == 0)
 			msg->flags |= (HTTP_MSGF_TE_CHNK | HTTP_MSGF_XFER_LEN);
 		else if (msg->flags & HTTP_MSGF_TE_CHNK) {
@@ -4922,26 +4923,26 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	/* FIXME: below we should remove the content-length header(s) in case of chunked encoding */
 	ctx.idx = 0;
 	while (!(msg->flags & HTTP_MSGF_TE_CHNK) && !use_close_only &&
-	       http_find_header2("Content-Length", 14, rep->buf.p, &txn->hdr_idx, &ctx)) {
+	       http_find_header2("Content-Length", 14, rep->buf->p, &txn->hdr_idx, &ctx)) {
 		signed long long cl;
 
 		if (!ctx.vlen) {
-			msg->err_pos = ctx.line + ctx.val - rep->buf.p;
+			msg->err_pos = ctx.line + ctx.val - rep->buf->p;
 			goto hdr_response_bad;
 		}
 
 		if (strl2llrc(ctx.line + ctx.val, ctx.vlen, &cl)) {
-			msg->err_pos = ctx.line + ctx.val - rep->buf.p;
+			msg->err_pos = ctx.line + ctx.val - rep->buf->p;
 			goto hdr_response_bad; /* parse failure */
 		}
 
 		if (cl < 0) {
-			msg->err_pos = ctx.line + ctx.val - rep->buf.p;
+			msg->err_pos = ctx.line + ctx.val - rep->buf->p;
 			goto hdr_response_bad;
 		}
 
 		if ((msg->flags & HTTP_MSGF_CNT_LEN) && (msg->chunk_len != cl)) {
-			msg->err_pos = ctx.line + ctx.val - rep->buf.p;
+			msg->err_pos = ctx.line + ctx.val - rep->buf->p;
 			goto hdr_response_bad; /* already specified, was different */
 		}
 
@@ -4979,7 +4980,7 @@ int http_process_res_common(struct session *t, struct channel *rep, int an_bit, 
 		rep,
 		rep->rex, rep->wex,
 		rep->flags,
-		rep->buf.i,
+		rep->buf->i,
 		rep->analysers);
 
 	if (unlikely(msg->msg_state < HTTP_MSG_BODY))	/* we need more data */
@@ -5348,7 +5349,7 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 		return 0;
 
 	if ((res->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) ||
-	    ((res->flags & CF_SHUTW) && (res->to_forward || res->buf.o)) ||
+	    ((res->flags & CF_SHUTW) && (res->to_forward || res->buf->o)) ||
 	    !s->req->analysers) {
 		/* Output closed while we were sending data. We must abort and
 		 * wake the other side up.
@@ -5363,7 +5364,7 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 
 	if (msg->msg_state < HTTP_MSG_CHUNK_SIZE) {
 		/* we have msg->sov which points to the first byte of message body.
-		 * rep->buf.p still points to the beginning of the message and msg->sol
+		 * rep->buf->p still points to the beginning of the message and msg->sol
 		 * is still null. We must save the body in msg->next because it
 		 * survives buffer re-alignments.
 		 */
@@ -5578,7 +5579,7 @@ int apply_filter_to_req_headers(struct session *t, struct channel *req, struct h
 
 	last_hdr = 0;
 
-	cur_next = req->buf.p + hdr_idx_first_pos(&txn->hdr_idx);
+	cur_next = req->buf->p + hdr_idx_first_pos(&txn->hdr_idx);
 	old_idx = 0;
 
 	while (!last_hdr) {
@@ -5657,7 +5658,7 @@ int apply_filter_to_req_headers(struct session *t, struct channel *req, struct h
 
 			case ACT_REPLACE:
 				len = exp_replace(trash, cur_ptr, exp->replace, pmatch);
-				delta = buffer_replace2(&req->buf, cur_ptr, cur_end, trash, len);
+				delta = buffer_replace2(req->buf, cur_ptr, cur_end, trash, len);
 				/* FIXME: if the user adds a newline in the replacement, the
 				 * index will not be recalculated for now, and the new line
 				 * will not be counted as a new header.
@@ -5670,7 +5671,7 @@ int apply_filter_to_req_headers(struct session *t, struct channel *req, struct h
 				break;
 
 			case ACT_REMOVE:
-				delta = buffer_replace2(&req->buf, cur_ptr, cur_next, NULL, 0);
+				delta = buffer_replace2(req->buf, cur_ptr, cur_next, NULL, 0);
 				cur_next += delta;
 
 				http_msg_move_end(&txn->req, delta);
@@ -5722,7 +5723,7 @@ int apply_filter_to_req_line(struct session *t, struct channel *req, struct hdr_
 
 	done = 0;
 
-	cur_ptr = req->buf.p;
+	cur_ptr = req->buf->p;
 	cur_end = cur_ptr + txn->req.sl.rq.l;
 
 	/* Now we have the request line between cur_ptr and cur_end */
@@ -5782,7 +5783,7 @@ int apply_filter_to_req_line(struct session *t, struct channel *req, struct hdr_
 		case ACT_REPLACE:
 			*cur_end = term; /* restore the string terminator */
 			len = exp_replace(trash, cur_ptr, exp->replace, pmatch);
-			delta = buffer_replace2(&req->buf, cur_ptr, cur_end, trash, len);
+			delta = buffer_replace2(req->buf, cur_ptr, cur_end, trash, len);
 			/* FIXME: if the user adds a newline in the replacement, the
 			 * index will not be recalculated for now, and the new line
 			 * will not be counted as a new header.
@@ -6035,7 +6036,7 @@ void manage_client_side_cookies(struct session *t, struct channel *req)
 
 	/* Iterate through the headers, we start with the start line. */
 	old_idx = 0;
-	hdr_next = req->buf.p + hdr_idx_first_pos(&txn->hdr_idx);
+	hdr_next = req->buf->p + hdr_idx_first_pos(&txn->hdr_idx);
 
 	while ((cur_idx = txn->hdr_idx.v[old_idx].next)) {
 		struct hdr_idx_elem *cur_hdr;
@@ -6163,7 +6164,7 @@ void manage_client_side_cookies(struct session *t, struct channel *req)
 				 */
 				preserve_hdr = 1;
 				if (del_from != NULL) {
-					int delta = del_hdr_value(&req->buf, &del_from, prev);
+					int delta = del_hdr_value(req->buf, &del_from, prev);
 					val_end  += delta;
 					next     += delta;
 					hdr_end  += delta;
@@ -6186,13 +6187,13 @@ void manage_client_side_cookies(struct session *t, struct channel *req)
 				int stripped_after = 0;
 
 				if (att_end != equal) {
-					stripped_before = buffer_replace2(&req->buf, att_end, equal, NULL, 0);
+					stripped_before = buffer_replace2(req->buf, att_end, equal, NULL, 0);
 					equal   += stripped_before;
 					val_beg += stripped_before;
 				}
 
 				if (val_beg > equal + 1) {
-					stripped_after = buffer_replace2(&req->buf, equal + 1, val_beg, NULL, 0);
+					stripped_after = buffer_replace2(req->buf, equal + 1, val_beg, NULL, 0);
 					val_beg += stripped_after;
 					stripped_before += stripped_after;
 				}
@@ -6373,7 +6374,7 @@ void manage_client_side_cookies(struct session *t, struct channel *req)
 				if ((t->be->ck_opts & PR_CK_PFX) && (delim != val_end)) {
 					int delta; /* negative */
 
-					delta = buffer_replace2(&req->buf, val_beg, delim + 1, NULL, 0);
+					delta = buffer_replace2(req->buf, val_beg, delim + 1, NULL, 0);
 					val_end  += delta;
 					next     += delta;
 					hdr_end  += delta;
@@ -6396,7 +6397,7 @@ void manage_client_side_cookies(struct session *t, struct channel *req)
 				preserve_hdr = 1;
 
 				if (del_from != NULL) {
-					int delta = del_hdr_value(&req->buf, &del_from, prev);
+					int delta = del_hdr_value(req->buf, &del_from, prev);
 					if (att_beg >= del_from)
 						att_beg += delta;
 					if (att_end >= del_from)
@@ -6449,11 +6450,11 @@ void manage_client_side_cookies(struct session *t, struct channel *req)
 		if (del_from) {
 			int delta;
 			if (preserve_hdr) {
-				delta = del_hdr_value(&req->buf, &del_from, hdr_end);
+				delta = del_hdr_value(req->buf, &del_from, hdr_end);
 				hdr_end = del_from;
 				cur_hdr->len += delta;
 			} else {
-				delta = buffer_replace2(&req->buf, hdr_beg, hdr_next, NULL, 0);
+				delta = buffer_replace2(req->buf, hdr_beg, hdr_next, NULL, 0);
 
 				/* FIXME: this should be a separate function */
 				txn->hdr_idx.v[old_idx].next = cur_hdr->next;
@@ -6485,7 +6486,7 @@ int apply_filter_to_resp_headers(struct session *t, struct channel *rtr, struct 
 
 	last_hdr = 0;
 
-	cur_next = rtr->buf.p + hdr_idx_first_pos(&txn->hdr_idx);
+	cur_next = rtr->buf->p + hdr_idx_first_pos(&txn->hdr_idx);
 	old_idx = 0;
 
 	while (!last_hdr) {
@@ -6531,7 +6532,7 @@ int apply_filter_to_resp_headers(struct session *t, struct channel *rtr, struct 
 
 			case ACT_REPLACE:
 				len = exp_replace(trash, cur_ptr, exp->replace, pmatch);
-				delta = buffer_replace2(&rtr->buf, cur_ptr, cur_end, trash, len);
+				delta = buffer_replace2(rtr->buf, cur_ptr, cur_end, trash, len);
 				/* FIXME: if the user adds a newline in the replacement, the
 				 * index will not be recalculated for now, and the new line
 				 * will not be counted as a new header.
@@ -6544,7 +6545,7 @@ int apply_filter_to_resp_headers(struct session *t, struct channel *rtr, struct 
 				break;
 
 			case ACT_REMOVE:
-				delta = buffer_replace2(&rtr->buf, cur_ptr, cur_next, NULL, 0);
+				delta = buffer_replace2(rtr->buf, cur_ptr, cur_next, NULL, 0);
 				cur_next += delta;
 
 				http_msg_move_end(&txn->rsp, delta);
@@ -6593,7 +6594,7 @@ int apply_filter_to_sts_line(struct session *t, struct channel *rtr, struct hdr_
 
 	done = 0;
 
-	cur_ptr = rtr->buf.p;
+	cur_ptr = rtr->buf->p;
 	cur_end = cur_ptr + txn->rsp.sl.st.l;
 
 	/* Now we have the status line between cur_ptr and cur_end */
@@ -6621,7 +6622,7 @@ int apply_filter_to_sts_line(struct session *t, struct channel *rtr, struct hdr_
 		case ACT_REPLACE:
 			*cur_end = term; /* restore the string terminator */
 			len = exp_replace(trash, cur_ptr, exp->replace, pmatch);
-			delta = buffer_replace2(&rtr->buf, cur_ptr, cur_end, trash, len);
+			delta = buffer_replace2(rtr->buf, cur_ptr, cur_end, trash, len);
 			/* FIXME: if the user adds a newline in the replacement, the
 			 * index will not be recalculated for now, and the new line
 			 * will not be counted as a new header.
@@ -6639,7 +6640,7 @@ int apply_filter_to_sts_line(struct session *t, struct channel *rtr, struct hdr_
 			/* we have a full respnse and we know that we have either a CR
 			 * or an LF at <ptr>.
 			 */
-			txn->status = strl2ui(rtr->buf.p + txn->rsp.sl.st.c, txn->rsp.sl.st.c_l);
+			txn->status = strl2ui(rtr->buf->p + txn->rsp.sl.st.c, txn->rsp.sl.st.c_l);
 			hdr_idx_set_start(&txn->hdr_idx, txn->rsp.sl.st.l, *cur_end == '\r');
 			/* there is no point trying this regex on headers */
 			return 1;
@@ -6726,7 +6727,7 @@ void manage_server_side_cookies(struct session *t, struct channel *res)
 	 * we start with the start line.
 	 */
 	old_idx = 0;
-	hdr_next = res->buf.p + hdr_idx_first_pos(&txn->hdr_idx);
+	hdr_next = res->buf->p + hdr_idx_first_pos(&txn->hdr_idx);
 
 	while ((cur_idx = txn->hdr_idx.v[old_idx].next)) {
 		struct hdr_idx_elem *cur_hdr;
@@ -6876,13 +6877,13 @@ void manage_server_side_cookies(struct session *t, struct channel *res)
 				int stripped_after = 0;
 
 				if (att_end != equal) {
-					stripped_before = buffer_replace2(&res->buf, att_end, equal, NULL, 0);
+					stripped_before = buffer_replace2(res->buf, att_end, equal, NULL, 0);
 					equal   += stripped_before;
 					val_beg += stripped_before;
 				}
 
 				if (val_beg > equal + 1) {
-					stripped_after = buffer_replace2(&res->buf, equal + 1, val_beg, NULL, 0);
+					stripped_after = buffer_replace2(res->buf, equal + 1, val_beg, NULL, 0);
 					val_beg += stripped_after;
 					stripped_before += stripped_after;
 				}
@@ -6940,7 +6941,7 @@ void manage_server_side_cookies(struct session *t, struct channel *res)
 					/* this cookie must be deleted */
 					if (*prev == ':' && next == hdr_end) {
 						/* whole header */
-						delta = buffer_replace2(&res->buf, hdr_beg, hdr_next, NULL, 0);
+						delta = buffer_replace2(res->buf, hdr_beg, hdr_next, NULL, 0);
 						txn->hdr_idx.v[old_idx].next = cur_hdr->next;
 						txn->hdr_idx.used--;
 						cur_hdr->len = 0;
@@ -6952,7 +6953,7 @@ void manage_server_side_cookies(struct session *t, struct channel *res)
 						 */
 					} else {
 						/* just remove the value */
-						int delta = del_hdr_value(&res->buf, &prev, next);
+						int delta = del_hdr_value(res->buf, &prev, next);
 						next      = prev;
 						hdr_end  += delta;
 						hdr_next += delta;
@@ -6967,7 +6968,7 @@ void manage_server_side_cookies(struct session *t, struct channel *res)
 					/* replace bytes val_beg->val_end with the cookie name associated
 					 * with this server since we know it.
 					 */
-					delta = buffer_replace2(&res->buf, val_beg, val_end, srv->cookie, srv->cklen);
+					delta = buffer_replace2(res->buf, val_beg, val_end, srv->cookie, srv->cklen);
 					next     += delta;
 					hdr_end  += delta;
 					hdr_next += delta;
@@ -6981,7 +6982,7 @@ void manage_server_side_cookies(struct session *t, struct channel *res)
 					/* insert the cookie name associated with this server
 					 * before existing cookie, and insert a delimiter between them..
 					 */
-					delta = buffer_replace2(&res->buf, val_beg, val_beg, srv->cookie, srv->cklen + 1);
+					delta = buffer_replace2(res->buf, val_beg, val_beg, srv->cookie, srv->cklen + 1);
 					next     += delta;
 					hdr_end  += delta;
 					hdr_next += delta;
@@ -7091,7 +7092,7 @@ void check_response_for_cacheability(struct session *t, struct channel *rtr)
 	 * we start with the start line.
 	 */
 	cur_idx = 0;
-	cur_next = rtr->buf.p + hdr_idx_first_pos(&txn->hdr_idx);
+	cur_next = rtr->buf->p + hdr_idx_first_pos(&txn->hdr_idx);
 
 	while ((cur_idx = txn->hdr_idx.v[cur_idx].next)) {
 		struct hdr_idx_elem *cur_hdr;
@@ -7245,7 +7246,7 @@ int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct pr
 {
 	struct uri_auth *uri_auth = backend->uri_auth;
 	struct http_msg *msg = &txn->req;
-	const char *uri = msg->buf->buf.p+ msg->sl.rq.u;
+	const char *uri = msg->chn->buf->p+ msg->sl.rq.u;
 	const char *h;
 
 	if (!uri_auth)
@@ -7321,23 +7322,23 @@ int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct pr
  * By default it tries to report the error position as msg->err_pos. However if
  * this one is not set, it will then report msg->next, which is the last known
  * parsing point. The function is able to deal with wrapping buffers. It always
- * displays buffers as a contiguous area starting at buf->buf.p.
+ * displays buffers as a contiguous area starting at buf->p.
  */
 void http_capture_bad_message(struct error_snapshot *es, struct session *s,
                               struct http_msg *msg,
 			      int state, struct proxy *other_end)
 {
-	struct channel *buf = msg->buf;
+	struct channel *chn = msg->chn;
 	int len1, len2;
 
-	es->len = MIN(buf->buf.i, sizeof(es->buf));
-	len1 = buf->buf.data + buf->buf.size - buf->buf.p;
+	es->len = MIN(chn->buf->i, sizeof(es->buf));
+	len1 = chn->buf->data + chn->buf->size - chn->buf->p;
 	len1 = MIN(len1, es->len);
 	len2 = es->len - len1; /* remaining data if buffer wraps */
 
-	memcpy(es->buf, buf->buf.p, len1);
+	memcpy(es->buf, chn->buf->p, len1);
 	if (len2)
-		memcpy(es->buf + len1, buf->buf.data, len2);
+		memcpy(es->buf + len1, chn->buf->data, len2);
 
 	if (msg->err_pos >= 0)
 		es->pos = msg->err_pos;
@@ -7351,13 +7352,13 @@ void http_capture_bad_message(struct error_snapshot *es, struct session *s,
 	es->src  = s->req->prod->conn.addr.from;
 	es->state = state;
 	es->ev_id = error_snapshot_id++;
-	es->b_flags = buf->flags;
+	es->b_flags = chn->flags;
 	es->s_flags = s->flags;
 	es->t_flags = s->txn.flags;
 	es->m_flags = msg->flags;
-	es->b_out = buf->buf.o;
-	es->b_wrap = buf->buf.data + buf->buf.size - buf->buf.p;
-	es->b_tot = buf->total;
+	es->b_out = chn->buf->o;
+	es->b_wrap = chn->buf->data + chn->buf->size - chn->buf->p;
+	es->b_tot = chn->total;
 	es->m_clen = msg->chunk_len;
 	es->m_blen = msg->body_len;
 }
@@ -7389,7 +7390,7 @@ unsigned int http_get_hdr(const struct http_msg *msg, const char *hname, int hle
 
 	if (occ >= 0) {
 		/* search from the beginning */
-		while (http_find_header2(hname, hlen, msg->buf->buf.p, idx, ctx)) {
+		while (http_find_header2(hname, hlen, msg->chn->buf->p, idx, ctx)) {
 			occ--;
 			if (occ <= 0) {
 				*vptr = ctx->line + ctx->val;
@@ -7405,7 +7406,7 @@ unsigned int http_get_hdr(const struct http_msg *msg, const char *hname, int hle
 		return 0;
 
 	found = hist_ptr = 0;
-	while (http_find_header2(hname, hlen, msg->buf->buf.p, idx, ctx)) {
+	while (http_find_header2(hname, hlen, msg->chn->buf->p, idx, ctx)) {
 		ptr_hist[hist_ptr] = ctx->line + ctx->val;
 		len_hist[hist_ptr] = ctx->vlen;
 		if (++hist_ptr >= MAX_HDR_HISTORY)
@@ -7476,8 +7477,8 @@ void http_init_txn(struct session *s)
 	txn->rsp.body_len = 0LL;
 	txn->req.msg_state = HTTP_MSG_RQBEFORE; /* at the very beginning of the request */
 	txn->rsp.msg_state = HTTP_MSG_RPBEFORE; /* at the very beginning of the response */
-	txn->req.buf = s->req;
-	txn->rsp.buf = s->rep;
+	txn->req.chn = s->req;
+	txn->rsp.chn = s->rep;
 
 	txn->auth.method = HTTP_AUTH_UNKNOWN;
 
@@ -7554,8 +7555,8 @@ void http_reset_txn(struct session *s)
 	 * a HEAD with some data, or sending more than the advertised
 	 * content-length.
 	 */
-	if (unlikely(s->rep->buf.i))
-		s->rep->buf.i = 0;
+	if (unlikely(s->rep->buf->i))
+		s->rep->buf->i = 0;
 
 	s->req->rto = s->fe->timeout.client;
 	s->req->wto = TICK_ETERNITY;
@@ -7682,19 +7683,19 @@ acl_prefetch_http(struct proxy *px, struct session *s, void *l7, unsigned int op
 
 		if (unlikely(txn->req.msg_state < HTTP_MSG_BODY)) {
 			if ((msg->msg_state == HTTP_MSG_ERROR) ||
-			    buffer_full(&s->req->buf, global.tune.maxrewrite)) {
+			    buffer_full(s->req->buf, global.tune.maxrewrite)) {
 				smp->data.uint = 0;
 				return -1;
 			}
 
 			/* Try to decode HTTP request */
-			if (likely(msg->next < s->req->buf.i))
+			if (likely(msg->next < s->req->buf->i))
 				http_msg_analyzer(msg, &txn->hdr_idx);
 
 			/* Still no valid request ? */
 			if (unlikely(msg->msg_state < HTTP_MSG_BODY)) {
 				if ((msg->msg_state == HTTP_MSG_ERROR) ||
-				    buffer_full(&s->req->buf, global.tune.maxrewrite)) {
+				    buffer_full(s->req->buf, global.tune.maxrewrite)) {
 					smp->data.uint = 0;
 					return -1;
 				}
@@ -7707,7 +7708,7 @@ acl_prefetch_http(struct proxy *px, struct session *s, void *l7, unsigned int op
 			 * preparation to perform so that further checks can rely
 			 * on HTTP tests.
 			 */
-			txn->meth = find_http_meth(msg->buf->buf.p, msg->sl.rq.m_l);
+			txn->meth = find_http_meth(msg->chn->buf->p, msg->sl.rq.m_l);
 			if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 				s->flags |= SN_REDIRECTABLE;
 
@@ -7788,7 +7789,7 @@ acl_fetch_meth(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 			return 0;
 		smp->type = SMP_T_CSTR;
 		smp->data.str.len = txn->req.sl.rq.m_l;
-		smp->data.str.str = txn->req.buf->buf.p;
+		smp->data.str.str = txn->req.chn->buf->p;
 	}
 	smp->flags = SMP_F_VOL_1ST;
 	return 1;
@@ -7847,7 +7848,7 @@ acl_fetch_rqver(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	len = txn->req.sl.rq.v_l;
-	ptr = txn->req.buf->buf.p + txn->req.sl.rq.v;
+	ptr = txn->req.chn->buf->p + txn->req.sl.rq.v;
 
 	while ((len-- > 0) && (*ptr++ != '/'));
 	if (len <= 0)
@@ -7872,7 +7873,7 @@ acl_fetch_stver(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	len = txn->rsp.sl.st.v_l;
-	ptr = txn->rsp.buf->buf.p;
+	ptr = txn->rsp.chn->buf->p;
 
 	while ((len-- > 0) && (*ptr++ != '/'));
 	if (len <= 0)
@@ -7898,7 +7899,7 @@ acl_fetch_stcode(struct proxy *px, struct session *l4, void *l7, unsigned int op
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	len = txn->rsp.sl.st.c_l;
-	ptr = txn->rsp.buf->buf.p + txn->rsp.sl.st.c;
+	ptr = txn->rsp.chn->buf->p + txn->rsp.sl.st.c;
 
 	smp->type = SMP_T_UINT;
 	smp->data.uint = __strl2ui(ptr, len);
@@ -7917,7 +7918,7 @@ smp_fetch_url(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 
 	smp->type = SMP_T_CSTR;
 	smp->data.str.len = txn->req.sl.rq.u_l;
-	smp->data.str.str = txn->req.buf->buf.p + txn->req.sl.rq.u;
+	smp->data.str.str = txn->req.chn->buf->p + txn->req.sl.rq.u;
 	smp->flags = SMP_F_VOL_1ST;
 	return 1;
 }
@@ -7931,7 +7932,7 @@ smp_fetch_url_ip(struct proxy *px, struct session *l4, void *l7, unsigned int op
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	/* Parse HTTP request */
-	url2sa(txn->req.buf->buf.p + txn->req.sl.rq.u, txn->req.sl.rq.u_l, &l4->req->cons->conn.addr.to);
+	url2sa(txn->req.chn->buf->p + txn->req.sl.rq.u, txn->req.sl.rq.u_l, &l4->req->cons->conn.addr.to);
 	if (((struct sockaddr_in *)&l4->req->cons->conn.addr.to)->sin_family != AF_INET)
 		return 0;
 	smp->type = SMP_T_IPV4;
@@ -7957,7 +7958,7 @@ smp_fetch_url_port(struct proxy *px, struct session *l4, void *l7, unsigned int 
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	/* Same optimization as url_ip */
-	url2sa(txn->req.buf->buf.p + txn->req.sl.rq.u, txn->req.sl.rq.u_l, &l4->req->cons->conn.addr.to);
+	url2sa(txn->req.chn->buf->p + txn->req.sl.rq.u, txn->req.sl.rq.u_l, &l4->req->cons->conn.addr.to);
 	smp->type = SMP_T_UINT;
 	smp->data.uint = ntohs(((struct sockaddr_in *)&l4->req->cons->conn.addr.to)->sin_port);
 
@@ -8039,7 +8040,7 @@ smp_fetch_hdr_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int o
 
 	ctx.idx = 0;
 	cnt = 0;
-	while (http_find_header2(args->data.str.str, args->data.str.len, msg->buf->buf.p, idx, &ctx))
+	while (http_find_header2(args->data.str.str, args->data.str.len, msg->chn->buf->p, idx, &ctx))
 		cnt++;
 
 	smp->type = SMP_T_UINT;
@@ -8100,7 +8101,7 @@ smp_fetch_path(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 
 	CHECK_HTTP_MESSAGE_FIRST();
 
-	end = txn->req.buf->buf.p + txn->req.sl.rq.u + txn->req.sl.rq.u_l;
+	end = txn->req.chn->buf->p + txn->req.sl.rq.u + txn->req.sl.rq.u_l;
 	ptr = http_get_path(txn);
 	if (!ptr)
 		return 0;
@@ -8134,7 +8135,7 @@ smp_fetch_base(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	ctx.idx = 0;
-	if (!http_find_header2("Host", 4, txn->req.buf->buf.p + txn->req.sol, &txn->hdr_idx, &ctx) ||
+	if (!http_find_header2("Host", 4, txn->req.chn->buf->p + txn->req.sol, &txn->hdr_idx, &ctx) ||
 	    !ctx.vlen)
 		return smp_fetch_path(px, l4, l7, opt, args, smp);
 
@@ -8145,7 +8146,7 @@ smp_fetch_base(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 	smp->data.str.len = ctx.vlen;
 
 	/* now retrieve the path */
-	end = txn->req.buf->buf.p + txn->req.sol + txn->req.sl.rq.u + txn->req.sl.rq.u_l;
+	end = txn->req.chn->buf->p + txn->req.sol + txn->req.sl.rq.u + txn->req.sl.rq.u_l;
 	beg = http_get_path(txn);
 	if (!beg)
 		beg = end;
@@ -8381,7 +8382,7 @@ smp_fetch_cookie(struct proxy *px, struct session *l4, void *l7, unsigned int op
 	 * next one.
 	 */
 
-	sol = msg->buf->buf.p;
+	sol = msg->chn->buf->p;
 	if (!(smp->flags & SMP_F_NOT_LAST)) {
 		/* search for the header from the beginning, we must first initialize
 		 * the search parameters.
@@ -8463,7 +8464,7 @@ acl_fetch_cookie_cnt(struct proxy *px, struct session *l4, void *l7, unsigned in
 		hdr_name_len = 10;
 	}
 
-	sol = msg->buf->buf.p;
+	sol = msg->chn->buf->p;
 	val_end = val_beg = NULL;
 	ctx.idx = 0;
 	cnt = 0;
@@ -8621,7 +8622,7 @@ smp_fetch_url_param(struct proxy *px, struct session *l4, void *l7, unsigned int
 	if (args[1].type)
 		delim = *args[1].data.str.str;
 
-	if (!find_url_param_value(msg->buf->buf.p + msg->sl.rq.u, msg->sl.rq.u_l,
+	if (!find_url_param_value(msg->chn->buf->p + msg->sl.rq.u, msg->sl.rq.u_l,
                                  args->data.str.str, args->data.str.len,
                                  &smp->data.str.str, &smp->data.str.len,
                                  delim))
