@@ -107,7 +107,7 @@ struct sample_conv *find_sample_conv(const char *kw, int len)
 * Returns a static trash struct chunk to use in sample casts or format conversions
 * Swiths the 2 available trash buffers to protect data during convert
 */
-static struct chunk *get_trash_chunk(void)
+struct chunk *sample_get_trash_chunk(void)
 {
 	if (sample_trash_buf == sample_trash_buf1)
 		sample_trash_buf = sample_trash_buf2;
@@ -133,7 +133,7 @@ static int c_ip2int(struct sample *smp)
 
 static int c_ip2str(struct sample *smp)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct chunk *trash = sample_get_trash_chunk();
 
 	if (!inet_ntop(AF_INET, (void *)&smp->data.ipv4, trash->str, trash->size))
 		return 0;
@@ -152,7 +152,7 @@ static int c_ip2ipv6(struct sample *smp)
 
 static int c_ipv62str(struct sample *smp)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct chunk *trash = sample_get_trash_chunk();
 
 	if (!inet_ntop(AF_INET6, (void *)&smp->data.ipv6, trash->str, trash->size))
 		return 0;
@@ -187,9 +187,25 @@ static int c_str2ipv6(struct sample *smp)
 	return inet_pton(AF_INET6, smp->data.str.str, &smp->data.ipv6);
 }
 
+static int c_bin2str(struct sample *smp)
+{
+	struct chunk *trash = sample_get_trash_chunk();
+	unsigned char c;
+	int ptr = 0;
+
+	trash->len = 0;
+	while (ptr < smp->data.str.len && trash->len <= trash->size - 2) {
+		c = smp->data.str.str[ptr++];
+		trash->str[trash->len++] = hextab[(c >> 4) & 0xF];
+		trash->str[trash->len++] = hextab[c & 0xF];
+	}
+	smp->data.str = *trash;
+	return 1;
+}
+
 static int c_int2str(struct sample *smp)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct chunk *trash = sample_get_trash_chunk();
 	char *pos;
 
 	pos = ultoa_r(smp->data.uint, trash->str, trash->size);
@@ -206,7 +222,7 @@ static int c_int2str(struct sample *smp)
 
 static int c_datadup(struct sample *smp)
 {
-	struct chunk *trash = get_trash_chunk();
+	struct chunk *trash = sample_get_trash_chunk();
 
 	trash->len = smp->data.str.len < trash->size ? smp->data.str.len : trash->size;
 	memcpy(trash->str, smp->data.str.str, trash->len);
@@ -253,9 +269,9 @@ static sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
 /*       IPV4 */ { NULL,      c_ip2int,  c_ip2int,  c_none,   c_ip2ipv6,  c_ip2str,   NULL,      c_ip2str,   NULL   },
 /*       IPV6 */ { NULL,      NULL,      NULL,      NULL,     c_none,     c_ipv62str, NULL,      c_ipv62str, NULL   },
 /*        STR */ { c_str2int, c_str2int, c_str2int, c_str2ip, c_str2ipv6, c_none,     c_none,    c_none,     c_none },
-/*        BIN */ { NULL,      NULL,      NULL,      NULL,     NULL,       NULL,       c_none,    NULL,       c_none },
+/*        BIN */ { NULL,      NULL,      NULL,      NULL,     NULL,       c_bin2str,  c_none,    c_bin2str,  c_none },
 /*       CSTR */ { c_str2int, c_str2int, c_str2int, c_str2ip, c_str2ipv6, c_datadup,  c_datadup, c_none,     c_none },
-/*       CBIN */ { NULL,      NULL,      NULL,      NULL,     NULL,       NULL,       c_datadup, NULL,       c_none },
+/*       CBIN */ { NULL,      NULL,      NULL,      NULL,     NULL,       c_bin2str,  c_datadup, c_bin2str,  c_none },
 };
 
 /*
@@ -320,6 +336,7 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_s
 
 	LIST_INIT(&(expr->conv_exprs));
 	expr->fetch = fetch;
+	expr->arg_p = empty_arg_list;
 
 	if (end != endw) {
 		char *err_msg = NULL;
@@ -344,6 +361,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_s
 			goto out_error;
 		}
 
+		if (!expr->arg_p)
+			expr->arg_p = empty_arg_list;
+
 		if (fetch->val_args && !fetch->val_args(expr->arg_p, &err_msg)) {
 			p = my_strndup(str[*idx], endw - str[*idx]);
 			if (p) {
@@ -354,7 +374,7 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_s
 			goto out_error;
 		}
 	}
-	else if (fetch->arg_mask) {
+	else if (ARGM(fetch->arg_mask)) {
 		p = my_strndup(str[*idx], endw - str[*idx]);
 		if (p) {
 			snprintf(err, err_size, "missing args for fetch method '%s'.", p);
@@ -435,6 +455,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_s
 				free(err_msg);
 				goto out_error;
 			}
+
+			if (!conv_expr->arg_p)
+				conv_expr->arg_p = empty_arg_list;
 
 			if (conv->val_args && !conv->val_args(conv_expr->arg_p, &err_msg)) {
 				p = my_strndup(str[*idx], endw - str[*idx]);

@@ -141,6 +141,21 @@ int ssl_sock_verifycbk(int ok, X509_STORE_CTX *x_store)
 	return 0;
 }
 
+#ifdef OPENSSL_NPN_NEGOTIATED
+/* This callback is used so that the server advertises the list of
+ * negociable protocols for NPN.
+ */
+static int ssl_sock_advertise_npn_protos(SSL *s, const unsigned char **data,
+                                         unsigned int *len, void *arg)
+{
+	struct bind_conf *conf = arg;
+
+	*data = (const unsigned char *)conf->npn_str;
+	*len = conf->npn_len;
+	return SSL_TLSEXT_ERR_OK;
+}
+#endif
+
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 /* Sets the SSL ctx of <ssl> to match the advertised server name. Returns a
  * warning when no match is found, which implies the default (first) cert
@@ -548,6 +563,11 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 	}
 
 	SSL_CTX_set_info_callback(ctx, ssl_sock_infocbk);
+#ifdef OPENSSL_NPN_NEGOTIATED
+	if (bind_conf->npn_str)
+		SSL_CTX_set_next_protos_advertised_cb(ctx, ssl_sock_advertise_npn_protos, bind_conf);
+#endif
+
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_cbk);
 	SSL_CTX_set_tlsext_servername_arg(ctx, bind_conf);
@@ -836,6 +856,12 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 		}
 		else {
 			/* Fail on all other handshake errors */
+			/* Note: OpenSSL may leave unread bytes in the socket's
+			 * buffer, causing an RST to be emitted upon close() on
+			 * TCP sockets. We first try to drain possibly pending
+			 * data to avoid this as much as possible.
+			 */
+			ret = recv(conn->t.sock.fd, trash, trashlen, MSG_NOSIGNAL|MSG_DONTWAIT);
 			goto out_error;
 		}
 	}
@@ -1118,11 +1144,11 @@ smp_fetch_has_sni(struct proxy *px, struct session *l4, void *l7, unsigned int o
 #endif
 }
 
+#ifdef OPENSSL_NPN_NEGOTIATED
 static int
 smp_fetch_ssl_npn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                   const struct arg *args, struct sample *smp)
 {
-#ifdef OPENSSL_NPN_NEGOTIATED
 	smp->flags = 0;
 	smp->type = SMP_T_CSTR;
 
@@ -1137,10 +1163,8 @@ smp_fetch_ssl_npn(struct proxy *px, struct session *l4, void *l7, unsigned int o
 		return 0;
 
 	return 1;
-#else
-	return 0;
-#endif
 }
+#endif
 
 static int
 smp_fetch_ssl_sni(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
@@ -1466,6 +1490,54 @@ static int bind_parse_no_tlsv12(char **args, int cur_arg, struct proxy *px, stru
 	return 0;
 }
 
+/* parse the "npn" bind keyword */
+static int bind_parse_npn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+#ifdef OPENSSL_NPN_NEGOTIATED
+	char *p1, *p2;
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing the comma-delimited NPN protocol suite", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	free(conf->npn_str);
+
+	/* the NPN string is built as a suite of (<len> <name>)* */
+	conf->npn_len = strlen(args[cur_arg + 1]) + 1;
+	conf->npn_str = calloc(1, conf->npn_len);
+	memcpy(conf->npn_str + 1, args[cur_arg + 1], conf->npn_len);
+
+	/* replace commas with the name length */
+	p1 = conf->npn_str;
+	p2 = p1 + 1;
+	while (1) {
+		p2 = memchr(p1 + 1, ',', conf->npn_str + conf->npn_len - (p1 + 1));
+		if (!p2)
+			p2 = p1 + 1 + strlen(p1 + 1);
+
+		if (p2 - (p1 + 1) > 255) {
+			*p2 = '\0';
+			memprintf(err, "'%s' : NPN protocol name too long : '%s'", args[cur_arg], p1 + 1);
+			return ERR_ALERT | ERR_FATAL;
+		}
+
+		*p1 = p2 - (p1 + 1);
+		p1 = p2;
+
+		if (!*p2)
+			break;
+
+		*(p2++) = '\0';
+	}
+	return 0;
+#else
+	if (err)
+		memprintf(err, "'%s' : library does not support TLS NPN extension", args[cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+
 /* parse the "ssl" bind keyword */
 static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
@@ -1708,8 +1780,8 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "ssl_npn",                acl_parse_str, smp_fetch_ssl_npn,            acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 #endif
 	{ "ssl_sni",                acl_parse_str, smp_fetch_ssl_sni,            acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_sni_end",            acl_parse_str, smp_fetch_ssl_sni,            acl_match_end,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_sni_reg",            acl_parse_str, smp_fetch_ssl_sni,            acl_match_reg,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_sni_end",            acl_parse_str, smp_fetch_ssl_sni,            acl_match_end,     ACL_USE_L6REQ_PERMANENT, 0 },
+	{ "ssl_sni_reg",            acl_parse_reg, smp_fetch_ssl_sni,            acl_match_reg,     ACL_USE_L6REQ_PERMANENT, 0 },
 	{ "ssl_verify_caerr",       acl_parse_int, smp_fetch_verify_caerr,       acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 	{ "ssl_verify_caerr_depth", acl_parse_int, smp_fetch_verify_caerr_depth, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 	{ "ssl_verify_crterr",      acl_parse_int, smp_fetch_verify_crterr,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
@@ -1743,6 +1815,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "no-tls-tickets",        bind_parse_no_tls_tickets, 0 }, /* disable session resumption tickets */
 	{ "ssl",                   bind_parse_ssl,            0 }, /* enable SSL processing */
 	{ "verify",                bind_parse_verify,         1 }, /* set SSL verify method */
+	{ "npn",                   bind_parse_npn,            1 }, /* set NPN supported protocols */
 	{ NULL, NULL, 0 },
 }};
 
