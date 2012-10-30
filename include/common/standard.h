@@ -180,9 +180,19 @@ extern int ishex(char s);
 
 /*
  * Return integer equivalent of character <c> for a hex digit (0-9, a-f, A-F),
- * otherwise -1.
+ * otherwise -1. This compact form helps gcc produce efficient code.
  */
-extern int hex2i(int c);
+static inline int hex2i(int c)
+{
+	if ((unsigned char)(c -= '0') > 9) {
+		if ((unsigned char)(c -= 'A' - '0') > 5 &&
+		    (unsigned char)(c -= 'a' - 'A') > 5)
+			c = -11;
+		c += 10;
+	}
+	return c;
+}
+
 
 /*
  * Checks <name> for invalid characters. Valid chars are [A-Za-z0-9_:.-]. If an
@@ -562,6 +572,12 @@ static inline unsigned int __full_hash(unsigned int a)
 	return a * 3221225473U;
 }
 
+/* sets the address family to AF_UNSPEC so that is_addr() does not match */
+static inline void clear_addr(struct sockaddr_storage *addr)
+{
+	addr->ss_family = AF_UNSPEC;
+}
+
 /* returns non-zero if addr has a valid and non-null IPv4 or IPv6 address,
  * otherwise zero.
  */
@@ -660,6 +676,9 @@ char *human_time(int t, short hz_div);
 
 extern const char *monthname[];
 
+/* numeric timezone (that is, the hour and minute offset from UTC) */
+char localtimezone[6];
+
 /* date2str_log: write a date in the format :
  * 	sprintf(str, "%02d/%s/%04d:%02d:%02d:%02d.%03d",
  *		tm.tm_mday, monthname[tm.tm_mon], tm.tm_year+1900,
@@ -676,6 +695,13 @@ char *date2str_log(char *dest, struct tm *tm, struct timeval *date, size_t size)
  * NULL if there isn't enough space.
  */
 char *gmt2str_log(char *dst, struct tm *tm, size_t size);
+
+/* localdate2str_log: write a date in the format :
+ * "%02d/%s/%04d:%02d:%02d:%02d +0000(local timezone)" without using snprintf
+ * return a pointer to the last char written (\0) or
+ * NULL if there isn't enough space.
+ */
+char *localdate2str_log(char *dst, struct tm *tm, size_t size);
 
 /* Dynamically allocates a string of the proper length to hold the formatted
  * output. NULL is returned on error. The caller is responsible for freeing the

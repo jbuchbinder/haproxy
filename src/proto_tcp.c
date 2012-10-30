@@ -170,14 +170,18 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
 
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 	if (foreign_ok) {
-		ret = bind(fd, (struct sockaddr *)&bind_addr, get_addr_len(&bind_addr));
-		if (ret < 0)
-			return 2;
+		if (is_addr(&bind_addr)) {
+			ret = bind(fd, (struct sockaddr *)&bind_addr, get_addr_len(&bind_addr));
+			if (ret < 0)
+				return 2;
+		}
 	}
 	else {
-		ret = bind(fd, (struct sockaddr *)local, get_addr_len(local));
-		if (ret < 0)
-			return 1;
+		if (is_addr(local)) {
+			ret = bind(fd, (struct sockaddr *)local, get_addr_len(local));
+			if (ret < 0)
+				return 1;
+		}
 	}
 
 	if (!flags)
@@ -295,15 +299,17 @@ int tcp_connect_server(struct connection *conn, int data)
 	if (srv != NULL && srv->state & SRV_BIND_SRC) {
 		int ret, flags = 0;
 
-		switch (srv->state & SRV_TPROXY_MASK) {
-		case SRV_TPROXY_ADDR:
-		case SRV_TPROXY_CLI:
-			flags = 3;
-			break;
-		case SRV_TPROXY_CIP:
-		case SRV_TPROXY_DYN:
-			flags = 1;
-			break;
+		if (is_addr(&conn->addr.from)) {
+			switch (srv->state & SRV_TPROXY_MASK) {
+			case SRV_TPROXY_ADDR:
+			case SRV_TPROXY_CLI:
+				flags = 3;
+				break;
+			case SRV_TPROXY_CIP:
+			case SRV_TPROXY_DYN:
+				flags = 1;
+				break;
+			}
 		}
 
 #ifdef SO_BINDTODEVICE
@@ -368,15 +374,17 @@ int tcp_connect_server(struct connection *conn, int data)
 	else if (be->options & PR_O_BIND_SRC) {
 		int ret, flags = 0;
 
-		switch (be->options & PR_O_TPXY_MASK) {
-		case PR_O_TPXY_ADDR:
-		case PR_O_TPXY_CLI:
-			flags = 3;
-			break;
-		case PR_O_TPXY_CIP:
-		case PR_O_TPXY_DYN:
-			flags = 1;
-			break;
+		if (is_addr(&conn->addr.from)) {
+			switch (be->options & PR_O_TPXY_MASK) {
+			case PR_O_TPXY_ADDR:
+			case PR_O_TPXY_CLI:
+				flags = 3;
+				break;
+			case PR_O_TPXY_CIP:
+			case PR_O_TPXY_DYN:
+				flags = 1;
+				break;
+			}
 		}
 
 #ifdef SO_BINDTODEVICE
@@ -855,7 +863,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts) {
 						session_track_stkctr1(s, t, ts);
 						if (s->fe != s->be)
@@ -871,7 +879,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts) {
 						session_track_stkctr2(s, t, ts);
 						if (s->fe != s->be)
@@ -1025,7 +1033,7 @@ int tcp_exec_req_rules(struct session *s)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts)
 						session_track_stkctr1(s, t, ts);
 				}
@@ -1038,7 +1046,7 @@ int tcp_exec_req_rules(struct session *s)
 					 * to consider rule->act_prm->trk_ctr.type.
 					 */
 					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn.addr.from));
+					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
 					if (ts)
 						session_track_stkctr2(s, t, ts);
 				}
@@ -1503,13 +1511,13 @@ static int
 smp_fetch_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
               const struct arg *args, struct sample *smp)
 {
-	switch (l4->si[0].conn.addr.from.ss_family) {
+	switch (l4->si[0].conn->addr.from.ss_family) {
 	case AF_INET:
-		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn.addr.from)->sin_addr;
+		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn->addr.from)->sin_addr;
 		smp->type = SMP_T_IPV4;
 		break;
 	case AF_INET6:
-		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn.addr.from))->sin6_addr;
+		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn->addr.from))->sin6_addr;
 		smp->type = SMP_T_IPV6;
 		break;
 	default:
@@ -1526,7 +1534,7 @@ smp_fetch_sport(struct proxy *px, struct session *l4, void *l7, unsigned int opt
                 const struct arg *args, struct sample *smp)
 {
 	smp->type = SMP_T_UINT;
-	if (!(smp->data.uint = get_host_port(&l4->si[0].conn.addr.from)))
+	if (!(smp->data.uint = get_host_port(&l4->si[0].conn->addr.from)))
 		return 0;
 
 	smp->flags = 0;
@@ -1538,15 +1546,15 @@ static int
 smp_fetch_dst(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
               const struct arg *args, struct sample *smp)
 {
-	conn_get_to_addr(&l4->si[0].conn);
+	conn_get_to_addr(l4->si[0].conn);
 
-	switch (l4->si[0].conn.addr.to.ss_family) {
+	switch (l4->si[0].conn->addr.to.ss_family) {
 	case AF_INET:
-		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn.addr.to)->sin_addr;
+		smp->data.ipv4 = ((struct sockaddr_in *)&l4->si[0].conn->addr.to)->sin_addr;
 		smp->type = SMP_T_IPV4;
 		break;
 	case AF_INET6:
-		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn.addr.to))->sin6_addr;
+		smp->data.ipv6 = ((struct sockaddr_in6 *)(&l4->si[0].conn->addr.to))->sin6_addr;
 		smp->type = SMP_T_IPV6;
 		break;
 	default:
@@ -1562,10 +1570,10 @@ static int
 smp_fetch_dport(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                 const struct arg *args, struct sample *smp)
 {
-	conn_get_to_addr(&l4->si[0].conn);
+	conn_get_to_addr(l4->si[0].conn);
 
 	smp->type = SMP_T_UINT;
-	if (!(smp->data.uint = get_host_port(&l4->si[0].conn.addr.to)))
+	if (!(smp->data.uint = get_host_port(&l4->si[0].conn->addr.to)))
 		return 0;
 
 	smp->flags = 0;

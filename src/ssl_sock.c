@@ -173,17 +173,17 @@ static int ssl_sock_switchctx_cbk(SSL *ssl, int *al, struct bind_conf *s)
 	if (!servername)
 		return SSL_TLSEXT_ERR_NOACK;
 
-	for (i = 0; i < trashlen; i++) {
+	for (i = 0; i < trash.size; i++) {
 		if (!servername[i])
 			break;
-		trash[i] = tolower(servername[i]);
-		if (!wildp && (trash[i] == '.'))
-			wildp = &trash[i];
+		trash.str[i] = tolower(servername[i]);
+		if (!wildp && (trash.str[i] == '.'))
+			wildp = &trash.str[i];
 	}
-	trash[i] = 0;
+	trash.str[i] = 0;
 
 	/* lookup in full qualified names */
-	node = ebst_lookup(&s->sni_ctx, trash);
+	node = ebst_lookup(&s->sni_ctx, trash.str);
 	if (!node) {
 		if (!wildp)
 			return SSL_TLSEXT_ERR_ALERT_WARNING;
@@ -391,6 +391,13 @@ static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf
 			SSL_CTX_free(ctx);
 		return 1;
 	}
+
+	if (SSL_CTX_check_private_key(ctx) <= 0) {
+		memprintf(err, "%sinconsistencies between private key and certificate loaded from PEM file '%s'.\n",
+		          err && *err ? *err : "", path);
+		return 1;
+	}
+
 	/* we must not free the SSL_CTX anymore below, since it's already in
 	 * the tree, so it will be discovered and cleaned in time.
 	 */
@@ -621,7 +628,26 @@ int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 		cfgerr++;
 		return cfgerr;
 	}
-
+	if (srv->ssl_ctx.client_crt) {
+		if (SSL_CTX_use_PrivateKey_file(srv->ssl_ctx.ctx, srv->ssl_ctx.client_crt, SSL_FILETYPE_PEM) <= 0) {
+			Alert("config : %s '%s', server '%s': unable to load SSL private key from PEM file '%s'.\n",
+			      proxy_type_str(curproxy), curproxy->id,
+			      srv->id, srv->ssl_ctx.client_crt);
+			cfgerr++;
+		}
+		else if (SSL_CTX_use_certificate_chain_file(srv->ssl_ctx.ctx, srv->ssl_ctx.client_crt) <= 0) {
+			Alert("config : %s '%s', server '%s': unable to load ssl certificate from PEM file '%s'.\n",
+			      proxy_type_str(curproxy), curproxy->id,
+			      srv->id, srv->ssl_ctx.client_crt);
+			cfgerr++;
+		}
+		else if (SSL_CTX_check_private_key(srv->ssl_ctx.ctx) <= 0) {
+			Alert("config : %s '%s', server '%s': inconsistencies between private key and certificate loaded from PEM file '%s'.\n",
+			      proxy_type_str(curproxy), curproxy->id,
+			      srv->id, srv->ssl_ctx.client_crt);
+			cfgerr++;
+		}
+	}
 
 	if (srv->ssl_ctx.options & SRV_SSL_O_NO_SSLV3)
 		options |= SSL_OP_NO_SSLv3;
@@ -861,7 +887,7 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			 * TCP sockets. We first try to drain possibly pending
 			 * data to avoid this as much as possible.
 			 */
-			ret = recv(conn->t.sock.fd, trash, trashlen, MSG_NOSIGNAL|MSG_DONTWAIT);
+			ret = recv(conn->t.sock.fd, trash.str, trash.size, MSG_NOSIGNAL|MSG_DONTWAIT);
 			goto out_error;
 		}
 	}
@@ -1095,68 +1121,856 @@ const char *ssl_sock_get_proto_version(struct connection *conn)
 	return SSL_get_version(conn->xprt_ctx);
 }
 
+/* Extract a serial from a cert, and copy it to a chunk.
+ * Returns 1 if serial is found and copied, 0 if no serial found and
+ * -1 if output is not large enough.
+ */
+static int
+ssl_sock_get_serial(X509 *crt, struct chunk *out)
+{
+	ASN1_INTEGER *serial;
+
+	serial = X509_get_serialNumber(crt);
+	if (!serial)
+		return 0;
+
+	if (out->size < serial->length)
+		return -1;
+
+	memcpy(out->str, serial->data, serial->length);
+	out->len = serial->length;
+	return 1;
+}
+
+
+/* Copy Date in ASN1_UTCTIME format in struct chunk out.
+ * Returns 1 if serial is found and copied, 0 if no valid time found
+ * and -1 if output is not large enough.
+ */
+static int
+ssl_sock_get_time(ASN1_TIME *tm, struct chunk *out)
+{
+	if (tm->type == V_ASN1_GENERALIZEDTIME) {
+		ASN1_GENERALIZEDTIME *gentm = (ASN1_GENERALIZEDTIME *)tm;
+
+		if (gentm->length < 12)
+			return 0;
+		if (gentm->data[0] != 0x32 || gentm->data[1] != 0x30)
+			return 0;
+		if (out->size < gentm->length-2)
+			return -1;
+
+		memcpy(out->str, gentm->data+2, gentm->length-2);
+		out->len = gentm->length-2;
+		return 1;
+	}
+	else if (tm->type == V_ASN1_UTCTIME) {
+		ASN1_UTCTIME *utctm = (ASN1_UTCTIME *)tm;
+
+		if (utctm->length < 10)
+			return 0;
+		if (utctm->data[0] >= 0x35)
+			return 0;
+		if (out->size < utctm->length)
+			return -1;
+
+		memcpy(out->str, utctm->data, utctm->length);
+		out->len = utctm->length;
+		return 1;
+	}
+
+	return 0;
+}
+
+/* Extract an entry from a X509_NAME and copy its value to an output chunk.
+ * Returns 1 if entry found, 0 if entry not found, or -1 if output not large enough.
+ */
+static int
+ssl_sock_get_dn_entry(X509_NAME *a, const struct chunk *entry, int pos, struct chunk *out)
+{
+	X509_NAME_ENTRY *ne;
+	int i, j, n;
+	int cur = 0;
+	const char *s;
+	char tmp[128];
+
+	out->len = 0;
+	for (i = 0; i < sk_X509_NAME_ENTRY_num(a->entries); i++) {
+		if (pos < 0)
+			j = (sk_X509_NAME_ENTRY_num(a->entries)-1) - i;
+		else
+			j = i;
+
+		ne = sk_X509_NAME_ENTRY_value(a->entries, j);
+		n = OBJ_obj2nid(ne->object);
+		if ((n == NID_undef) || ((s = OBJ_nid2sn(n)) == NULL)) {
+			i2t_ASN1_OBJECT(tmp, sizeof(tmp), ne->object);
+			s = tmp;
+		}
+
+		if (chunk_strcasecmp(entry, s) != 0)
+			continue;
+
+		if (pos < 0)
+			cur--;
+		else
+			cur++;
+
+		if (cur != pos)
+			continue;
+
+		if (ne->value->length > out->size)
+			return -1;
+
+		memcpy(out->str, ne->value->data, ne->value->length);
+		out->len = ne->value->length;
+		return 1;
+	}
+
+	return 0;
+
+}
+
+/* Extract and format full DN from a X509_NAME and copy result into a chunk
+ * Returns 1 if dn entries exits, 0 if no dn entry found or -1 if output is not large enough.
+ */
+static int
+ssl_sock_get_dn_oneline(X509_NAME *a, struct chunk *out)
+{
+	X509_NAME_ENTRY *ne;
+	int i, n, ln;
+	int l = 0;
+	const char *s;
+	char *p;
+	char tmp[128];
+
+	out->len = 0;
+	p = out->str;
+	for (i = 0; i < sk_X509_NAME_ENTRY_num(a->entries); i++) {
+		ne = sk_X509_NAME_ENTRY_value(a->entries, i);
+		n = OBJ_obj2nid(ne->object);
+		if ((n == NID_undef) || ((s = OBJ_nid2sn(n)) == NULL)) {
+			i2t_ASN1_OBJECT(tmp, sizeof(tmp), ne->object);
+			s = tmp;
+		}
+		ln = strlen(s);
+
+		l += 1 + ln + 1 + ne->value->length;
+		if (l > out->size)
+			return -1;
+		out->len = l;
+
+		*(p++)='/';
+		memcpy(p, s, ln);
+		p += ln;
+		*(p++)='=';
+		memcpy(p, ne->value->data, ne->value->length);
+		p += ne->value->length;
+	}
+
+	if (!out->len)
+		return 0;
+
+	return 1;
+}
+
 /***** Below are some sample fetching functions for ACL/patterns *****/
 
 /* boolean, returns true if client cert was present */
 static int
-smp_fetch_client_crt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                     const struct arg *args, struct sample *smp)
+smp_fetch_ssl_fc_has_crt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                         const struct arg *args, struct sample *smp)
 {
-	if (!l4 || l4->si[0].conn.xprt != &ssl_sock)
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
 		return 0;
 
-	if (!(l4->si[0].conn.flags & CO_FL_CONNECTED)) {
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
 		smp->flags |= SMP_F_MAY_CHANGE;
 		return 0;
 	}
 
 	smp->flags = 0;
 	smp->type = SMP_T_BOOL;
-	smp->data.uint = SSL_SOCK_ST_FL_VERIFY_DONE & l4->si[0].conn.xprt_st ? 1 : 0;
+	smp->data.uint = SSL_SOCK_ST_FL_VERIFY_DONE & l4->si[0].conn->xprt_st ? 1 : 0;
 
 	return 1;
 }
 
-
-/* boolean, returns true if transport layer is SSL */
+/* bin, returns serial in a binary chunk */
 static int
-smp_fetch_is_ssl(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_ssl_c_serial(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate, it increase X509 * ref count */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (ssl_sock_get_serial(crt, smp_trash) <= 0)
+		goto out;
+
+	smp->data.str = *smp_trash;
+	smp->type = SMP_T_BIN;
+	ret = 1;
+out:
+	if (crt)
+		X509_free(crt);
+	return ret;
+}
+
+/*str, returns notafter date in ASN1_UTCTIME format */
+static int
+smp_fetch_ssl_c_notafter(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate, it increase X509 * ref count */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (ssl_sock_get_time(X509_get_notAfter(crt), smp_trash) <= 0)
+		goto out;
+
+	smp->data.str = *smp_trash;
+	smp->type = SMP_T_STR;
+	ret = 1;
+out:
+	if (crt)
+		X509_free(crt);
+	return ret;
+}
+
+/* str, returns a string of a formatted full dn \C=..\O=..\OU=.. \CN=.. */
+static int
+smp_fetch_ssl_c_i_dn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	X509_NAME *name;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate, it increase X509 * ref count */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	name = X509_get_issuer_name(crt);
+	if (!name)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (args && args[0].type == ARGT_STR) {
+		int pos = 1;
+
+		if (args[1].type == ARGT_SINT)
+			pos = args[1].data.sint;
+		else if (args[1].type == ARGT_UINT)
+			pos =(int)args[1].data.uint;
+
+		if (ssl_sock_get_dn_entry(name, &args[0].data.str, pos, smp_trash) <= 0)
+			goto out;
+	}
+	else if (ssl_sock_get_dn_oneline(name, smp_trash) <= 0)
+		goto out;
+
+	smp->type = SMP_T_STR;
+	smp->data.str = *smp_trash;
+	ret = 1;
+out:
+	if (crt)
+		X509_free(crt);
+	return ret;
+}
+
+/*str, returns notbefore date in ASN1_UTCTIME format */
+static int
+smp_fetch_ssl_c_notbefore(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate, it increase X509 * ref count */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (ssl_sock_get_time(X509_get_notBefore(crt), smp_trash) <= 0)
+		goto out;
+
+	smp->data.str = *smp_trash;
+	smp->type = SMP_T_STR;
+	ret = 1;
+out:
+	if (crt)
+		X509_free(crt);
+	return ret;
+}
+
+/* str, returns a string of a formatted full dn \C=..\O=..\OU=.. \CN=.. */
+static int
+smp_fetch_ssl_c_s_dn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	X509_NAME *name;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate, it increase X509 * ref count */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	name = X509_get_subject_name(crt);
+	if (!name)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (args && args[0].type == ARGT_STR) {
+		int pos = 1;
+
+		if (args[1].type == ARGT_SINT)
+			pos = args[1].data.sint;
+		else if (args[1].type == ARGT_UINT)
+			pos =(int)args[1].data.uint;
+
+		if (ssl_sock_get_dn_entry(name, &args[0].data.str, pos, smp_trash) <= 0)
+			goto out;
+	}
+	else if (ssl_sock_get_dn_oneline(name, smp_trash) <= 0)
+		goto out;
+
+	smp->type = SMP_T_STR;
+	smp->data.str = *smp_trash;
+	ret = 1;
+out:
+	if (crt)
+		X509_free(crt);
+	return ret;
+}
+/* integer, returns the client certificate version */
+static int
+smp_fetch_ssl_c_version(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	X509 *crt;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate returns a ptr on allocated X509 struct */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		return 0;
+
+	smp->data.uint = (unsigned int)(1 + X509_get_version(crt));
+	X509_free(crt);
+	smp->type = SMP_T_UINT;
+
+	return 1;
+}
+
+/* str, returns the client certificate sig alg */
+static int
+smp_fetch_ssl_c_sig_alg(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	X509 *crt;
+	int nid;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate increase X509 * ref count  */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		return 0;
+
+	nid = OBJ_obj2nid((ASN1_OBJECT *)(crt->cert_info->signature->algorithm));
+
+	smp->data.str.str = (char *)OBJ_nid2sn(nid);
+	if (!smp->data.str.str)
+		return 0;
+
+	smp->type = SMP_T_CSTR;
+	smp->data.str.len = strlen(smp->data.str.str);
+	X509_free(crt);
+
+	return 1;
+}
+
+/* str, returns the client certificate key alg */
+static int
+smp_fetch_ssl_c_key_alg(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	X509 *crt;
+	int nid;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_peer_certificate increase X509 * ref count  */
+	crt = SSL_get_peer_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		return 0;
+
+	nid = OBJ_obj2nid((ASN1_OBJECT *)(crt->cert_info->key->algor->algorithm));
+
+	smp->data.str.str = (char *)OBJ_nid2sn(nid);
+	if (!smp->data.str.str)
+		return 0;
+
+	smp->type = SMP_T_CSTR;
+	smp->data.str.len = strlen(smp->data.str.str);
+	X509_free(crt);
+
+	return 1;
+}
+
+/* boolean, returns true if front conn. transport layer is SSL */
+static int
+smp_fetch_ssl_fc(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                  const struct arg *args, struct sample *smp)
 {
 	smp->type = SMP_T_BOOL;
-	smp->data.uint = (l4->si[0].conn.xprt == &ssl_sock);
+	smp->data.uint = (l4->si[0].conn->xprt == &ssl_sock);
 	return 1;
 }
 
-/* boolean, returns true if transport layer is SSL */
+/* boolean, returns true if client present a SNI */
 static int
-smp_fetch_has_sni(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                  const struct arg *args, struct sample *smp)
+smp_fetch_ssl_fc_has_sni(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                         const struct arg *args, struct sample *smp)
 {
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	smp->type = SMP_T_BOOL;
-	smp->data.uint = (l4->si[0].conn.xprt == &ssl_sock) &&
-		l4->si[0].conn.xprt_ctx &&
-		SSL_get_servername(l4->si[0].conn.xprt_ctx, TLSEXT_NAMETYPE_host_name) != NULL;
+	smp->data.uint = (l4->si[0].conn->xprt == &ssl_sock) &&
+		l4->si[0].conn->xprt_ctx &&
+		SSL_get_servername(l4->si[0].conn->xprt_ctx, TLSEXT_NAMETYPE_host_name) != NULL;
 	return 1;
 #else
 	return 0;
 #endif
 }
 
+/* bin, returns serial in a binary chunk */
+static int
+smp_fetch_ssl_f_serial(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (ssl_sock_get_serial(crt, smp_trash) <= 0)
+		goto out;
+
+	smp->data.str = *smp_trash;
+	smp->type = SMP_T_BIN;
+	ret = 1;
+out:
+	return ret;
+}
+/*str, returns notafter date in ASN1_UTCTIME format */
+static int
+smp_fetch_ssl_f_notafter(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (ssl_sock_get_time(X509_get_notAfter(crt), smp_trash) <= 0)
+		goto out;
+
+	smp->data.str = *smp_trash;
+	smp->type = SMP_T_STR;
+	ret = 1;
+out:
+	return ret;
+}
+
+/*str, returns notbefore date in ASN1_UTCTIME format */
+static int
+smp_fetch_ssl_f_notbefore(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (ssl_sock_get_time(X509_get_notBefore(crt), smp_trash) <= 0)
+		goto out;
+
+	smp->data.str = *smp_trash;
+	smp->type = SMP_T_STR;
+	ret = 1;
+out:
+	return ret;
+}
+
+/* integer, returns the frontend certificate version */
+static int
+smp_fetch_ssl_f_version(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                           const struct arg *args, struct sample *smp)
+{
+	X509 *crt;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* SSL_get_certificate returns a ptr on an SSL * internal sub struct */
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		return 0;
+
+	smp->data.uint = (unsigned int)(1 + X509_get_version(crt));
+	smp->type = SMP_T_UINT;
+
+	return 1;
+}
+
+/* str, returns the client certificate sig alg */
+static int
+smp_fetch_ssl_f_sig_alg(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	X509 *crt;
+	int nid;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		return 0;
+
+	nid = OBJ_obj2nid((ASN1_OBJECT *)(crt->cert_info->signature->algorithm));
+
+	smp->data.str.str = (char *)OBJ_nid2sn(nid);
+	if (!smp->data.str.str)
+		return 0;
+
+	smp->type = SMP_T_CSTR;
+	smp->data.str.len = strlen(smp->data.str.str);
+
+	return 1;
+}
+
+/* str, returns the client certificate key alg */
+static int
+smp_fetch_ssl_f_key_alg(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	X509 *crt;
+	int nid;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		return 0;
+
+	nid = OBJ_obj2nid((ASN1_OBJECT *)(crt->cert_info->key->algor->algorithm));
+
+	smp->data.str.str = (char *)OBJ_nid2sn(nid);
+	if (!smp->data.str.str)
+		return 0;
+
+	smp->type = SMP_T_CSTR;
+	smp->data.str.len = strlen(smp->data.str.str);
+
+	return 1;
+}
+
+/* str, returns a string of a formatted full dn \C=..\O=..\OU=.. \CN=.. */
+static int
+smp_fetch_ssl_f_i_dn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	X509_NAME *name;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	name = X509_get_issuer_name(crt);
+	if (!name)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (args && args[0].type == ARGT_STR) {
+		int pos = 1;
+
+		if (args[1].type == ARGT_SINT)
+			pos = args[1].data.sint;
+		else if (args[1].type == ARGT_UINT)
+			pos =(int)args[1].data.uint;
+
+		if (ssl_sock_get_dn_entry(name, &args[0].data.str, pos, smp_trash) <= 0)
+			goto out;
+	}
+	else if (ssl_sock_get_dn_oneline(name, smp_trash) <= 0)
+		goto out;
+
+	smp->type = SMP_T_STR;
+	smp->data.str = *smp_trash;
+	ret = 1;
+out:
+	return ret;
+}
+
+/* str, returns a string of a formatted full dn \C=..\O=..\OU=.. \CN=.. */
+static int
+smp_fetch_ssl_f_s_dn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
+{
+	X509 *crt = NULL;
+	X509_NAME *name;
+	int ret = 0;
+	struct chunk *smp_trash;
+
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	crt = SSL_get_certificate(l4->si[0].conn->xprt_ctx);
+	if (!crt)
+		goto out;
+
+	name = X509_get_subject_name(crt);
+	if (!name)
+		goto out;
+
+	smp_trash = sample_get_trash_chunk();
+	if (args && args[0].type == ARGT_STR) {
+		int pos = 1;
+
+		if (args[1].type == ARGT_SINT)
+			pos = args[1].data.sint;
+		else if (args[1].type == ARGT_UINT)
+			pos =(int)args[1].data.uint;
+
+		if (ssl_sock_get_dn_entry(name, &args[0].data.str, pos, smp_trash) <= 0)
+			goto out;
+	}
+	else if (ssl_sock_get_dn_oneline(name, smp_trash) <= 0)
+		goto out;
+
+	smp->type = SMP_T_STR;
+	smp->data.str = *smp_trash;
+	ret = 1;
+out:
+	return ret;
+}
+
+static int
+smp_fetch_ssl_fc_cipher(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	smp->flags = 0;
+
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	smp->data.str.str = (char *)SSL_get_cipher_name(l4->si[0].conn->xprt_ctx);
+	if (!smp->data.str.str)
+		return 0;
+
+	smp->type = SMP_T_CSTR;
+	smp->data.str.len = strlen(smp->data.str.str);
+
+	return 1;
+}
+
+static int
+smp_fetch_ssl_fc_alg_keysize(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                             const struct arg *args, struct sample *smp)
+{
+	smp->flags = 0;
+
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!SSL_get_cipher_bits(l4->si[0].conn->xprt_ctx, (int *)&smp->data.uint))
+		return 0;
+
+	smp->type = SMP_T_UINT;
+
+	return 1;
+}
+
+static int
+smp_fetch_ssl_fc_use_keysize(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                             const struct arg *args, struct sample *smp)
+{
+	smp->flags = 0;
+
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	smp->data.uint = (unsigned int)SSL_get_cipher_bits(l4->si[0].conn->xprt_ctx, NULL);
+	if (!smp->data.uint)
+		return 0;
+
+	smp->type = SMP_T_UINT;
+
+	return 1;
+}
+
 #ifdef OPENSSL_NPN_NEGOTIATED
 static int
-smp_fetch_ssl_npn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                  const struct arg *args, struct sample *smp)
+smp_fetch_ssl_fc_npn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                     const struct arg *args, struct sample *smp)
 {
 	smp->flags = 0;
 	smp->type = SMP_T_CSTR;
 
-	if (!l4 || !l4->si[0].conn.xprt_ctx || l4->si[0].conn.xprt != &ssl_sock)
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
 		return 0;
 
 	smp->data.str.str = NULL;
-	SSL_get0_next_proto_negotiated(l4->si[0].conn.xprt_ctx,
+	SSL_get0_next_proto_negotiated(l4->si[0].conn->xprt_ctx,
 	                                (const unsigned char **)&smp->data.str.str, (unsigned *)&smp->data.str.len);
 
 	if (!smp->data.str.str)
@@ -1167,17 +1981,63 @@ smp_fetch_ssl_npn(struct proxy *px, struct session *l4, void *l7, unsigned int o
 #endif
 
 static int
-smp_fetch_ssl_sni(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                  const struct arg *args, struct sample *smp)
+smp_fetch_ssl_fc_protocol(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                          const struct arg *args, struct sample *smp)
+{
+	smp->flags = 0;
+
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	smp->data.str.str = (char *)SSL_get_version(l4->si[0].conn->xprt_ctx);
+	if (!smp->data.str.str)
+		return 0;
+
+	smp->type = SMP_T_CSTR;
+	smp->data.str.len = strlen(smp->data.str.str);
+
+	return 1;
+}
+
+static int
+smp_fetch_ssl_fc_session_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                            const struct arg *args, struct sample *smp)
+{
+#if OPENSSL_VERSION_NUMBER > 0x0090800fL
+	SSL_SESSION *sess;
+
+	smp->flags = 0;
+	smp->type = SMP_T_CBIN;
+
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	sess = SSL_get_session(l4->si[0].conn->xprt_ctx);
+	if (!sess)
+		return 0;
+
+	smp->data.str.str = (char *)SSL_SESSION_get_id(sess, (unsigned int *)&smp->data.str.len);
+	if (!smp->data.str.str || !&smp->data.str.len)
+		return 0;
+
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+static int
+smp_fetch_ssl_fc_sni(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                     const struct arg *args, struct sample *smp)
 {
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	smp->flags = 0;
 	smp->type = SMP_T_CSTR;
 
-	if (!l4 || !l4->si[0].conn.xprt_ctx || l4->si[0].conn.xprt != &ssl_sock)
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
 		return 0;
 
-	smp->data.str.str = (char *)SSL_get_servername(l4->si[0].conn.xprt_ctx, TLSEXT_NAMETYPE_host_name);
+	smp->data.str.str = (char *)SSL_get_servername(l4->si[0].conn->xprt_ctx, TLSEXT_NAMETYPE_host_name);
 	if (!smp->data.str.str)
 		return 0;
 
@@ -1188,84 +2048,84 @@ smp_fetch_ssl_sni(struct proxy *px, struct session *l4, void *l7, unsigned int o
 #endif
 }
 
-/* integer, returns the first verify error ID in CA */
+/* integer, returns the first verify error in CA chain of client certificate chain. */
 static int
-smp_fetch_verify_caerr(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_ssl_c_ca_err(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                        const struct arg *args, struct sample *smp)
 {
-	if (!l4 || l4->si[0].conn.xprt != &ssl_sock)
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
 		return 0;
 
-	if (!(l4->si[0].conn.flags & CO_FL_CONNECTED)) {
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
 
 	smp->type = SMP_T_UINT;
-	smp->data.uint = (unsigned int)SSL_SOCK_ST_TO_CA_ERROR(l4->si[0].conn.xprt_st);
+	smp->data.uint = (unsigned int)SSL_SOCK_ST_TO_CA_ERROR(l4->si[0].conn->xprt_st);
 	smp->flags = 0;
 
 	return 1;
 }
 
-/* integer, returns the depth of the first verify error in CA */
+/* integer, returns the depth of the first verify error in CA chain of client certificate chain. */
 static int
-smp_fetch_verify_caerr_depth(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_ssl_c_ca_err_depth(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                              const struct arg *args, struct sample *smp)
 {
-	if (!l4 || l4->si[0].conn.xprt != &ssl_sock)
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
 		return 0;
 
-	if (!(l4->si[0].conn.flags & CO_FL_CONNECTED)) {
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
 
 	smp->type = SMP_T_UINT;
-	smp->data.uint = (unsigned int)SSL_SOCK_ST_TO_CAEDEPTH(l4->si[0].conn.xprt_st);
+	smp->data.uint = (unsigned int)SSL_SOCK_ST_TO_CAEDEPTH(l4->si[0].conn->xprt_st);
 	smp->flags = 0;
 
 	return 1;
 }
 
-/* integer, returns the depth of the first verify error in CA */
+/* integer, returns the first verify error on client certificate */
 static int
-smp_fetch_verify_crterr(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                        const struct arg *args, struct sample *smp)
+smp_fetch_ssl_c_err(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                    const struct arg *args, struct sample *smp)
 {
-	if (!l4 || l4->si[0].conn.xprt != &ssl_sock)
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
 		return 0;
 
-	if (!(l4->si[0].conn.flags & CO_FL_CONNECTED)) {
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
 
 	smp->type = SMP_T_UINT;
-	smp->data.uint = (unsigned int)SSL_SOCK_ST_TO_CRTERROR(l4->si[0].conn.xprt_st);
+	smp->data.uint = (unsigned int)SSL_SOCK_ST_TO_CRTERROR(l4->si[0].conn->xprt_st);
 	smp->flags = 0;
 
 	return 1;
 }
 
-/* integer, returns the verify result */
+/* integer, returns the verify result on client cert */
 static int
-smp_fetch_verify_result(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                      const struct arg *args, struct sample *smp)
+smp_fetch_ssl_c_verify(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                       const struct arg *args, struct sample *smp)
 {
-	if (!l4 || l4->si[0].conn.xprt != &ssl_sock)
+	if (!l4 || l4->si[0].conn->xprt != &ssl_sock)
 		return 0;
 
-	if (!(l4->si[0].conn.flags & CO_FL_CONNECTED)) {
+	if (!(l4->si[0].conn->flags & CO_FL_CONNECTED)) {
 		smp->flags = SMP_F_MAY_CHANGE;
 		return 0;
 	}
 
-	if (!l4->si[0].conn.xprt_ctx)
+	if (!l4->si[0].conn->xprt_ctx)
 		return 0;
 
 	smp->type = SMP_T_UINT;
-	smp->data.uint = (unsigned int)SSL_get_verify_result(l4->si[0].conn.xprt_ctx);
+	smp->data.uint = (unsigned int)SSL_get_verify_result(l4->si[0].conn->xprt_ctx);
 	smp->flags = 0;
 
 	return 1;
@@ -1643,6 +2503,22 @@ static int srv_parse_crl_file(char **args, int *cur_arg, struct proxy *px, struc
 #endif
 }
 
+/* parse the "crt" server keyword */
+static int srv_parse_crt(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	if (!*args[*cur_arg + 1]) {
+		if (err)
+			memprintf(err, "'%s' : missing certificate file path", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if ((*args[*cur_arg + 1] != '/') && global.crt_base)
+		memprintf(&newsrv->ssl_ctx.client_crt, "%s/%s", global.ca_base, args[*cur_arg + 1]);
+	else
+		memprintf(&newsrv->ssl_ctx.client_crt, "%s", args[*cur_arg + 1]);
+
+	return 0;
+}
 
 /* parse the "force-sslv3" server keyword */
 static int srv_parse_force_sslv3(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
@@ -1755,17 +2631,38 @@ static int srv_parse_verify(char **args, int *cur_arg, struct proxy *px, struct 
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
-	{ "client_crt",             smp_fetch_client_crt,         0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "is_ssl",                 smp_fetch_is_ssl,             0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_has_sni",            smp_fetch_has_sni,            0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_ca_err",           smp_fetch_ssl_c_ca_err,       0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_ca_err_depth",     smp_fetch_ssl_c_ca_err_depth, 0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_err",              smp_fetch_ssl_c_err,          0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_i_dn",             smp_fetch_ssl_c_i_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_key_alg",          smp_fetch_ssl_c_key_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_notafter",         smp_fetch_ssl_c_notafter,     0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_notbefore",        smp_fetch_ssl_c_notbefore,    0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_sig_alg",          smp_fetch_ssl_c_sig_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_s_dn",             smp_fetch_ssl_c_s_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_serial",           smp_fetch_ssl_c_serial,       0,    NULL,    SMP_T_BIN,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_verify",           smp_fetch_ssl_c_verify,       0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_version",          smp_fetch_ssl_c_version,      0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_i_dn",             smp_fetch_ssl_f_i_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_key_alg",          smp_fetch_ssl_f_key_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_notafter",         smp_fetch_ssl_f_notafter,     0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_notbefore",        smp_fetch_ssl_f_notbefore,    0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_sig_alg",          smp_fetch_ssl_f_sig_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_s_dn",             smp_fetch_ssl_f_s_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_serial",           smp_fetch_ssl_f_serial,       0,    NULL,    SMP_T_BIN, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_f_version",          smp_fetch_ssl_f_version,      0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc",                 smp_fetch_ssl_fc,             0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_alg_keysize",     smp_fetch_ssl_fc_alg_keysize, 0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_cipher",          smp_fetch_ssl_fc_cipher,      0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_has_crt",         smp_fetch_ssl_fc_has_crt,     0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_has_sni",         smp_fetch_ssl_fc_has_sni,     0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
 #ifdef OPENSSL_NPN_NEGOTIATED
-	{ "ssl_npn",                smp_fetch_ssl_npn,            0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_npn",             smp_fetch_ssl_fc_npn,         0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
 #endif
-	{ "ssl_sni",                smp_fetch_ssl_sni,            0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_verify_caerr",       smp_fetch_verify_caerr,       0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_verify_caerr_depth", smp_fetch_verify_caerr_depth, 0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_verify_crterr",      smp_fetch_verify_crterr,      0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_verify_result",      smp_fetch_verify_result,      0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_protocol",        smp_fetch_ssl_fc_protocol,    0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_use_keysize",     smp_fetch_ssl_fc_use_keysize, 0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_session_id",      smp_fetch_ssl_fc_session_id,  0,    NULL,    SMP_T_CBIN, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_sni",             smp_fetch_ssl_fc_sni,         0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
 	{ NULL, NULL, 0, 0, 0 },
 }};
 
@@ -1773,19 +2670,39 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {{ },{
-	{ "client_crt",             acl_parse_int, smp_fetch_client_crt,         acl_match_nothing, ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "is_ssl",                 acl_parse_int, smp_fetch_is_ssl,             acl_match_nothing, ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_has_sni",            acl_parse_int, smp_fetch_has_sni,            acl_match_nothing, ACL_USE_L6REQ_PERMANENT, 0 },
+	{ "ssl_c_ca_err",           acl_parse_int, smp_fetch_ssl_c_ca_err,       acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_ca_err_depth",     acl_parse_int, smp_fetch_ssl_c_ca_err_depth, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_err",              acl_parse_int, smp_fetch_ssl_c_err,          acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_i_dn",             acl_parse_str, smp_fetch_ssl_c_i_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
+	{ "ssl_c_key_alg",          acl_parse_str, smp_fetch_ssl_c_key_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_notafter",         acl_parse_str, smp_fetch_ssl_c_notafter,     acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_notbefore",        acl_parse_str, smp_fetch_ssl_c_notbefore,    acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_sig_alg",          acl_parse_str, smp_fetch_ssl_c_sig_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_s_dn",             acl_parse_str, smp_fetch_ssl_c_s_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
+	{ "ssl_c_serial",           acl_parse_bin, smp_fetch_ssl_c_serial,       acl_match_bin,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_verify",           acl_parse_int, smp_fetch_ssl_c_verify,       acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_c_version",          acl_parse_int, smp_fetch_ssl_c_version,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_f_i_dn",             acl_parse_str, smp_fetch_ssl_f_i_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
+	{ "ssl_f_key_alg",          acl_parse_str, smp_fetch_ssl_f_key_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_f_notafter",         acl_parse_str, smp_fetch_ssl_f_notafter,     acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_f_notbefore",        acl_parse_str, smp_fetch_ssl_f_notbefore,    acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_f_sig_alg",          acl_parse_str, smp_fetch_ssl_f_sig_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_f_s_dn",             acl_parse_str, smp_fetch_ssl_f_s_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
+	{ "ssl_f_serial",           acl_parse_bin, smp_fetch_ssl_f_serial,       acl_match_bin,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_f_version",          acl_parse_int, smp_fetch_ssl_f_version,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc",                 acl_parse_int, smp_fetch_ssl_fc,             acl_match_nothing, ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_alg_keysize",     acl_parse_str, smp_fetch_ssl_fc_alg_keysize, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_cipher",          acl_parse_str, smp_fetch_ssl_fc_cipher,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_has_crt",         acl_parse_int, smp_fetch_ssl_fc_has_crt,     acl_match_nothing, ACL_USE_L6REQ_PERMANENT, 0 },
+	{ "ssl_fc_has_sni",         acl_parse_int, smp_fetch_ssl_fc_has_sni,     acl_match_nothing, ACL_USE_L6REQ_PERMANENT, 0 },
 #ifdef OPENSSL_NPN_NEGOTIATED
-	{ "ssl_npn",                acl_parse_str, smp_fetch_ssl_npn,            acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_npn",             acl_parse_str, smp_fetch_ssl_fc_npn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
 #endif
-	{ "ssl_sni",                acl_parse_str, smp_fetch_ssl_sni,            acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_sni_end",            acl_parse_str, smp_fetch_ssl_sni,            acl_match_end,     ACL_USE_L6REQ_PERMANENT, 0 },
-	{ "ssl_sni_reg",            acl_parse_reg, smp_fetch_ssl_sni,            acl_match_reg,     ACL_USE_L6REQ_PERMANENT, 0 },
-	{ "ssl_verify_caerr",       acl_parse_int, smp_fetch_verify_caerr,       acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_verify_caerr_depth", acl_parse_int, smp_fetch_verify_caerr_depth, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_verify_crterr",      acl_parse_int, smp_fetch_verify_crterr,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_verify_result",      acl_parse_int, smp_fetch_verify_result,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_protocol",        acl_parse_str, smp_fetch_ssl_fc_protocol,    acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_use_keysize",     acl_parse_str, smp_fetch_ssl_fc_use_keysize, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_sni",             acl_parse_str, smp_fetch_ssl_fc_sni,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_sni_end",         acl_parse_str, smp_fetch_ssl_fc_sni,         acl_match_end,     ACL_USE_L6REQ_PERMANENT, 0 },
+	{ "ssl_fc_sni_reg",         acl_parse_reg, smp_fetch_ssl_fc_sni,         acl_match_reg,     ACL_USE_L6REQ_PERMANENT, 0 },
 	{ NULL, NULL, NULL, NULL },
 }};
 
@@ -1831,6 +2748,7 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "check-ssl",             srv_parse_check_ssl,      0, 0 }, /* enable SSL for health checks */
 	{ "ciphers",               srv_parse_ciphers,        1, 0 }, /* select the cipher suite */
 	{ "crl-file",              srv_parse_crl_file,       1, 0 }, /* set certificate revocation list file use on server cert verify */
+	{ "crt",                   srv_parse_crt,            1, 0 }, /* set client certificate */
 	{ "force-sslv3",           srv_parse_force_sslv3,    0, 0 }, /* force SSLv3 */
 	{ "force-tlsv10",          srv_parse_force_tlsv10,   0, 0 }, /* force TLSv10 */
 	{ "force-tlsv11",          srv_parse_force_tlsv11,   0, 0 }, /* force TLSv11 */

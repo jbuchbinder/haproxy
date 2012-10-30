@@ -40,10 +40,18 @@ struct chunk {
 int chunk_printf(struct chunk *chk, const char *fmt, ...)
 	__attribute__ ((format(printf, 2, 3)));
 
+int chunk_appendf(struct chunk *chk, const char *fmt, ...)
+	__attribute__ ((format(printf, 2, 3)));
+
 int chunk_htmlencode(struct chunk *dst, struct chunk *src);
 int chunk_asciiencode(struct chunk *dst, struct chunk *src, char qc);
 int chunk_strcmp(const struct chunk *chk, const char *str);
 int chunk_strcasecmp(const struct chunk *chk, const char *str);
+
+static inline void chunk_reset(struct chunk *chk)
+{
+	chk->len  = 0;
+}
 
 static inline void chunk_init(struct chunk *chk, char *str, size_t size)
 {
@@ -88,7 +96,7 @@ static inline int chunk_strcpy(struct chunk *chk, const char *str)
 	return 1;
 }
 
-static inline void chunk_reset(struct chunk *chk)
+static inline void chunk_drop(struct chunk *chk)
 {
 	chk->str  = NULL;
 	chk->len  = -1;
@@ -100,10 +108,8 @@ static inline void chunk_destroy(struct chunk *chk)
 	if (!chk->size)
 		return;
 
-	if (chk->str)
-		free(chk->str);
-
-	chunk_reset(chk);
+	free(chk->str);
+	chunk_drop(chk);
 }
 
 /*

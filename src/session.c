@@ -83,6 +83,12 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	if (unlikely((s = pool_alloc2(pool2_session)) == NULL))
 		goto out_close;
 
+	if (unlikely((s->si[0].conn = pool_alloc2(pool2_connection)) == NULL))
+		goto out_fail_conn0;
+
+	if (unlikely((s->si[1].conn = pool_alloc2(pool2_connection)) == NULL))
+		goto out_fail_conn1;
+
 	/* minimum session initialization required for an embryonic session is
 	 * fairly low. We need very little to execute L4 ACLs, then we need a
 	 * task to make the client-side connection live on its own.
@@ -100,11 +106,11 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	s->fe  = p;
 
 	/* OK, we're keeping the session, so let's properly initialize the session */
-	s->si[0].conn.t.sock.fd = cfd;
-	s->si[0].conn.ctrl = l->proto;
-	s->si[0].conn.flags = CO_FL_NONE;
-	s->si[0].conn.addr.from = *addr;
-	set_target_client(&s->si[0].conn.target, l);
+	s->si[0].conn->t.sock.fd = cfd;
+	s->si[0].conn->ctrl = l->proto;
+	s->si[0].conn->flags = CO_FL_NONE;
+	s->si[0].conn->addr.from = *addr;
+	set_target_client(&s->si[0].conn->target, l);
 
 	s->logs.accept_date = date; /* user-visible date for logging */
 	s->logs.tv_accept = now;  /* corrected date for internal use */
@@ -152,7 +158,7 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 		 *  - HEALTH mode without HTTP check => just send "OK"
 		 *  - TCP mode from monitoring address => just close
 		 */
-		recv(cfd, trash, trashlen, MSG_DONTWAIT);
+		recv(cfd, trash.str, trash.size, MSG_DONTWAIT);
 		if (p->mode == PR_MODE_HTTP ||
 		    (p->mode == PR_MODE_HEALTH && (p->options2 & PR_O2_CHK_ANY) == PR_O2_HTTP_CHK))
 			send(cfd, "HTTP/1.0 200 OK\r\n\r\n", 19, MSG_DONTWAIT|MSG_NOSIGNAL|MSG_MORE);
@@ -165,8 +171,8 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 
 	/* wait for a PROXY protocol header */
 	if (l->options & LI_O_ACC_PROXY) {
-		s->si[0].conn.flags |= CO_FL_ACCEPT_PROXY;
-		conn_sock_want_recv(&s->si[0].conn);
+		s->si[0].conn->flags |= CO_FL_ACCEPT_PROXY;
+		conn_sock_want_recv(s->si[0].conn);
 	}
 
 	if (unlikely((t = task_new()) == NULL))
@@ -180,14 +186,14 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	 * but not initialized. Also note we need to be careful as the stream
 	 * int is not initialized yet.
 	 */
-	conn_prepare(&s->si[0].conn, &sess_conn_cb, l->proto, l->xprt, s);
+	conn_prepare(s->si[0].conn, &sess_conn_cb, l->proto, l->xprt, s);
 
 	/* finish initialization of the accepted file descriptor */
 	fd_insert(cfd);
-	fdtab[cfd].owner = &s->si[0].conn;
+	fdtab[cfd].owner = s->si[0].conn;
 	fdtab[cfd].iocb = conn_fd_handler;
-	conn_data_want_recv(&s->si[0].conn);
-	if (conn_xprt_init(&s->si[0].conn) < 0)
+	conn_data_want_recv(s->si[0].conn);
+	if (conn_xprt_init(s->si[0].conn) < 0)
 		goto out_free_task;
 
 	/* OK, now either we have a pending handshake to execute with and
@@ -196,11 +202,11 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	 * set the I/O timeout to the frontend's client timeout.
 	 */
 
-	if (s->si[0].conn.flags & CO_FL_HANDSHAKE) {
+	if (s->si[0].conn->flags & CO_FL_HANDSHAKE) {
 		t->process = expire_mini_session;
 		t->expire = tick_add_ifset(now_ms, p->timeout.client);
 		task_queue(t);
-		s->si[0].conn.flags |= CO_FL_INIT_DATA | CO_FL_WAKE_DATA;
+		s->si[0].conn->flags |= CO_FL_INIT_DATA | CO_FL_WAKE_DATA;
 		return 1;
 	}
 
@@ -216,6 +222,10 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	p->feconn--;
 	if (s->stkctr1_entry || s->stkctr2_entry)
 		session_store_counters(s);
+	pool_free2(pool2_connection, s->si[1].conn);
+ out_fail_conn1:
+	pool_free2(pool2_connection, s->si[0].conn);
+ out_fail_conn0:
 	pool_free2(pool2_session, s);
  out_close:
 	if (ret < 0 && l->xprt == &raw_sock && p->mode == PR_MODE_HTTP) {
@@ -238,7 +248,7 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 static void kill_mini_session(struct session *s)
 {
 	/* kill the connection now */
-	conn_xprt_close(&s->si[0].conn);
+	conn_xprt_close(s->si[0].conn);
 
 	s->fe->feconn--;
 	if (s->stkctr1_entry || s->stkctr2_entry)
@@ -262,11 +272,13 @@ static void kill_mini_session(struct session *s)
 	task_delete(s->task);
 	task_free(s->task);
 
-	if (fdtab[s->si[0].conn.t.sock.fd].owner)
-		fd_delete(s->si[0].conn.t.sock.fd);
+	if (fdtab[s->si[0].conn->t.sock.fd].owner)
+		fd_delete(s->si[0].conn->t.sock.fd);
 	else
-		close(s->si[0].conn.t.sock.fd);
+		close(s->si[0].conn->t.sock.fd);
 
+	pool_free2(pool2_connection, s->si[1].conn);
+	pool_free2(pool2_connection, s->si[0].conn);
 	pool_free2(pool2_session, s);
 }
 
@@ -347,6 +359,7 @@ int session_complete(struct session *s)
 	 */
 	s->be  = s->fe;
 	s->req = s->rep = NULL; /* will be allocated later */
+	s->comp_algo = NULL;
 
 	/* Let's count a session now */
 	proxy_inc_fe_sess_ctr(l, p);
@@ -392,8 +405,8 @@ int session_complete(struct session *s)
 	/* pre-initialize the other side's stream interface to an INIT state. The
 	 * callbacks will be initialized before attempting to connect.
 	 */
-	s->si[1].conn.t.sock.fd = -1; /* just to help with debugging */
-	s->si[1].conn.flags = CO_FL_NONE;
+	s->si[1].conn->t.sock.fd = -1; /* just to help with debugging */
+	s->si[1].conn->flags = CO_FL_NONE;
 	s->si[1].owner     = t;
 	s->si[1].state     = s->si[1].prev_state = SI_ST_INI;
 	s->si[1].err_type  = SI_ET_NONE;
@@ -401,7 +414,7 @@ int session_complete(struct session *s)
 	s->si[1].err_loc   = NULL;
 	s->si[1].release   = NULL;
 	s->si[1].send_proxy_ofs = 0;
-	clear_target(&s->si[1].conn.target);
+	clear_target(&s->si[1].conn->target);
 	si_prepare_embedded(&s->si[1]);
 	s->si[1].exp       = TICK_ETERNITY;
 	s->si[1].flags     = SI_FL_NONE;
@@ -484,7 +497,7 @@ int session_complete(struct session *s)
 	txn->rsp.chn = s->rep;
 
 	/* finish initialization of the accepted file descriptor */
-	conn_data_want_recv(&s->si[0].conn);
+	conn_data_want_recv(s->si[0].conn);
 
 	if (p->accept && (ret = p->accept(s)) <= 0) {
 		/* Either we had an unrecoverable error (<0) or work is
@@ -496,10 +509,10 @@ int session_complete(struct session *s)
 
 	/* if logs require transport layer information, note it on the connection */
 	if (s->logs.logwait & LW_XPRT)
-		s->si[0].conn.flags |= CO_FL_XPRT_TRACKED;
+		s->si[0].conn->flags |= CO_FL_XPRT_TRACKED;
 
 	/* we want the connection handler to notify the stream interface about updates. */
-	s->si[0].conn.flags |= CO_FL_WAKE_DATA;
+	s->si[0].conn->flags |= CO_FL_WAKE_DATA;
 
 	/* it is important not to call the wakeup function directly but to
 	 * pass through task_wakeup(), because this one knows how to apply
@@ -551,6 +564,11 @@ static void session_free(struct session *s)
 		sess_change_server(s, NULL);
 	}
 
+	if (s->comp_algo) {
+		s->comp_algo->end(&s->comp_ctx.strm);
+		s->comp_algo = NULL;
+	}
+
 	if (s->req->pipe)
 		put_pipe(s->req->pipe);
 
@@ -566,8 +584,8 @@ static void session_free(struct session *s)
 	http_end_txn(s);
 
 	/* ensure the client-side transport layer is destroyed */
-	s->si[0].conn.flags &= ~CO_FL_XPRT_TRACKED;
-	conn_xprt_close(&s->si[0].conn);
+	s->si[0].conn->flags &= ~CO_FL_XPRT_TRACKED;
+	conn_xprt_close(s->si[0].conn);
 
 	for (i = 0; i < s->store_count; i++) {
 		if (!s->store[i].ts)
@@ -596,6 +614,8 @@ static void session_free(struct session *s)
 		bref->ref = s->list.n;
 	}
 	LIST_DEL(&s->list);
+	pool_free2(pool2_connection, s->si[1].conn);
+	pool_free2(pool2_connection, s->si[0].conn);
 	pool_free2(pool2_session, s);
 
 	/* We may want to free the maximum amount of pools if the proxy is stopping */
@@ -742,11 +762,24 @@ static int sess_update_st_con_tcp(struct session *s, struct stream_interface *si
 	 * attempts and error reports.
 	 */
 	if (unlikely(si->flags & (SI_FL_EXP|SI_FL_ERR))) {
+		if (unlikely(si->ob->flags & CF_WRITE_PARTIAL)) {
+			/* Some data were sent past the connection establishment,
+			 * so we need to pretend we're established to log correctly
+			 * and let later states handle the failure.
+			 */
+			s->logs.t_connect = tv_ms_elapsed(&s->logs.tv_accept, &now);
+			si->exp      = TICK_ETERNITY;
+			si->state    = SI_ST_EST;
+			si->err_type = SI_ET_DATA_ERR;
+			si->ib->flags |= CF_READ_ERROR | CF_WRITE_ERROR;
+			si->err_loc = target_srv(&s->target);
+			return 1;
+		}
 		si->exp   = TICK_ETERNITY;
 		si->state = SI_ST_CER;
 		fd_delete(si_fd(si));
 
-		conn_xprt_close(&si->conn);
+		conn_xprt_close(si->conn);
 		if (si->release)
 			si->release(si);
 
@@ -2063,8 +2096,8 @@ struct task *process_session(struct task *t)
 	if (!(s->req->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    s->req->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (s->si[0].conn.xprt && s->si[0].conn.xprt->rcv_pipe && s->si[0].conn.xprt->snd_pipe) &&
-	    (s->si[1].conn.xprt && s->si[1].conn.xprt->rcv_pipe && s->si[1].conn.xprt->snd_pipe) &&
+	    (s->si[0].conn->xprt && s->si[0].conn->xprt->rcv_pipe && s->si[0].conn->xprt->snd_pipe) &&
+	    (s->si[1].conn->xprt && s->si[1].conn->xprt->rcv_pipe && s->si[1].conn->xprt->snd_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_REQ) ||
 	     (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2118,7 +2151,7 @@ struct task *process_session(struct task *t)
 				 */
 				s->req->cons->state = SI_ST_REQ; /* new connection requested */
 				s->req->cons->conn_retries = s->be->conn_retries;
-				if (unlikely(s->req->cons->conn.target.type == TARG_TYPE_APPLET &&
+				if (unlikely(s->req->cons->conn->target.type == TARG_TYPE_APPLET &&
 					     !(si_ctrl(s->req->cons) && si_ctrl(s->req->cons)->connect))) {
 					s->req->cons->state = SI_ST_EST; /* connection established */
 					s->rep->flags |= CF_READ_ATTACHED; /* producer is now attached */
@@ -2209,8 +2242,8 @@ struct task *process_session(struct task *t)
 	if (!(s->rep->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    s->rep->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (s->si[0].conn.xprt && s->si[0].conn.xprt->rcv_pipe && s->si[0].conn.xprt->snd_pipe) &&
-	    (s->si[1].conn.xprt && s->si[1].conn.xprt->rcv_pipe && s->si[1].conn.xprt->snd_pipe) &&
+	    (s->si[0].conn->xprt && s->si[0].conn->xprt->rcv_pipe && s->si[0].conn->xprt->snd_pipe) &&
+	    (s->si[1].conn->xprt && s->si[1].conn->xprt->rcv_pipe && s->si[1].conn->xprt->snd_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_RTR) ||
 	     (((s->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2272,24 +2305,22 @@ struct task *process_session(struct task *t)
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) ||
 		      (global.mode & MODE_VERBOSE)))) {
-		int len;
-
 		if (s->si[1].state == SI_ST_CLO &&
 		    s->si[1].prev_state == SI_ST_EST) {
-			len = sprintf(trash, "%08x:%s.srvcls[%04x:%04x]\n",
+			chunk_printf(&trash, "%08x:%s.srvcls[%04x:%04x]\n",
 				      s->uniq_id, s->be->id,
 				      (unsigned short)si_fd(&s->si[0]),
 				      (unsigned short)si_fd(&s->si[1]));
-			if (write(1, trash, len) < 0) /* shut gcc warning */;
+			if (write(1, trash.str, trash.len) < 0) /* shut gcc warning */;
 		}
 
 		if (s->si[0].state == SI_ST_CLO &&
 		    s->si[0].prev_state == SI_ST_EST) {
-			len = sprintf(trash, "%08x:%s.clicls[%04x:%04x]\n",
+			chunk_printf(&trash, "%08x:%s.clicls[%04x:%04x]\n",
 				      s->uniq_id, s->be->id,
 				      (unsigned short)si_fd(&s->si[0]),
 				      (unsigned short)si_fd(&s->si[1]));
-			if (write(1, trash, len) < 0) /* shut gcc warning */;
+			if (write(1, trash.str, trash.len) < 0) /* shut gcc warning */;
 		}
 	}
 
@@ -2299,10 +2330,10 @@ struct task *process_session(struct task *t)
 		if ((s->fe->options & PR_O_CONTSTATS) && (s->flags & SN_BE_ASSIGNED))
 			session_process_counters(s);
 
-		if (s->rep->cons->state == SI_ST_EST && s->rep->cons->conn.target.type != TARG_TYPE_APPLET)
+		if (s->rep->cons->state == SI_ST_EST && s->rep->cons->conn->target.type != TARG_TYPE_APPLET)
 			si_update(s->rep->cons);
 
-		if (s->req->cons->state == SI_ST_EST && s->req->cons->conn.target.type != TARG_TYPE_APPLET)
+		if (s->req->cons->state == SI_ST_EST && s->req->cons->conn->target.type != TARG_TYPE_APPLET)
 			si_update(s->req->cons);
 
 		s->req->flags &= ~(CF_READ_NULL|CF_READ_PARTIAL|CF_WRITE_NULL|CF_WRITE_PARTIAL|CF_READ_ATTACHED);
@@ -2329,12 +2360,12 @@ struct task *process_session(struct task *t)
 		/* Call the stream interfaces' I/O handlers when embedded.
 		 * Note that this one may wake the task up again.
 		 */
-		if (s->req->cons->conn.target.type == TARG_TYPE_APPLET ||
-		    s->rep->cons->conn.target.type == TARG_TYPE_APPLET) {
-			if (s->req->cons->conn.target.type == TARG_TYPE_APPLET)
-				s->req->cons->conn.target.ptr.a->fct(s->req->cons);
-			if (s->rep->cons->conn.target.type == TARG_TYPE_APPLET)
-				s->rep->cons->conn.target.ptr.a->fct(s->rep->cons);
+		if (s->req->cons->conn->target.type == TARG_TYPE_APPLET ||
+		    s->rep->cons->conn->target.type == TARG_TYPE_APPLET) {
+			if (s->req->cons->conn->target.type == TARG_TYPE_APPLET)
+				s->req->cons->conn->target.ptr.a->fct(s->req->cons);
+			if (s->rep->cons->conn->target.type == TARG_TYPE_APPLET)
+				s->rep->cons->conn->target.ptr.a->fct(s->rep->cons);
 			if (task_in_rq(t)) {
 				/* If we woke up, we don't want to requeue the
 				 * task to the wait queue, but rather requeue
@@ -2392,11 +2423,10 @@ struct task *process_session(struct task *t)
 
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)))) {
-		int len;
-		len = sprintf(trash, "%08x:%s.closed[%04x:%04x]\n",
+		chunk_printf(&trash, "%08x:%s.closed[%04x:%04x]\n",
 			      s->uniq_id, s->be->id,
 			      (unsigned short)si_fd(s->req->prod), (unsigned short)si_fd(s->req->cons));
-		if (write(1, trash, len) < 0) /* shut gcc warning */;
+		if (write(1, trash.str, trash.len) < 0) /* shut gcc warning */;
 	}
 
 	s->logs.t_close = tv_ms_elapsed(&s->logs.tv_accept, &now);
@@ -2571,7 +2601,7 @@ acl_fetch_src_get_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned 
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -2631,7 +2661,7 @@ acl_fetch_src_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned 
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -2692,7 +2722,7 @@ acl_fetch_src_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned 
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -2748,7 +2778,7 @@ acl_fetch_src_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsigned 
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -2809,7 +2839,7 @@ acl_fetch_src_conn_rate(struct proxy *px, struct session *l4, void *l7, unsigned
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -2829,7 +2859,7 @@ acl_fetch_src_updt_conn_cnt(struct proxy *px, struct session *l4, void *l7, unsi
 	struct stktable_key *key;
 	void *ptr;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -2898,7 +2928,7 @@ acl_fetch_src_conn_cur(struct proxy *px, struct session *l4, void *l7, unsigned 
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -2954,7 +2984,7 @@ acl_fetch_src_sess_cnt(struct proxy *px, struct session *l4, void *l7, unsigned 
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3015,7 +3045,7 @@ acl_fetch_src_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3071,7 +3101,7 @@ acl_fetch_src_http_req_cnt(struct proxy *px, struct session *l4, void *l7, unsig
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3132,7 +3162,7 @@ acl_fetch_src_http_req_rate(struct proxy *px, struct session *l4, void *l7, unsi
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3188,7 +3218,7 @@ acl_fetch_src_http_err_cnt(struct proxy *px, struct session *l4, void *l7, unsig
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3249,7 +3279,7 @@ acl_fetch_src_http_err_rate(struct proxy *px, struct session *l4, void *l7, unsi
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3310,7 +3340,7 @@ acl_fetch_src_kbytes_in(struct proxy *px, struct session *l4, void *l7, unsigned
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3373,7 +3403,7 @@ acl_fetch_src_bytes_in_rate(struct proxy *px, struct session *l4, void *l7, unsi
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3434,7 +3464,7 @@ acl_fetch_src_kbytes_out(struct proxy *px, struct session *l4, void *l7, unsigne
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 
@@ -3497,7 +3527,7 @@ acl_fetch_src_bytes_out_rate(struct proxy *px, struct session *l4, void *l7, uns
 {
 	struct stktable_key *key;
 
-	key = addr_to_stktable_key(&l4->si[0].conn.addr.from);
+	key = addr_to_stktable_key(&l4->si[0].conn->addr.from);
 	if (!key)
 		return 0;
 

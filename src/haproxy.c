@@ -77,6 +77,7 @@
 #include <proto/backend.h>
 #include <proto/channel.h>
 #include <proto/checks.h>
+#include <proto/connection.h>
 #include <proto/fd.h>
 #include <proto/hdr_idx.h>
 #include <proto/listener.h>
@@ -154,8 +155,7 @@ static int *oldpids = NULL;
 static int oldpids_sig; /* use USR1 or TERM */
 
 /* this is used to drain data, and as a temporary buffer for sprintf()... */
-char *trash = NULL;
-int trashlen = BUFSIZE;
+struct chunk trash = { };
 
 /* this buffer is always the same size as standard buffers and is used for
  * swapping data inside a buffer.
@@ -345,37 +345,37 @@ void sig_dump_state(struct sig_handler *sh)
 
 		send_log(p, LOG_NOTICE, "SIGHUP received, dumping servers states for proxy %s.\n", p->id);
 		while (s) {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %lld tot.",
-				 p->id, s->id,
-				 (s->state & SRV_RUNNING) ? "UP" : "DOWN",
-				 s->cur_sess, s->nbpend, s->counters.cum_sess);
-			Warning("%s\n", trash);
-			send_log(p, LOG_NOTICE, "%s\n", trash);
+			chunk_printf(&trash,
+			             "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %lld tot.",
+			             p->id, s->id,
+			             (s->state & SRV_RUNNING) ? "UP" : "DOWN",
+			             s->cur_sess, s->nbpend, s->counters.cum_sess);
+			Warning("%s\n", trash.str);
+			send_log(p, LOG_NOTICE, "%s\n", trash.str);
 			s = s->next;
 		}
 
 		/* FIXME: those info are a bit outdated. We should be able to distinguish between FE and BE. */
 		if (!p->srv) {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
-				 p->id,
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			chunk_printf(&trash,
+			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             p->id,
+			             p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 		} else if (p->srv_act == 0) {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
-				 p->id,
-				 (p->srv_bck) ? "is running on backup servers" : "has no server available",
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			chunk_printf(&trash,
+			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             p->id,
+			             (p->srv_bck) ? "is running on backup servers" : "has no server available",
+			             p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 		} else {
-			snprintf(trash, trashlen,
-				 "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
-				 " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
-				 p->id, p->srv_act, p->srv_bck,
-				 p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			chunk_printf(&trash,
+			             "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
+			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             p->id, p->srv_act, p->srv_bck,
+			             p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 		}
-		Warning("%s\n", trash);
-		send_log(p, LOG_NOTICE, "%s\n", trash);
+		Warning("%s\n", trash.str);
+		send_log(p, LOG_NOTICE, "%s\n", trash.str);
 
 		p = p->next;
 	}
@@ -401,8 +401,9 @@ void init(int argc, char **argv)
 	struct wordlist *wl;
 	char *progname;
 	char *change_dir = NULL;
+	struct tm curtime;
 
-	trash = malloc(trashlen);
+	chunk_init(&trash, malloc(global.tune.bufsize), global.tune.bufsize);
 
 	/* NB: POSIX does not make it mandatory for gethostname() to NULL-terminate
 	 * the string in case of truncation, and at least FreeBSD appears not to do
@@ -427,9 +428,14 @@ void init(int argc, char **argv)
 	tv_update_date(-1,-1);
 	start_date = now;
 
+	/* Get the numeric timezone. */
+	get_localtime(start_date.tv_sec, &curtime);
+	strftime(localtimezone, 6, "%z", &curtime);
+
 	signal_init();
 	init_task();
 	init_session();
+	init_connection();
 	/* warning, we init buffers later */
 	init_pendconn();
 	init_proto_http();
@@ -710,9 +716,16 @@ void init(int argc, char **argv)
 	if (arg_mode & (MODE_DEBUG | MODE_FOREGROUND)) {
 		/* command line debug mode inhibits configuration mode */
 		global.mode &= ~(MODE_DAEMON | MODE_QUIET);
+		global.mode |= (arg_mode & (MODE_DEBUG | MODE_FOREGROUND));
 	}
-	global.mode |= (arg_mode & (MODE_DAEMON | MODE_FOREGROUND | MODE_QUIET |
-				    MODE_VERBOSE | MODE_DEBUG ));
+
+	if (arg_mode & MODE_DAEMON) {
+		/* command line daemon mode inhibits foreground and debug modes mode */
+		global.mode &= ~(MODE_DEBUG | MODE_FOREGROUND);
+		global.mode |= (arg_mode & MODE_DAEMON);
+	}
+
+	global.mode |= (arg_mode & (MODE_QUIET | MODE_VERBOSE));
 
 	if ((global.mode & MODE_DEBUG) && (global.mode & (MODE_DAEMON | MODE_QUIET))) {
 		Warning("<debug> mode incompatible with <quiet> and <daemon>. Keeping <debug> only.\n");
@@ -729,6 +742,11 @@ void init(int argc, char **argv)
 		global.nbproc = 1;
 
 	swap_buffer = (char *)calloc(1, global.tune.bufsize);
+	sample_trash_buf1 = (char *)calloc(1, global.tune.bufsize);
+	sample_trash_buf2 = (char *)calloc(1, global.tune.bufsize);
+	get_http_auth_buff = (char *)calloc(1, global.tune.bufsize);
+	static_table_key = calloc(1, sizeof(*static_table_key) + global.tune.bufsize);
+
 
 	fdinfo = (struct fdinfo *)calloc(1,
 				       sizeof(struct fdinfo) * (global.maxsock));
@@ -1115,6 +1133,7 @@ void deinit(void)
 	}
 
 	pool_destroy2(pool2_session);
+	pool_destroy2(pool2_connection);
 	pool_destroy2(pool2_buffer);
 	pool_destroy2(pool2_channel);
 	pool_destroy2(pool2_requri);
