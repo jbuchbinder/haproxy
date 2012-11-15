@@ -35,6 +35,7 @@
 #include <types/capture.h>
 #include <types/compression.h>
 #include <types/global.h>
+#include <types/obj_type.h>
 #include <types/peers.h>
 
 #include <proto/acl.h>
@@ -265,6 +266,7 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 
 		for (; port <= end; port++) {
 			l = (struct listener *)calloc(1, sizeof(struct listener));
+			l->obj_type = OBJ_TYPE_LISTENER;
 			LIST_ADDQ(&curproxy->conf.listeners, &l->by_fe);
 			LIST_ADDQ(&bind_conf->listeners, &l->by_bind);
 			l->frontend = curproxy;
@@ -514,9 +516,6 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	else if (!strcmp(args[0], "noepoll")) {
 		global.tune.options &= ~GTUNE_USE_EPOLL;
 	}
-	else if (!strcmp(args[0], "nosepoll")) {
-		global.tune.options &= ~GTUNE_USE_SEPOLL;
-	}
 	else if (!strcmp(args[0], "nokqueue")) {
 		global.tune.options &= ~GTUNE_USE_KQUEUE;
 	}
@@ -662,6 +661,66 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.tune.max_http_hdr = atol(args[1]);
 	}
+	else if (!strcmp(args[0], "tune.zlib.memlevel")) {
+#ifdef USE_ZLIB
+		if (*args[1]) {
+			global.tune.zlibmemlevel = atoi(args[1]);
+			if (global.tune.zlibmemlevel < 1 || global.tune.zlibmemlevel > 9) {
+				Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		} else {
+			Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "tune.zlib.windowsize")) {
+#ifdef USE_ZLIB
+		if (*args[1]) {
+			global.tune.zlibwindowsize = atoi(args[1]);
+			if (global.tune.zlibwindowsize < 8 || global.tune.zlibwindowsize > 15) {
+				Alert("parsing [%s:%d] : '%s' expects a numeric value between 8 and 15\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		} else {
+			Alert("parsing [%s:%d] : '%s' expects a numeric value between 8 and 15\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "tune.comp.maxlevel")) {
+		if (*args[1]) {
+			global.tune.comp_maxlevel = atoi(args[1]);
+			if (global.tune.comp_maxlevel < 1 || global.tune.comp_maxlevel > 9) {
+				Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		} else {
+			Alert("parsing [%s:%d] : '%s' expects a numeric value between 1 and 9\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
 	else if (!strcmp(args[0], "uid")) {
 		if (global.uid != 0) {
 			Alert("parsing [%s:%d] : user/uid already specified. Continuing.\n", file, linenum);
@@ -784,6 +843,14 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.cps_lim = atol(args[1]);
 	}
+	else if (!strcmp(args[0], "maxcomprate")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument in kb/s.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.comp_rate_lim = atoi(args[1]) * 1024;
+	}
 	else if (!strcmp(args[0], "maxpipes")) {
 		if (global.maxpipes != 0) {
 			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
@@ -796,6 +863,14 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.maxpipes = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "maxzlibmem")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.maxzlibmem = atol(args[1]);
 	}
 	else if (!strcmp(args[0], "ulimit-n")) {
 		if (global.rlimit_nofile != 0) {
@@ -3961,6 +4036,7 @@ stats_error_parsing:
 			newsrv->conf.file = strdup(file);
 			newsrv->conf.line = linenum;
 
+			newsrv->obj_type = OBJ_TYPE_SERVER;
 			LIST_INIT(&newsrv->actconns);
 			LIST_INIT(&newsrv->pendconns);
 			do_check = 0;
@@ -4626,6 +4702,11 @@ stats_error_parsing:
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
+		if (*(args[2])) {
+			Alert("parsing [%s:%d] : %s expects only one argument, don't forget to escape spaces!\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 		free(curproxy->uniqueid_format_string);
 		curproxy->uniqueid_format_string = strdup(args[1]);
 	}
@@ -4643,6 +4724,11 @@ stats_error_parsing:
 	else if (strcmp(args[0], "log-format") == 0) {
 		if (!*(args[1])) {
 			Alert("parsing [%s:%d] : %s expects an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (*(args[2])) {
+			Alert("parsing [%s:%d] : %s expects only one argument, don't forget to escape spaces!\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -5252,6 +5338,8 @@ stats_error_parsing:
 
 		if (!strcmp(args[1], "algo")) {
 			int cur_arg;
+			struct comp_ctx ctx;
+
 			cur_arg = 2;
 			if (!*args[cur_arg]) {
 				Alert("parsing [%s:%d] : '%s' expects <algorithm>\n",
@@ -5262,6 +5350,14 @@ stats_error_parsing:
 			while (*(args[cur_arg])) {
 				if (comp_append_algo(comp, args[cur_arg]) < 0) {
 					Alert("parsing [%s:%d] : '%s' : '%s' is not a supported algorithm.\n",
+					      file, linenum, args[0], args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				if (curproxy->comp->algos->init(&ctx, 9) == 0) {
+					curproxy->comp->algos->end(&ctx);
+				} else {
+					Alert("parsing [%s:%d] : '%s' : Can't init '%s' algorithm.\n",
 					      file, linenum, args[0], args[cur_arg]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;

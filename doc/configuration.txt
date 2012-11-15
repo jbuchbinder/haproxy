@@ -455,16 +455,17 @@ The following keywords are supported in the "global" section :
  * Performance tuning
    - maxconn
    - maxconnrate
+   - maxcomprate
    - maxpipes
    - maxsslconn
    - noepoll
    - nokqueue
    - nopoll
-   - nosepoll
    - nosplice
    - spread-checks
    - tune.bufsize
    - tune.chksize
+   - tune.comp.maxlevel
    - tune.http.maxhdr
    - tune.maxaccept
    - tune.maxpollevents
@@ -474,6 +475,8 @@ The following keywords are supported in the "global" section :
    - tune.rcvbuf.server
    - tune.sndbuf.client
    - tune.sndbuf.server
+   - tune.zlib.memlevel
+   - tune.zlib.windowsize
 
  * Debugging
    - debug
@@ -669,6 +672,15 @@ maxconnrate <number>
   value close to its expected share. Also, lowering tune.maxaccept can improve
   fairness.
 
+maxcomprate <number>
+  Sets the maximum per-process input compression rate to <number> kilobytes
+  pers second.  For each session, if the maximum is reached, the compression
+  level will be decreased during the session. If the maximum is reached at the
+  beginning of a session, the session will not compress at all. If the maximum
+  is not reached, the compression level will be increased up to
+  tune.comp.maxlevel.  A value of zero means there is no limit, this is the
+  default value.
+
 maxpipes <number>
   Sets the maximum per-process number of pipes to <number>. Currently, pipes
   are only used by kernel-based tcp splicing. Since a pipe contains two file
@@ -686,10 +698,16 @@ maxsslconn <number>
   that the limit applies both to incoming and outgoing connections, so one
   connection which is deciphered then ciphered accounts for 2 SSL connections.
 
+maxzlibmem <number>
+  Sets the maximum amount of RAM in megabytes per process usable by the zlib.
+  When the maximum amount is reached, future sessions will not compress as long
+  as RAM is unavailable. When sets to 0, there is no limit.
+  The default value is 0.
+
 noepoll
   Disables the use of the "epoll" event polling system on Linux. It is
   equivalent to the command-line argument "-de". The next polling system
-  used will generally be "poll". See also "nosepoll", and "nopoll".
+  used will generally be "poll". See also "nopoll".
 
 nokqueue
   Disables the use of the "kqueue" event polling system on BSD. It is
@@ -700,13 +718,7 @@ nopoll
   Disables the use of the "poll" event polling system. It is equivalent to the
   command-line argument "-dp". The next polling system used will be "select".
   It should never be needed to disable "poll" since it's available on all
-  platforms supported by HAProxy. See also "nosepoll", and "nopoll" and
-  "nokqueue".
-
-nosepoll
-  Disables the use of the "speculative epoll" event polling system on Linux. It
-  is equivalent to the command-line argument "-ds". The next polling system
-  used will generally be "epoll". See also "nosepoll", and "nopoll".
+  platforms supported by HAProxy. See also "nokqueue" and "noepoll".
 
 nosplice
   Disables the use of kernel tcp splicing between sockets on Linux. It is
@@ -744,6 +756,12 @@ tune.chksize <number>
   more memory and CPU usage. The default value is 16384 and can be changed at
   build time. It is not recommended to change this value, but to use better
   checks whenever possible.
+
+tune.comp.maxlevel <number>
+  Sets the maximum compression level. The compression level affects CPU
+  usage during compression. This value affects CPU usage during compression.
+  Each session using compression initializes the compression algorithm with
+  this value. The default value is 1.
 
 tune.http.maxhdr <number>
   Sets the maximum number of headers in a request. When a request comes with a
@@ -816,6 +834,18 @@ tune.sndbuf.server <number>
   to the kernel waiting for a large part of the buffer to be read before
   notifying haproxy again.
 
+tune.zlib.memlevel <number>
+  Sets the memLevel parameter in zlib initialization for each session. It
+  defines how much memory should be allocated for the intenal compression
+  state. A value of 1 uses minimum memory but is slow and reduces compression
+  ratio, a value of 9 uses maximum memory for optimal speed.  Can be a value
+  between 1 and 9. The default value is 8.
+
+tune.zlib.windowsize <number>
+  Sets the window size (the size of the history buffer) as a parameter of the
+  zlib initialization for each session. Larger values of this parameter result
+  in better compression at the expense of memory usage.  Can be a value between
+  8 and 15.  The default value is 15.
 
 3.3. Debugging
 --------------
@@ -1778,16 +1808,34 @@ clitimeout <timeout> (deprecated)
   See also : "timeout client", "timeout http-request", "timeout server", and
              "srvtimeout".
 
-compression algo [ gzip ] ...
-compression type ...
+compression algo <algorithm> ...
+compression type <mime type> ...
 compression offload
   Enable HTTP compression.
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   yes
   Arguments :
-    algo  is followed by the list of supported compression algorithms.
-    type  is followed by the list of MIME types that will be compressed.
-    offload makes haproxy work as a compression offloader only (see notes).
+    algo     is followed by the list of supported compression algorithms.
+    type     is followed by the list of MIME types that will be compressed.
+    offload  makes haproxy work as a compression offloader only (see notes).
+
+  The currently supported algorithms are :
+    identity  this is mostly for debugging, and it was useful for developping
+              the compression feature. Identity does not apply any change on
+              data.
+
+    gzip      applies gzip compression. This setting is only available when
+              support for zlib was built in.
+
+    deflate   same as gzip, but with deflate algorithm and zlib format.
+              Note that this algorithm has ambiguous support on many browsers
+              and no support at all from recent ones. It is strongly
+              recommended not to use it for anything else than experimentation.
+              This setting is only available when support for zlib was built
+              in.
+
+  Compression will be activated depending of the Accept-Encoding request
+  header. With identity, it does not take care of that header.
 
   The "offload" setting makes haproxy remove the Accept-Encoding header to
   prevent backend servers from compressing responses. It is strongly
@@ -4349,7 +4397,7 @@ redirect scheme   <sch> [code <code>] <option> [{if | unless} <condition>]
         redirect code 301 prefix / drop-query append-slash if missing_slash
 
   Example: redirect all HTTP traffic to HTTPS when SSL is handled by haproxy.
-        redirect scheme https if !{ is_ssl }
+        redirect scheme https if !{ ssl_fc }
 
   See section 7 about ACL usage.
 
@@ -9322,8 +9370,8 @@ The list of currently supported pattern fetch functions is the following :
                haproxy -vv). See also the "npn" bind keyword.
 
   ssl_fc_protocol
-               Returns the name of the used protocol when the incoming connection
-               was made over an SSL/TLS transport layer.
+               Returns the name of the used protocol when the incoming
+               connection was made over an SSL/TLS transport layer.
 
   ssl_fc_session_id
                Returns the SSL ID of the front connection when the incoming
@@ -11082,6 +11130,11 @@ set rate-limit connections global <value>
   'maxconnrate' setting. A value of zero disables the limitation. This limit
   applies to all frontends and the change has an immediate effect. The value
   is passed in number of connections per second.
+
+set rate-limit http-compression global <value>
+  Change the maximum input compression rate, which is set by the global
+  'maxcomprate' setting. A value of zero disables the limitation. The value is
+  passed in number of kilobytes per second.
 
 set table <table> key <key> data.<data_type> <value>
   Create or update a stick-table entry in the table. If the key is not present,

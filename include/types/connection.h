@@ -28,6 +28,7 @@
 #include <common/config.h>
 
 #include <types/listener.h>
+#include <types/obj_type.h>
 #include <types/protocol.h>
 
 /* referenced below */
@@ -55,29 +56,18 @@ struct task;
  * - Stopping an I/O event consists in ANDing with ~1.
  * - Polling for an I/O event consists in ORing with ~3.
  *
- * The last computed state is remembered in CO_FL_CURR_* so that differential
+ * The last ENA state is remembered in CO_FL_CURR_* so that differential
  * changes can be applied. After bits are applied, the POLL status bits are
  * cleared so that it is possible to detect when an EAGAIN was encountered. For
  * pollers that do not support speculative I/O, POLLED is the same as ENABLED
  * and the POL flag can safely be ignored. However it makes a difference for
  * the connection handler.
  *
- * The ENA flags are per-layer (one pair for SOCK, another one for DATA).
- * The POL flags are only for the socket layer since they indicate that EAGAIN
- * was encountered. Thus, the DATA layer uses its own ENA flag and the socket
- * layer's POL flag.
- *
- * The bits are arranged so that it is possible to detect a change by performing
- * only a left shift followed by a xor and applying a mask to the result. The
- * principle is that depending on what we want to check (data polling changes or
- * sock polling changes), we mask different bits. The bits are arranged this way :
- *
- *    S(ock) - W(ait) - C(urr) - P(oll) - D(ata)
- *
- * SOCK changes are reported when (S != C) || (W != P) => (S:W) != (C:P)
- * DATA changes are reported when (D != C) || (W != P) => (W:C) != (P:D)
- * The R and W bits are split apart so that we never shift more than 2 bits at
- * a time, allowing move+shift to be done as a single operation on x86.
+ * The ENA flags are per-layer (one pair for SOCK, another one for DATA). The
+ * POL flags are irrelevant to these layers and only reflect the fact that
+ * EAGAIN was encountered, they're materialised by the CO_FL_WAIT_* connection
+ * flags. POL flags always indicate a polling change because it is assumed that
+ * the poller uses a cache and does not always poll.
  */
 
 /* flags for use in connection->flags */
@@ -85,16 +75,15 @@ enum {
 	CO_FL_NONE          = 0x00000000,  /* Just for initialization purposes */
 
 	/* Do not change these values without updating conn_*_poll_changes() ! */
-	CO_FL_DATA_RD_ENA   = 0x00000001,  /* receiving data is allowed */
-	CO_FL_CURR_RD_POL   = 0x00000002,  /* receiving needs to poll first */
+	CO_FL_SOCK_RD_ENA   = 0x00000001,  /* receiving handshakes is allowed */
+	CO_FL_DATA_RD_ENA   = 0x00000002,  /* receiving data is allowed */
 	CO_FL_CURR_RD_ENA   = 0x00000004,  /* receiving is currently allowed */
 	CO_FL_WAIT_RD       = 0x00000008,  /* receiving needs to poll first */
-	CO_FL_SOCK_RD_ENA   = 0x00000010,  /* receiving handshakes is allowed */
+
+	CO_FL_SOCK_WR_ENA   = 0x00000010,  /* sending handshakes is desired */
 	CO_FL_DATA_WR_ENA   = 0x00000020,  /* sending data is desired */
-	CO_FL_CURR_WR_POL   = 0x00000040,  /* sending needs to poll first */
-	CO_FL_CURR_WR_ENA   = 0x00000080,  /* sending is currently desired */
-	CO_FL_WAIT_WR       = 0x00000100,  /* sending needs to poll first */
-	CO_FL_SOCK_WR_ENA   = 0x00000200,  /* sending handshakes is desired */
+	CO_FL_CURR_WR_ENA   = 0x00000040,  /* sending is currently desired */
+	CO_FL_WAIT_WR       = 0x00000080,  /* sending needs to poll first */
 
 	/* These flags are used by data layers to indicate they had to stop
 	 * sending data because a buffer was empty (WAIT_DATA) or stop receiving
@@ -153,17 +142,6 @@ enum {
 	CO_FL_XPRT_TRACKED  = 0x80000000,
 };
 
-/* target types */
-enum {
-	TARG_TYPE_NONE = 0,         /* no target set, pointer is NULL by definition */
-	TARG_TYPE_CLIENT,           /* target is a client, pointer is NULL by definition */
-	TARG_TYPE_PROXY,            /* target is a proxy   ; use address with the proxy's settings */
-	TARG_TYPE_SERVER,           /* target is a server  ; use address with server's and its proxy's settings */
-	TARG_TYPE_APPLET,           /* target is an applet ; use only the applet */
-	TARG_TYPE_TASK,             /* target is a task running an external applet */
-};
-
-
 /* xprt_ops describes transport-layer operations for a connection. They
  * generally run over a socket-based control layer, but not always. Some
  * of them are used for data transfer with the upper layer (rcv_*, snd_*)
@@ -197,19 +175,6 @@ struct data_cb {
 	int  (*init)(struct connection *conn);  /* data-layer initialization */
 };
 
-/* a target describes what is on the remote side of the connection. */
-struct target {
-	int type;
-	union {
-		void *v;              /* pointer value, for any type */
-		struct proxy *p;      /* when type is TARG_TYPE_PROXY  */
-		struct server *s;     /* when type is TARG_TYPE_SERVER */
-		struct si_applet *a;  /* when type is TARG_TYPE_APPLET */
-		struct task *t;       /* when type is TARG_TYPE_TASK */
-		struct listener *l;   /* when type is TARG_TYPE_CLIENT */
-	} ptr;
-} __attribute__((packed));
-
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
  * socket, and can also be made to an internal applet. It can support
@@ -230,7 +195,7 @@ struct connection {
 			int fd;       /* file descriptor for a stream driver when known */
 		} sock;
 	} t;
-	struct target target;         /* the target to connect to (server, proxy, applet, ...) */
+	enum obj_type *target;        /* the target to connect to (server, proxy, applet, ...) */
 	struct {
 		struct sockaddr_storage from;	/* client address, or address to spoof when connecting to the server */
 		struct sockaddr_storage to;	/* address reached by the client, or address to connect to */

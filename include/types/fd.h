@@ -25,13 +25,13 @@
 #include <common/config.h>
 #include <types/port_range.h>
 
+/* Direction for each FD event update */
 enum {
 	DIR_RD=0,
 	DIR_WR=1,
-	DIR_SIZE
 };
 
-/*
+/* Polling status flags returned in fdtab[].ev :
  * FD_POLL_IN remains set as long as some data is pending for read.
  * FD_POLL_OUT remains set as long as the fd accepts to write data.
  * FD_POLL_ERR and FD_POLL_ERR remain set forever (until processed).
@@ -45,6 +45,26 @@ enum {
 #define FD_POLL_DATA    (FD_POLL_IN  | FD_POLL_OUT)
 #define FD_POLL_STICKY  (FD_POLL_ERR | FD_POLL_HUP)
 
+/* Event state for an FD in each direction, as found in the 4 lower bits of
+ * fdtab[].spec_e, and in the 4 next bits.
+ */
+#define FD_EV_ACTIVE    1U
+#define FD_EV_POLLED    4U
+#define FD_EV_STATUS    (FD_EV_ACTIVE | FD_EV_POLLED)
+#define FD_EV_STATUS_R  (FD_EV_STATUS)
+#define FD_EV_STATUS_W  (FD_EV_STATUS << 1)
+
+#define FD_EV_POLLED_R  (FD_EV_POLLED)
+#define FD_EV_POLLED_W  (FD_EV_POLLED << 1)
+#define FD_EV_POLLED_RW (FD_EV_POLLED_R | FD_EV_POLLED_W)
+
+#define FD_EV_ACTIVE_R  (FD_EV_ACTIVE)
+#define FD_EV_ACTIVE_W  (FD_EV_ACTIVE << 1)
+#define FD_EV_ACTIVE_RW (FD_EV_ACTIVE_R | FD_EV_ACTIVE_W)
+
+#define FD_EV_CURR_MASK 0x0FU
+#define FD_EV_PREV_MASK 0xF0U
+
 /* info about one given fd */
 struct fdtab {
 	int (*iocb)(int fd);                 /* I/O handler, returns FD_WAIT_* */
@@ -52,6 +72,8 @@ struct fdtab {
 	unsigned int  spec_p;                /* speculative polling: position in spec list+1. 0=not in list. */
 	unsigned char spec_e;                /* speculative polling: read and write events status. 4 bits */
 	unsigned char ev;                    /* event seen in return of poll() : FD_POLL_* */
+	unsigned char new:1;                 /* 1 if this fd has just been created */
+	unsigned char updated:1;             /* 1 if this fd is already in the update list */
 };
 
 /* less often used information */
@@ -70,18 +92,12 @@ struct fdinfo {
  *    poller should set it to 100.
  *  - <private> is initialized by the poller's init() function, and cleaned by
  *    the term() function.
- *  - clo() should be used to do indicate the poller that fd will be closed. It
- *    may be the same as rem() on some pollers.
+ *  - clo() should be used to do indicate the poller that fd will be closed.
  *  - poll() calls the poller, expiring at <exp>
  */
 struct poller {
 	void   *private;                                     /* any private data for the poller */
-	int  REGPRM2 (*is_set)(const int fd, int dir);       /* check if <fd> is being polled for dir <dir> */
-	void REGPRM2    (*set)(const int fd, int dir);       /* set   polling on <fd> for <dir> */
-	void REGPRM2    (*clr)(const int fd, int dir);       /* clear polling on <fd> for <dir> */
-	void REGPRM2    (*wai)(const int fd, int dir);       /* wait for polling on <fd> for <dir> */
-	void REGPRM1    (*rem)(const int fd);                /* remove any polling on <fd> */
-	void REGPRM1    (*clo)(const int fd);                /* mark <fd> as closed */
+	void REGPRM1   (*clo)(const int fd);                 /* mark <fd> as closed */
     	void REGPRM2   (*poll)(struct poller *p, int exp);   /* the poller itself */
 	int  REGPRM1   (*init)(struct poller *p);            /* poller initialization */
 	void REGPRM1   (*term)(struct poller *p);            /* termination of this poller */

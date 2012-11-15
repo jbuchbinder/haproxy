@@ -125,7 +125,7 @@ int ssl_sock_verifycbk(int ok, X509_STORE_CTX *x_store)
 			conn->xprt_st |= SSL_SOCK_CAEDEPTH_TO_ST(depth);
 		}
 
-		if (target_client(&conn->target)->bind_conf->ca_ignerr & (1ULL << err))
+		if (objt_listener(conn->target)->bind_conf->ca_ignerr & (1ULL << err))
 			return 1;
 
 		return 0;
@@ -135,7 +135,7 @@ int ssl_sock_verifycbk(int ok, X509_STORE_CTX *x_store)
 		conn->xprt_st |= SSL_SOCK_CRTERROR_TO_ST(err);
 
 	/* check if certificate error needs to be ignored */
-	if (target_client(&conn->target)->bind_conf->crt_ignerr & (1ULL << err))
+	if (objt_listener(conn->target)->bind_conf->crt_ignerr & (1ULL << err))
 		return 1;
 
 	return 0;
@@ -798,15 +798,15 @@ static int ssl_sock_init(struct connection *conn)
 
 	/* If it is in client mode initiate SSL session
 	   in connect state otherwise accept state */
-	if (target_srv(&conn->target)) {
+	if (objt_server(conn->target)) {
 		/* Alloc a new SSL session ctx */
-		conn->xprt_ctx = SSL_new(target_srv(&conn->target)->ssl_ctx.ctx);
+		conn->xprt_ctx = SSL_new(objt_server(conn->target)->ssl_ctx.ctx);
 		if (!conn->xprt_ctx)
 			return -1;
 
 		SSL_set_connect_state(conn->xprt_ctx);
-		if (target_srv(&conn->target)->ssl_ctx.reused_sess)
-			SSL_set_session(conn->xprt_ctx, target_srv(&conn->target)->ssl_ctx.reused_sess);
+		if (objt_server(conn->target)->ssl_ctx.reused_sess)
+			SSL_set_session(conn->xprt_ctx, objt_server(conn->target)->ssl_ctx.reused_sess);
 
 		/* set fd on SSL session context */
 		SSL_set_fd(conn->xprt_ctx, conn->t.sock.fd);
@@ -817,9 +817,9 @@ static int ssl_sock_init(struct connection *conn)
 		sslconns++;
 		return 0;
 	}
-	else if (target_client(&conn->target)) {
+	else if (objt_listener(conn->target)) {
 		/* Alloc a new SSL session ctx */
-		conn->xprt_ctx = SSL_new(target_client(&conn->target)->bind_conf->default_ctx);
+		conn->xprt_ctx = SSL_new(objt_listener(conn->target)->bind_conf->default_ctx);
 		if (!conn->xprt_ctx)
 			return -1;
 
@@ -854,6 +854,61 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 
 	if (!conn->xprt_ctx)
 		goto out_error;
+
+	/* If we use SSL_do_handshake to process a reneg initiated by
+	 * the remote peer, it sometimes returns SSL_ERROR_SSL.
+	 * Usually SSL_write and SSL_read are used and process implicitly
+	 * the reneg handshake.
+	 * Here we use SSL_peek as a workaround for reneg.
+	 */
+	if ((conn->flags & CO_FL_CONNECTED) && SSL_renegotiate_pending(conn->xprt_ctx)) {
+		char c;
+
+		ret = SSL_peek(conn->xprt_ctx, &c, 1);
+		if (ret <= 0) {
+			/* handshake may have not been completed, let's find why */
+			ret = SSL_get_error(conn->xprt_ctx, ret);
+			if (ret == SSL_ERROR_WANT_WRITE) {
+				/* SSL handshake needs to write, L4 connection may not be ready */
+				__conn_sock_stop_recv(conn);
+				__conn_sock_poll_send(conn);
+				return 0;
+			}
+			else if (ret == SSL_ERROR_WANT_READ) {
+				/* handshake may have been completed but we have
+				 * no more data to read.
+                                 */
+				if (!SSL_renegotiate_pending(conn->xprt_ctx)) {
+					ret = 1;
+					goto reneg_ok;
+				}
+				/* SSL handshake needs to read, L4 connection is ready */
+				if (conn->flags & CO_FL_WAIT_L4_CONN)
+					conn->flags &= ~CO_FL_WAIT_L4_CONN;
+				__conn_sock_stop_send(conn);
+				__conn_sock_poll_recv(conn);
+				return 0;
+			}
+			else if (ret == SSL_ERROR_SYSCALL) {
+				/* if errno is null, then connection was successfully established */
+				if (!errno && conn->flags & CO_FL_WAIT_L4_CONN)
+					conn->flags &= ~CO_FL_WAIT_L4_CONN;
+				goto out_error;
+			}
+			else {
+				/* Fail on all other handshake errors */
+				/* Note: OpenSSL may leave unread bytes in the socket's
+				 * buffer, causing an RST to be emitted upon close() on
+				 * TCP sockets. We first try to drain possibly pending
+				 * data to avoid this as much as possible.
+				 */
+				ret = recv(conn->t.sock.fd, trash.str, trash.size, MSG_NOSIGNAL|MSG_DONTWAIT);
+				goto out_error;
+			}
+		}
+		/* read some data: consider handshake completed */
+		goto reneg_ok;
+	}
 
 	ret = SSL_do_handshake(conn->xprt_ctx);
 	if (ret != 1) {
@@ -892,14 +947,16 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 		}
 	}
 
+reneg_ok:
+
 	/* Handshake succeeded */
-	if (target_srv(&conn->target)) {
+	if (objt_server(conn->target)) {
 		if (!SSL_session_reused(conn->xprt_ctx)) {
 			/* check if session was reused, if not store current session on server for reuse */
-			if (target_srv(&conn->target)->ssl_ctx.reused_sess)
-				SSL_SESSION_free(target_srv(&conn->target)->ssl_ctx.reused_sess);
+			if (objt_server(conn->target)->ssl_ctx.reused_sess)
+				SSL_SESSION_free(objt_server(conn->target)->ssl_ctx.reused_sess);
 
-			target_srv(&conn->target)->ssl_ctx.reused_sess = SSL_get1_session(conn->xprt_ctx);
+			objt_server(conn->target)->ssl_ctx.reused_sess = SSL_get1_session(conn->xprt_ctx);
 		}
 	}
 
@@ -909,9 +966,9 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 
  out_error:
 	/* free resumed session if exists */
-	if (target_srv(&conn->target) && target_srv(&conn->target)->ssl_ctx.reused_sess) {
-		SSL_SESSION_free(target_srv(&conn->target)->ssl_ctx.reused_sess);
-		target_srv(&conn->target)->ssl_ctx.reused_sess = NULL;
+	if (objt_server(conn->target) && objt_server(conn->target)->ssl_ctx.reused_sess) {
+		SSL_SESSION_free(objt_server(conn->target)->ssl_ctx.reused_sess);
+		objt_server(conn->target)->ssl_ctx.reused_sess = NULL;
 	}
 
 	/* Fail on all other handshake errors */
@@ -978,12 +1035,18 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 		else {
 			ret =  SSL_get_error(conn->xprt_ctx, ret);
 			if (ret == SSL_ERROR_WANT_WRITE) {
-				/* handshake is running, and it needs to poll for a write event */
+				/* handshake is running, and it needs to enable write */
 				conn->flags |= CO_FL_SSL_WAIT_HS;
-				__conn_sock_poll_send(conn);
+				__conn_sock_want_send(conn);
 				break;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
+				if (SSL_renegotiate_pending(conn->xprt_ctx)) {
+					/* handshake is running, and it may need to re-enable read */
+					conn->flags |= CO_FL_SSL_WAIT_HS;
+					__conn_sock_want_recv(conn);
+					break;
+				}
 				/* we need to poll for retry a read later */
 				__conn_data_poll_recv(conn);
 				break;
@@ -1056,18 +1119,20 @@ static int ssl_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 		else {
 			ret = SSL_get_error(conn->xprt_ctx, ret);
 			if (ret == SSL_ERROR_WANT_WRITE) {
+				if (SSL_renegotiate_pending(conn->xprt_ctx)) {
+					/* handshake is running, and it may need to re-enable write */
+					conn->flags |= CO_FL_SSL_WAIT_HS;
+					__conn_sock_want_send(conn);
+					break;
+				}
 				/* we need to poll to retry a write later */
 				__conn_data_poll_send(conn);
 				break;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
-				/* handshake is running, and
-				   it needs to poll for a read event,
-				   write polling must be disabled cause
-				   we are sure we can't write anything more
-				   before handshake re-performed */
+				/* handshake is running, and it needs to enable read */
 				conn->flags |= CO_FL_SSL_WAIT_HS;
-				__conn_sock_poll_recv(conn);
+				__conn_sock_want_recv(conn);
 				break;
 			}
 			goto out_error;

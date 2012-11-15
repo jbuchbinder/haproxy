@@ -26,6 +26,7 @@
 #include <common/memory.h>
 #include <types/connection.h>
 #include <types/listener.h>
+#include <proto/obj_type.h>
 
 extern struct pool_head *pool2_connection;
 
@@ -96,49 +97,51 @@ void conn_update_data_polling(struct connection *c);
 int conn_local_send_proxy(struct connection *conn, unsigned int flag);
 
 /* inspects c->flags and returns non-zero if DATA ENA changes from the CURR ENA
- * or if the WAIT flags set new flags that were not in CURR POL. Additionally,
+ * or if the WAIT flags are set with their respective ENA flags. Additionally,
  * non-zero is also returned if an error was reported on the connection. This
  * function is used quite often and is inlined. In order to proceed optimally
  * with very little code and CPU cycles, the bits are arranged so that a change
- * can be detected by a simple left shift, a xor, and a mask. This operation
- * detects when POLL:DATA differs from WAIT:CURR. In order to detect the ERROR
- * flag without additional work, we remove it from the copy of the original
- * flags (unshifted) before doing the XOR. This operation is parallelized with
- * the shift and does not induce additional cycles. This explains why we check
- * the error bit shifted left in the mask. Last, the final operation is an AND
- * which the compiler is able to replace with a TEST in boolean conditions. The
- * result is that all these checks are done in 5-6 cycles only and less than 20
- * bytes.
+ * can be detected by a few left shifts, a xor, and a mask. These operations
+ * detect when W&D are both enabled for either direction, when C&D differ for
+ * either direction and when Error is set. The trick consists in first keeping
+ * only the bits we're interested in, since they don't collide when shifted,
+ * and to perform the AND at the end. In practice, the compiler is able to
+ * replace the last AND with a TEST in boolean conditions. This results in
+ * checks that are done in 4-6 cycles and less than 30 bytes.
  */
 static inline unsigned int conn_data_polling_changes(const struct connection *c)
 {
-	unsigned int f = c->flags << 2;
-	return ((c->flags & ~(CO_FL_ERROR << 2)) ^ f) &
-		((CO_FL_ERROR<<2)|CO_FL_WAIT_WR|CO_FL_CURR_WR_ENA|CO_FL_WAIT_RD|CO_FL_CURR_RD_ENA) &
-		~(f & (CO_FL_WAIT_WR|CO_FL_WAIT_RD));
+	unsigned int f = c->flags;
+	f &= CO_FL_DATA_WR_ENA | CO_FL_DATA_RD_ENA | CO_FL_CURR_WR_ENA |
+	     CO_FL_CURR_RD_ENA | CO_FL_ERROR | CO_FL_WAIT_WR | CO_FL_WAIT_RD;
+
+	f = (f & (f << 2)) |                         /* test W & D */
+	    ((f ^ (f << 1)) & (CO_FL_CURR_WR_ENA|CO_FL_CURR_RD_ENA));    /* test C ^ D */
+	return f & (CO_FL_WAIT_WR | CO_FL_WAIT_RD | CO_FL_CURR_WR_ENA | CO_FL_CURR_RD_ENA | CO_FL_ERROR);
 }
 
 /* inspects c->flags and returns non-zero if SOCK ENA changes from the CURR ENA
- * or if the WAIT flags set new flags that were not in CURR POL. Additionally,
+ * or if the WAIT flags are set with their respective ENA flags. Additionally,
  * non-zero is also returned if an error was reported on the connection. This
  * function is used quite often and is inlined. In order to proceed optimally
  * with very little code and CPU cycles, the bits are arranged so that a change
- * can be detected by a simple left shift, a xor, and a mask. This operation
- * detects when CURR:POLL differs from SOCK:WAIT. In order to detect the ERROR
- * flag without additional work, we remove it from the copy of the original
- * flags (unshifted) before doing the XOR. This operation is parallelized with
- * the shift and does not induce additional cycles. This explains why we check
- * the error bit shifted left in the mask. Last, the final operation is an AND
- * which the compiler is able to replace with a TEST in boolean conditions. The
- * result is that all these checks are done in 5-6 cycles only and less than 20
- * bytes.
+ * can be detected by a few left shifts, a xor, and a mask. These operations
+ * detect when W&S are both enabled for either direction, when C&S differ for
+ * either direction and when Error is set. The trick consists in first keeping
+ * only the bits we're interested in, since they don't collide when shifted,
+ * and to perform the AND at the end. In practice, the compiler is able to
+ * replace the last AND with a TEST in boolean conditions. This results in
+ * checks that are done in 4-6 cycles and less than 30 bytes.
  */
 static inline unsigned int conn_sock_polling_changes(const struct connection *c)
 {
-	unsigned int f = c->flags << 2;
-	return ((c->flags & ~(CO_FL_ERROR << 2)) ^ f) &
-		((CO_FL_ERROR<<2)|CO_FL_WAIT_WR|CO_FL_SOCK_WR_ENA|CO_FL_WAIT_RD|CO_FL_SOCK_RD_ENA) &
-		~(f & (CO_FL_WAIT_WR|CO_FL_WAIT_RD));
+	unsigned int f = c->flags;
+	f &= CO_FL_SOCK_WR_ENA | CO_FL_SOCK_RD_ENA | CO_FL_CURR_WR_ENA |
+	     CO_FL_CURR_RD_ENA | CO_FL_ERROR | CO_FL_WAIT_WR | CO_FL_WAIT_RD;
+
+	f = (f & (f << 3)) |                         /* test W & S */
+	    ((f ^ (f << 2)) & (CO_FL_CURR_WR_ENA|CO_FL_CURR_RD_ENA));    /* test C ^ S */
+	return f & (CO_FL_WAIT_WR | CO_FL_WAIT_RD | CO_FL_CURR_WR_ENA | CO_FL_CURR_RD_ENA | CO_FL_ERROR);
 }
 
 /* Automatically updates polling on connection <c> depending on the DATA flags
@@ -373,67 +376,6 @@ static inline int conn_sock_shutw_pending(struct connection *c)
 	return (c->flags & (CO_FL_DATA_WR_SH | CO_FL_SOCK_WR_SH)) == CO_FL_DATA_WR_SH;
 }
 
-static inline void clear_target(struct target *dest)
-{
-	dest->type = TARG_TYPE_NONE;
-	dest->ptr.v = NULL;
-}
-
-static inline void set_target_client(struct target *dest, struct listener *l)
-{
-	dest->type = TARG_TYPE_CLIENT;
-	dest->ptr.l = l;
-}
-
-static inline void set_target_server(struct target *dest, struct server *s)
-{
-	dest->type = TARG_TYPE_SERVER;
-	dest->ptr.s = s;
-}
-
-static inline void set_target_proxy(struct target *dest, struct proxy *p)
-{
-	dest->type = TARG_TYPE_PROXY;
-	dest->ptr.p = p;
-}
-
-static inline void set_target_applet(struct target *dest, struct si_applet *a)
-{
-	dest->type = TARG_TYPE_APPLET;
-	dest->ptr.a = a;
-}
-
-static inline void set_target_task(struct target *dest, struct task *t)
-{
-	dest->type = TARG_TYPE_TASK;
-	dest->ptr.t = t;
-}
-
-static inline struct target *copy_target(struct target *dest, struct target *src)
-{
-	*dest = *src;
-	return dest;
-}
-
-static inline int target_match(struct target *a, struct target *b)
-{
-	return a->type == b->type && a->ptr.v == b->ptr.v;
-}
-
-static inline struct server *target_srv(struct target *t)
-{
-	if (!t || t->type != TARG_TYPE_SERVER)
-		return NULL;
-	return t->ptr.s;
-}
-
-static inline struct listener *target_client(struct target *t)
-{
-	if (!t || t->type != TARG_TYPE_CLIENT)
-		return NULL;
-	return t->ptr.l;
-}
-
 /* Retrieves the connection's source address */
 static inline void conn_get_from_addr(struct connection *conn)
 {
@@ -444,8 +386,8 @@ static inline void conn_get_from_addr(struct connection *conn)
 		return;
 
 	if (conn->ctrl->get_src(conn->t.sock.fd, (struct sockaddr *)&conn->addr.from,
-	                         sizeof(conn->addr.from),
-	                         conn->target.type != TARG_TYPE_CLIENT) == -1)
+	                        sizeof(conn->addr.from),
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
 		return;
 	conn->flags |= CO_FL_ADDR_FROM_SET;
 }
@@ -460,8 +402,8 @@ static inline void conn_get_to_addr(struct connection *conn)
 		return;
 
 	if (conn->ctrl->get_dst(conn->t.sock.fd, (struct sockaddr *)&conn->addr.to,
-	                         sizeof(conn->addr.to),
-	                         conn->target.type != TARG_TYPE_CLIENT) == -1)
+	                        sizeof(conn->addr.to),
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
 		return;
 	conn->flags |= CO_FL_ADDR_TO_SET;
 }

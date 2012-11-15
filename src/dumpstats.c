@@ -125,7 +125,7 @@ static int stats_accept(struct session *s)
 {
 	/* we have a dedicated I/O handler for the stats */
 	stream_int_register_handler(&s->si[1], &cli_applet);
-	copy_target(&s->target, &s->si[1].conn->target); // for logging only
+	s->target = s->si[1].conn->target; // for logging only
 	s->si[1].conn->xprt_ctx = s;
 	s->si[1].applet.st1 = 0;
 	s->si[1].applet.st0 = STAT_CLI_INIT;
@@ -1246,8 +1246,21 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 					return 1;
 				}
 			}
+			else if (strcmp(args[2], "http-compression") == 0) {
+				if (strcmp(args[3], "global") == 0) {
+					int v;
+
+					v = atoi(args[4]);
+					global.comp_rate_lim = v * 1024; /* Kilo to bytes. */
+				}
+				else {
+					si->applet.ctx.cli.msg = "'set rate-limit http-compression' only supports 'global'.\n";
+					si->applet.st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+			}
 			else {
-				si->applet.ctx.cli.msg = "'set rate-limit' only supports 'connections'.\n";
+				si->applet.ctx.cli.msg = "'set rate-limit' supports 'connections' and 'http-compression'.\n";
 				si->applet.st0 = STAT_CLI_PRINT;
 				return 1;
 			}
@@ -1708,6 +1721,8 @@ static int stats_dump_raw_to_buffer(struct stream_interface *si)
 				     "ConnRate: %d\n"
 				     "ConnRateLimit: %d\n"
 				     "MaxConnRate: %d\n"
+				     "CompressBpsIn: %u\n"
+				     "CompressBpsOut: %u\n"
 				     "Tasks: %d\n"
 				     "Run_queue: %d\n"
 				     "Idle_pct: %d\n"
@@ -1724,6 +1739,7 @@ static int stats_dump_raw_to_buffer(struct stream_interface *si)
 				     global.maxsock, global.maxconn, global.hardmaxconn, global.maxpipes,
 				     actconn, pipes_used, pipes_free,
 				     read_freq_ctr(&global.conn_per_sec), global.cps_lim, global.cps_max,
+				     read_freq_ctr(&global.comp_bps_in), read_freq_ctr(&global.comp_bps_out),
 				     nb_tasks_cur, run_queue_cur, idle_pct,
 				     global.node, global.desc?global.desc:""
 				     );
@@ -3403,8 +3419,8 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 		if (sess->be->cap & PR_CAP_BE)
 			chunk_appendf(&trash,
 				     "  server=%s (id=%u)",
-				     target_srv(&sess->target) ? target_srv(&sess->target)->id : "<none>",
-				     target_srv(&sess->target) ? target_srv(&sess->target)->puid : 0);
+				     objt_server(sess->target) ? objt_server(sess->target)->id : "<none>",
+				     objt_server(sess->target) ? objt_server(sess->target)->puid : 0);
 		else
 			chunk_appendf(&trash, "  server=<NONE> (id=-1)");
 
@@ -3447,7 +3463,7 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 			     &sess->si[0],
 			     sess->si[0].state,
 			     sess->si[0].flags,
-			     si_fd(&sess->si[0]),
+			     sess->si[0].conn->t.sock.fd,
 			     sess->si[0].exp ?
 			             tick_is_expired(sess->si[0].exp, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(sess->si[0].exp - now_ms),
@@ -3459,7 +3475,7 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 			     &sess->si[1],
 			     sess->si[1].state,
 			     sess->si[1].flags,
-			     si_fd(&sess->si[1]),
+			     sess->si[1].conn->t.sock.fd,
 			     sess->si[1].exp ?
 			             tick_is_expired(sess->si[1].exp, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(sess->si[1].exp - now_ms),
@@ -3622,7 +3638,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 					     get_host_port(&curr_sess->si[0].conn->addr.from),
 					     curr_sess->fe->id,
 					     (curr_sess->be->cap & PR_CAP_BE) ? curr_sess->be->id : "<NONE>",
-					     target_srv(&curr_sess->target) ? target_srv(&curr_sess->target)->id : "<none>"
+					     objt_server(curr_sess->target) ? objt_server(curr_sess->target)->id : "<none>"
 					     );
 				break;
 			case AF_UNIX:
@@ -3631,7 +3647,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 					     curr_sess->listener->luid,
 					     curr_sess->fe->id,
 					     (curr_sess->be->cap & PR_CAP_BE) ? curr_sess->be->id : "<NONE>",
-					     target_srv(&curr_sess->target) ? target_srv(&curr_sess->target)->id : "<none>"
+					     objt_server(curr_sess->target) ? objt_server(curr_sess->target)->id : "<none>"
 					     );
 				break;
 			}
@@ -3688,7 +3704,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 				     " s0=[%d,%1xh,fd=%d,ex=%s]",
 				     curr_sess->si[0].state,
 				     curr_sess->si[0].flags,
-				     si_fd(&curr_sess->si[0]),
+				     curr_sess->si[0].conn->t.sock.fd,
 				     curr_sess->si[0].exp ?
 				     human_time(TICKS_TO_MS(curr_sess->si[0].exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
@@ -3697,7 +3713,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 				     " s1=[%d,%1xh,fd=%d,ex=%s]",
 				     curr_sess->si[1].state,
 				     curr_sess->si[1].flags,
-				     si_fd(&curr_sess->si[1]),
+				     curr_sess->si[1].conn->t.sock.fd,
 				     curr_sess->si[1].exp ?
 				     human_time(TICKS_TO_MS(curr_sess->si[1].exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
@@ -4145,12 +4161,14 @@ static int bind_parse_level(char **args, int cur_arg, struct proxy *px, struct b
 }
 
 struct si_applet http_stats_applet = {
+	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<STATS>", /* used for logging */
 	.fct = http_stats_io_handler,
 	.release = NULL,
 };
 
 static struct si_applet cli_applet = {
+	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<CLI>", /* used for logging */
 	.fct = cli_io_handler,
 	.release = NULL,

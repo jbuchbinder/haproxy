@@ -101,6 +101,8 @@
 
 /*********************************************************************/
 
+extern const struct comp_algo comp_algos[];
+
 /*********************************************************************/
 
 /* list of config files */
@@ -112,6 +114,12 @@ int  relative_pid = 1;		/* process id starting at 1 */
 struct global global = {
 	.req_count = 0,
 	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
+#ifdef DEFAULT_MAXZLIBMEM
+	.maxzlibmem = DEFAULT_MAXZLIBMEM,
+#else
+	.maxzlibmem = 0,
+#endif
+	.comp_rate_lim = 0,
 	.unix_bind = {
 		 .ux = {
 			 .uid = -1,
@@ -124,8 +132,15 @@ struct global global = {
 		.maxrewrite = MAXREWRITE,
 		.chksize = BUFSIZE,
 #ifdef USE_OPENSSL
-		.sslcachesize = 20000,
+		.sslcachesize = SSLCACHESIZE,
 #endif
+#ifdef USE_ZLIB
+		.zlibmemlevel = 8,
+		.zlibwindowsize = MAX_WBITS,
+#endif
+		.comp_maxlevel = 1,
+
+
 	},
 #ifdef USE_OPENSSL
 #ifdef DEFAULT_MAXSSLCONN
@@ -216,6 +231,24 @@ void display_build_opts()
 #endif
 		"\n");
 
+#ifdef USE_ZLIB
+	printf("Built with zlib version : " ZLIB_VERSION "\n");
+#else /* USE_ZLIB */
+	printf("Built without zlib support (USE_ZLIB not set)\n");
+#endif
+	printf("Compression algorithms supported :");
+	{
+		int i;
+
+		for (i = 0; comp_algos[i].name; i++) {
+			printf("%s %s", (i == 0 ? "" : ","), comp_algos[i].name);
+		}
+		if (i == 0) {
+			printf("none");
+		}
+	}
+	printf("\n");
+
 #ifdef USE_OPENSSL
 	printf("Built with OpenSSL version : " OPENSSL_VERSION_TEXT "\n");
 	printf("OpenSSL library supports TLS extensions : "
@@ -278,9 +311,6 @@ void usage(char *name)
 		"        -p writes pids of all children to this file\n"
 #if defined(ENABLE_EPOLL)
 		"        -de disables epoll() usage even when available\n"
-#endif
-#if defined(ENABLE_SEPOLL)
-		"        -ds disables speculative epoll() usage even when available\n"
 #endif
 #if defined(ENABLE_KQUEUE)
 		"        -dk disables kqueue() usage even when available\n"
@@ -447,9 +477,6 @@ void init(int argc, char **argv)
 #if defined(ENABLE_EPOLL)
 	global.tune.options |= GTUNE_USE_EPOLL;
 #endif
-#if defined(ENABLE_SEPOLL)
-	global.tune.options |= GTUNE_USE_SEPOLL;
-#endif
 #if defined(ENABLE_KQUEUE)
 	global.tune.options |= GTUNE_USE_KQUEUE;
 #endif
@@ -482,10 +509,6 @@ void init(int argc, char **argv)
 #if defined(ENABLE_EPOLL)
 			else if (*flag == 'd' && flag[1] == 'e')
 				global.tune.options &= ~GTUNE_USE_EPOLL;
-#endif
-#if defined(ENABLE_SEPOLL)
-			else if (*flag == 'd' && flag[1] == 's')
-				global.tune.options &= ~GTUNE_USE_SEPOLL;
 #endif
 #if defined(ENABLE_POLL)
 			else if (*flag == 'd' && flag[1] == 'p')
@@ -762,9 +785,6 @@ void init(int argc, char **argv)
 
 	if (!(global.tune.options & GTUNE_USE_EPOLL))
 		disable_poller("epoll");
-
-	if (!(global.tune.options & GTUNE_USE_SEPOLL))
-		disable_poller("sepoll");
 
 	if (!(global.tune.options & GTUNE_USE_POLL))
 		disable_poller("poll");
@@ -1187,6 +1207,7 @@ void run_poll_loop()
 
 		/* The poller will ensure it returns around <next> */
 		cur_poller.poll(&cur_poller, next);
+		fd_process_spec_events();
 	}
 }
 

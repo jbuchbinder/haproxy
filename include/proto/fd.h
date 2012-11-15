@@ -30,6 +30,12 @@
 #include <common/config.h>
 #include <types/fd.h>
 
+/* public variables */
+extern int fd_nbspec;          // number of speculative events in the list
+extern int fd_nbupdt;          // number of updates in the list
+extern unsigned int *fd_spec;  // speculative I/O list
+extern unsigned int *fd_updt;  // FD updates list
+
 /* Deletes an FD from the fdsets, and recomputes the maxfd limit.
  * The file descriptor is also closed.
  */
@@ -70,48 +76,155 @@ int list_pollers(FILE *out);
  */
 void run_poller();
 
-#define EV_FD_ISSET(fd, ev)  (cur_poller.is_set((fd), (ev)))
+/* Scan and process the speculative events. This should be called right after
+ * the poller.
+ */
+void fd_process_spec_events();
+
+/* Mark fd <fd> as updated and allocate an entry in the update list for this if
+ * it was not already there. This can be done at any time.
+ */
+static inline void updt_fd(const int fd)
+{
+	if (fdtab[fd].updated)
+		/* already scheduled for update */
+		return;
+	fd_updt[fd_nbupdt++] = fd;
+	fdtab[fd].updated = 1;
+}
+
+
+/* allocate an entry for a speculative event. This can be done at any time. */
+static inline void alloc_spec_entry(const int fd)
+{
+	if (fdtab[fd].spec_p)
+		/* FD already in speculative I/O list */
+		return;
+	fd_spec[fd_nbspec++] = fd;
+	fdtab[fd].spec_p = fd_nbspec;
+}
+
+/* Removes entry used by fd <fd> from the spec list and replaces it with the
+ * last one. The fdtab.spec is adjusted to match the back reference if needed.
+ * If the fd has no entry assigned, return immediately.
+ */
+static inline void release_spec_entry(int fd)
+{
+	unsigned int pos;
+
+	pos = fdtab[fd].spec_p;
+	if (!pos)
+		return;
+	fdtab[fd].spec_p = 0;
+	fd_nbspec--;
+	if (pos <= fd_nbspec) {
+		/* was not the last entry */
+		fd = fd_spec[fd_nbspec];
+		fd_spec[pos - 1] = fd;
+		fdtab[fd].spec_p = pos;
+	}
+}
+
+/*
+ * Returns non-zero if <fd> is already monitored for events in direction <dir>.
+ */
+static inline int fd_ev_is_set(const int fd, int dir)
+{
+	return ((unsigned)fdtab[fd].spec_e >> dir) & FD_EV_STATUS;
+}
+
+/* Disable processing of events on fd <fd> for direction <dir>. Note: this
+ * function was optimized to be used with a constant for <dir>.
+ */
+static inline void fd_ev_clr(const int fd, int dir)
+{
+	unsigned int i = ((unsigned int)fdtab[fd].spec_e) & (FD_EV_STATUS << dir);
+	if (i == 0)
+		return; /* already disabled */
+	fdtab[fd].spec_e ^= i;
+	updt_fd(fd); /* need an update entry to change the state */
+}
+
+/* Enable polling for events on fd <fd> for direction <dir>. Note: this
+ * function was optimized to be used with a constant for <dir>.
+ */
+static inline void fd_ev_wai(const int fd, int dir)
+{
+	unsigned int i = ((unsigned int)fdtab[fd].spec_e) & (FD_EV_STATUS << dir);
+	if (i == (FD_EV_POLLED << dir))
+		return; /* already in desired state */
+	fdtab[fd].spec_e ^= i ^ (FD_EV_POLLED << dir);
+	updt_fd(fd); /* need an update entry to change the state */
+}
+
+/* Enable processing of events on fd <fd> for direction <dir>. Note: this
+ * function was optimized to be used with a constant for <dir>.
+ */
+static inline void fd_ev_set(int fd, int dir)
+{
+	unsigned int i = ((unsigned int)fdtab[fd].spec_e) & (FD_EV_STATUS << dir);
+
+	/* note that we don't care about disabling the polled state when
+	 * enabling the active state, since it brings no benefit but costs
+	 * some syscalls.
+	 */
+	if (i & (FD_EV_ACTIVE << dir))
+		return; /* already in desired state */
+	fdtab[fd].spec_e |= (FD_EV_ACTIVE << dir);
+	updt_fd(fd); /* need an update entry to change the state */
+}
+
+/* Disable processing of events on fd <fd> for both directions. */
+static inline void fd_ev_rem(const int fd)
+{
+	unsigned int i = ((unsigned int)fdtab[fd].spec_e) & FD_EV_CURR_MASK;
+	if (i == 0)
+		return; /* already disabled */
+	fdtab[fd].spec_e ^= i;
+	updt_fd(fd); /* need an update entry to change the state */
+}
 
 /* event manipulation primitives for use by I/O callbacks */
 static inline void fd_want_recv(int fd)
 {
-	cur_poller.set(fd, DIR_RD);
+	return fd_ev_set(fd, DIR_RD);
 }
 
 static inline void fd_stop_recv(int fd)
 {
-	cur_poller.clr(fd, DIR_RD);
+	return fd_ev_clr(fd, DIR_RD);
 }
 
 static inline void fd_poll_recv(int fd)
 {
-	cur_poller.wai(fd, DIR_RD);
+	return fd_ev_wai(fd, DIR_RD);
 }
 
 static inline void fd_want_send(int fd)
 {
-	cur_poller.set(fd, DIR_WR);
+	return fd_ev_set(fd, DIR_WR);
 }
 
 static inline void fd_stop_send(int fd)
 {
-	cur_poller.clr(fd, DIR_WR);
+	return fd_ev_clr(fd, DIR_WR);
 }
 
 static inline void fd_poll_send(int fd)
 {
-	cur_poller.wai(fd, DIR_WR);
+	return fd_ev_wai(fd, DIR_WR);
 }
 
 static inline void fd_stop_both(int fd)
 {
-	cur_poller.rem(fd);
+	return fd_ev_rem(fd);
 }
 
 /* Prepares <fd> for being polled */
 static inline void fd_insert(int fd)
 {
 	fdtab[fd].ev = 0;
+	fdtab[fd].new = 1;
 	if (fd + 1 > maxfd)
 		maxfd = fd + 1;
 }

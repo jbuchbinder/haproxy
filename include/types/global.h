@@ -2,7 +2,7 @@
  * include/types/global.h
  * Global variables.
  *
- * Copyright (C) 2000-2010 Willy Tarreau - w@1wt.eu
+ * Copyright (C) 2000-2012 Willy Tarreau - w@1wt.eu
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -54,9 +54,8 @@
 #define GTUNE_USE_POLL           (1<<1)
 #define GTUNE_USE_EPOLL          (1<<2)
 #define GTUNE_USE_KQUEUE         (1<<3)
-#define GTUNE_USE_SEPOLL         (1<<4)
 /* platform-specific options */
-#define GTUNE_USE_SPLICE         (1<<5)
+#define GTUNE_USE_SPLICE         (1<<4)
 
 /* Access level for a stats socket */
 #define ACCESS_LVL_NONE     0
@@ -80,11 +79,15 @@ struct global {
 	char *connect_default_ciphers;
 #endif
 	struct freq_ctr conn_per_sec;
+	struct freq_ctr comp_bps_in;	/* bytes per second, before http compression */
+	struct freq_ctr comp_bps_out;	/* bytes per second, after http compression */
 	int cps_lim, cps_max;
+	int comp_rate_lim;           /* HTTP compression rate limit */
 	int maxpipes;		/* max # of pipes */
 	int maxsock;		/* max # of sockets */
 	int rlimit_nofile;	/* default ulimit-n value : 0=unset */
 	int rlimit_memmax;	/* default ulimit-d in megs value : 0=unset */
+	int maxzlibmem;         /* max RAM for zlib in megs */
 	int mode;
 	unsigned int req_count; /* HTTP request counter */
 	int last_checks;
@@ -112,6 +115,11 @@ struct global {
 #ifdef USE_OPENSSL
 		int sslcachesize;  /* SSL cache size in session, defaults to 20000 */
 #endif
+#ifdef USE_ZLIB
+		int zlibmemlevel;    /* zlib memlevel */
+		int zlibwindowsize;  /* zlib window size */
+#endif
+		int comp_maxlevel;    /* max HTTP compression level */
 	} tune;
 	struct {
 		char *prefix;           /* path prefix of unix bind socket */

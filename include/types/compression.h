@@ -23,7 +23,11 @@
 #ifndef _TYPES_COMP_H
 #define _TYPES_COMP_H
 
+#ifdef USE_ZLIB
+
 #include <zlib.h>
+
+#endif /* USE_ZLIB */
 
 struct comp {
 	struct comp_algo *algos;
@@ -31,19 +35,27 @@ struct comp {
 	unsigned int offload;
 };
 
+struct comp_ctx {
+#ifdef USE_ZLIB
+	z_stream strm; /* zlib stream */
+	void *zlib_deflate_state;
+	void *zlib_window;
+	void *zlib_prev;
+	void *zlib_pending_buf;
+	void *zlib_head;
+#endif /* USE_ZLIB */
+	int cur_lvl;
+};
+
 struct comp_algo {
 	char *name;
 	int name_len;
-	int (*init)(void *, int);
-	int (*add_data)(void *v, const char *in_data, int in_len, char *out_data, int out_len);
-	int (*flush)(void *v, struct buffer *out, int flag);
-	int (*reset)(void *v);
-	int (*end)(void *v);
+	int (*init)(struct comp_ctx *comp_ctx, int level);
+	int (*add_data)(struct comp_ctx *comp_ctx, const char *in_data, int in_len, char *out_data, int out_len);
+	int (*flush)(struct comp_ctx *comp_ctx, struct buffer *out, int flag);
+	int (*reset)(struct comp_ctx *comp_ctx);
+	int (*end)(struct comp_ctx *comp_ctx);
 	struct comp_algo *next;
-};
-
-union comp_ctx {
-	z_stream strm; /* zlib */
 };
 
 struct comp_type {
