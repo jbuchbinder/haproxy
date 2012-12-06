@@ -14,7 +14,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,12 +41,14 @@
 #include <proto/backend.h>
 #include <proto/channel.h>
 #include <proto/checks.h>
+#include <proto/compression.h>
 #include <proto/dumpstats.h>
 #include <proto/fd.h>
 #include <proto/freq_ctr.h>
 #include <proto/log.h>
 #include <proto/pipe.h>
 #include <proto/listener.h>
+#include <proto/proto_http.h>
 #include <proto/proto_uxst.h>
 #include <proto/proxy.h>
 #include <proto/session.h>
@@ -56,11 +57,15 @@
 #include <proto/stream_interface.h>
 #include <proto/task.h>
 
+#ifdef USE_OPENSSL
+#include <proto/ssl_sock.h>
+#endif
+
 static int stats_dump_raw_to_buffer(struct stream_interface *si);
-static int stats_dump_full_sess_to_buffer(struct stream_interface *si);
+static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct session *sess);
 static int stats_dump_sess_to_buffer(struct stream_interface *si);
 static int stats_dump_errors_to_buffer(struct stream_interface *si);
-static int stats_table_request(struct stream_interface *si, bool show);
+static int stats_table_request(struct stream_interface *si, int show);
 static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struct uri_auth *uri);
 static int stats_dump_http(struct stream_interface *si, struct uri_auth *uri);
 
@@ -305,7 +310,8 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 		unsigned int set = 0;
 
 		while (*args[cur_arg]) {
-			int u;
+			unsigned int low, high;
+
 			if (strcmp(args[cur_arg], "all") == 0) {
 				set = 0;
 				break;
@@ -316,15 +322,33 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 			else if (strcmp(args[cur_arg], "even") == 0) {
 				set |= 0xAAAAAAAA;
 			}
-			else {
-				u = str2uic(args[cur_arg]);
-				if (u < 1 || u > 32) {
-					memprintf(err,
-						  "'%s %s' expects 'all', 'odd', 'even', or process numbers from 1 to 32.\n",
-						  args[0], args[1]);
+			else if (isdigit((int)*args[cur_arg])) {
+				char *dash = strchr(args[cur_arg], '-');
+
+				low = high = str2uic(args[cur_arg]);
+				if (dash)
+					high = str2uic(dash + 1);
+
+				if (high < low) {
+					unsigned int swap = low;
+					low = high;
+					high = swap;
+				}
+
+				if (low < 1 || high > 32) {
+					memprintf(err, "'%s %s' supports process numbers from 1 to 32.\n",
+					          args[0], args[1]);
 					return -1;
 				}
-				set |= 1 << (u - 1);
+
+				while (low <= high)
+					set |= 1 << (low++ - 1);
+			}
+			else {
+				memprintf(err,
+				          "'%s %s' expects 'all', 'odd', 'even', or a list of process ranges with numbers from 1 to 32.\n",
+				          args[0], args[1]);
+				return -1;
 			}
 			cur_arg++;
 		}
@@ -355,6 +379,7 @@ static int print_csv_header(struct chunk *msg)
 			    "hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,"
 			    "req_rate,req_rate_max,req_tot,"
 			    "cli_abrt,srv_abrt,"
+			    "comp_in,comp_out,comp_byp,comp_rsp,"
 			    "\n");
 }
 
@@ -903,7 +928,9 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				si->applet.st0 = STAT_CLI_PRINT;
 				return 1;
 			}
-			if (*args[2])
+			if (*args[2] && strcmp(args[2], "all") == 0)
+				si->applet.ctx.sess.target = (void *)-1;
+			else if (*args[2])
 				si->applet.ctx.sess.target = (void *)strtoul(args[2], NULL, 0);
 			else
 				si->applet.ctx.sess.target = NULL;
@@ -1249,6 +1276,12 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			else if (strcmp(args[2], "http-compression") == 0) {
 				if (strcmp(args[3], "global") == 0) {
 					int v;
+
+					if (!*args[4]) {
+						si->applet.ctx.cli.msg = "Expects a maximum input byte rate in kB/s.\n";
+						si->applet.st0 = STAT_CLI_PRINT;
+						return 1;
+					}
 
 					v = atoi(args[4]);
 					global.comp_rate_lim = v * 1024; /* Kilo to bytes. */
@@ -1723,6 +1756,11 @@ static int stats_dump_raw_to_buffer(struct stream_interface *si)
 				     "MaxConnRate: %d\n"
 				     "CompressBpsIn: %u\n"
 				     "CompressBpsOut: %u\n"
+				     "CompressBpsRateLim: %u\n"
+#ifdef USE_ZLIB
+				     "ZlibMemUsage: %ld\n"
+				     "MaxZlibMemUsage: %ld\n"
+#endif
 				     "Tasks: %d\n"
 				     "Run_queue: %d\n"
 				     "Idle_pct: %d\n"
@@ -1740,6 +1778,10 @@ static int stats_dump_raw_to_buffer(struct stream_interface *si)
 				     actconn, pipes_used, pipes_free,
 				     read_freq_ctr(&global.conn_per_sec), global.cps_lim, global.cps_max,
 				     read_freq_ctr(&global.comp_bps_in), read_freq_ctr(&global.comp_bps_out),
+				     global.comp_rate_lim,
+#ifdef USE_ZLIB
+				     zlib_used_memory, global.maxzlibmem,
+#endif
 				     nb_tasks_cur, run_queue_cur, idle_pct,
 				     global.node, global.desc?global.desc:""
 				     );
@@ -2432,19 +2474,37 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 						chunk_appendf(&trash, " %dxx=%lld,", i, px->fe_counters.p.http.rsp[i]);
 
 					chunk_appendf(&trash, " other=%lld,", px->fe_counters.p.http.rsp[0]);
+					chunk_appendf(&trash, " compressed=%lld (%d%%)",
+					              px->fe_counters.p.http.comp_rsp,
+					              px->fe_counters.p.http.rsp[2] ?
+					              (int)(100*px->fe_counters.p.http.comp_rsp/px->fe_counters.p.http.rsp[2]) : 0);
 					chunk_appendf(&trash, " intercepted=%lld\"", px->fe_counters.intercepted_req);
 				}
 
 				chunk_appendf(&trash,
 				     /* sessions: total, lbtot */
 				     ">%s%s%s</td><td></td>"
-				     /* bytes : in, out */
-				     "<td>%s</td><td>%s</td>"
+				     /* bytes : in */
+				     "<td>%s</td><td"
 				     "",
 				     (px->mode == PR_MODE_HTTP)?"<u>":"",
 				     U2H6(px->fe_counters.cum_sess),
 				     (px->mode == PR_MODE_HTTP)?"</u>":"",
-				     U2H7(px->fe_counters.bytes_in), U2H8(px->fe_counters.bytes_out));
+				     U2H7(px->fe_counters.bytes_in));
+
+				/* compression stats (via td title): comp_in, comp_out, comp_byp */
+				chunk_appendf(&trash, " title=\"compression: in=%lld out=%lld bypassed=%lld savings=%d%%\"",
+				              px->fe_counters.comp_in, px->fe_counters.comp_out, px->fe_counters.comp_byp,
+				              px->fe_counters.comp_in ?
+				              (int)((px->fe_counters.comp_in - px->fe_counters.comp_out)*100/px->fe_counters.comp_in) : 0);
+
+				chunk_appendf(&trash,
+				     /* bytes: out */
+				     ">%s%s%s</td>"
+				     "",
+				     (px->fe_counters.comp_in || px->fe_counters.comp_byp) ? "<u>":"",
+				     U2H0(px->fe_counters.bytes_out),
+				     (px->fe_counters.comp_in || px->fe_counters.comp_byp) ? "</u>":"");
 
 				chunk_appendf(&trash,
 				     /* denied: req, resp */
@@ -2519,6 +2579,14 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 
 				/* errors: cli_aborts, srv_aborts */
 				chunk_appendf(&trash, ",,");
+
+				/* compression: in, out, bypassed */
+				chunk_appendf(&trash, "%lld,%lld,%lld,",
+			              px->fe_counters.comp_in, px->fe_counters.comp_out, px->fe_counters.comp_byp);
+
+				/* compression: comp_rsp */
+				chunk_appendf(&trash, "%lld,",
+			              px->fe_counters.p.http.comp_rsp);
 
 				/* finish with EOL */
 				chunk_appendf(&trash, "\n");
@@ -2649,6 +2717,8 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 				     ",,,"
 				     /* errors: cli_aborts, srv_aborts */
 				     ",,"
+				     /* compression: in, out, bypassed, comp_rsp */
+				     ",,,,"
 				     "\n",
 				     px->id, l->name,
 				     l->nbconn, l->counters->conn_max,
@@ -2876,7 +2946,7 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 					}
 
 					chunk_appendf(&trash, "\"><u> %s%s",
-						tv_iszero(&sv->check.start)?"":"* ",
+					        (sv->state & SRV_CHK_RUNNING) ? "* " : "",
 						get_check_status_info(sv->check.status));
 
 					if (sv->check.status >= HCHK_STATUS_L57DATA)
@@ -3067,6 +3137,9 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 				chunk_appendf(&trash, "%lld,%lld,",
 					     sv->counters.cli_aborts, sv->counters.srv_aborts);
 
+				/* compression: in, out, bypassed, comp_rsp */
+				chunk_appendf(&trash, ",,,,");
+
 				/* finish with EOL */
 				chunk_appendf(&trash, "\n");
 			}
@@ -3136,25 +3209,43 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 				if (px->mode == PR_MODE_HTTP) {
 					int i;
 
-					chunk_appendf(&trash, " title=\"rsp codes:");
+					chunk_appendf(&trash, " title=\"%lld requests:", px->be_counters.p.http.cum_req);
 
 					for (i = 1; i < 6; i++)
 						chunk_appendf(&trash, " %dxx=%lld", i, px->be_counters.p.http.rsp[i]);
 
-					chunk_appendf(&trash, " other=%lld\"", px->be_counters.p.http.rsp[0]);
+					chunk_appendf(&trash, " other=%lld ", px->be_counters.p.http.rsp[0]);
+					chunk_appendf(&trash, " compressed=%lld (%d%%)\"",
+					              px->be_counters.p.http.comp_rsp,
+					              px->be_counters.p.http.rsp[2] ?
+					              (int)(100*px->be_counters.p.http.comp_rsp/px->be_counters.p.http.rsp[2]) : 0);
 				}
 
 				chunk_appendf(&trash,
 				     /* sessions: total, lbtot */
 				     ">%s%s%s</td><td>%s</td>"
-				     /* bytes: in, out */
-				     "<td>%s</td><td>%s</td>"
+				     /* bytes: in */
+				     "<td>%s</td><td"
 				     "",
 				     (px->mode == PR_MODE_HTTP)?"<u>":"",
 				     U2H6(px->be_counters.cum_conn),
 				     (px->mode == PR_MODE_HTTP)?"</u>":"",
 				     U2H7(px->be_counters.cum_lbconn),
-				     U2H8(px->be_counters.bytes_in), U2H9(px->be_counters.bytes_out));
+				     U2H8(px->be_counters.bytes_in));
+
+				/* compression stats (via td title): comp_in, comp_out, comp_byp */
+				chunk_appendf(&trash, " title=\"compression: in=%lld out=%lld bypassed=%lld savings=%d%%\"",
+				     px->be_counters.comp_in, px->be_counters.comp_out, px->be_counters.comp_byp,
+				     px->be_counters.comp_in ?
+				     (int)((px->be_counters.comp_in - px->be_counters.comp_out)*100/px->be_counters.comp_in) : 0);
+
+				chunk_appendf(&trash,
+				     /* bytes: out */
+				     ">%s%s%s</td>"
+				     "",
+				     (px->be_counters.comp_in || px->be_counters.comp_byp) ? "<u>":"",
+				     U2H0(px->be_counters.bytes_out),
+				     (px->be_counters.comp_in || px->be_counters.comp_byp) ? "</u>":"");
 
 				chunk_appendf(&trash,
 				     /* denied: req, resp */
@@ -3261,6 +3352,14 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 				chunk_appendf(&trash, "%lld,%lld,",
 					     px->be_counters.cli_aborts, px->be_counters.srv_aborts);
 
+				/* compression: in, out, bypassed */
+				chunk_appendf(&trash, "%lld,%lld,%lld,",
+			              px->be_counters.comp_in, px->be_counters.comp_out, px->be_counters.comp_byp);
+
+				/* compression: comp_rsp */
+				chunk_appendf(&trash, "%lld,",
+			              px->be_counters.p.http.comp_rsp);
+
 				/* finish with EOL */
 				chunk_appendf(&trash, "\n");
 
@@ -3312,29 +3411,72 @@ static int stats_dump_proxy(struct stream_interface *si, struct proxy *px, struc
 	}
 }
 
+static inline const char *get_conn_ctrl_name(const struct connection *conn)
+{
+	if (!conn->ctrl)
+		return "NONE";
+	return conn->ctrl->name;
+}
+
+static inline const char *get_conn_xprt_name(const struct connection *conn)
+{
+	static char ptr[17];
+
+	if (!conn->xprt)
+		return "NONE";
+
+	if (conn->xprt == &raw_sock)
+		return "RAW";
+
+#ifdef USE_OPENSSL
+	if (conn->xprt == &ssl_sock)
+		return "SSL";
+#endif
+	snprintf(ptr, sizeof(ptr), "%p", conn->xprt);
+	return ptr;
+}
+
+static inline const char *get_conn_data_name(const struct connection *conn)
+{
+	static char ptr[17];
+
+	if (!conn->data)
+		return "NONE";
+
+	if (conn->data == &sess_conn_cb)
+		return "SESS";
+
+	if (conn->data == &si_conn_cb)
+		return "STRM";
+
+	if (conn->data == &check_conn_cb)
+		return "CHCK";
+
+	snprintf(ptr, sizeof(ptr), "%p", conn->data);
+	return ptr;
+}
+
 /* This function dumps a complete session state onto the stream interface's
  * read buffer. The xprt_ctx must have been zeroed first, and the flags
  * properly set. The session has to be set in xprt_ctx.sess.target. It returns
  * 0 if the output buffer is full and it needs to be called again, otherwise
  * non-zero. It is designed to be called from stats_dump_sess_to_buffer() below.
  */
-static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
+static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct session *sess)
 {
 	struct tm tm;
-	struct session *sess;
 	extern const char *monthname[12];
 	char pn[INET6_ADDRSTRLEN];
 
 	chunk_reset(&trash);
-	sess = si->applet.ctx.sess.target;
 
 	if (si->applet.ctx.sess.section > 0 && si->applet.ctx.sess.uid != sess->uniq_id) {
 		/* session changed, no need to go any further */
 		chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
 		if (bi_putchk(si->ib, &trash) == -1)
 			return 0;
-		si->applet.ctx.sess.target = NULL;
 		si->applet.ctx.sess.uid = 0;
+		si->applet.ctx.sess.section = 0;
 		return 1;
 	}
 
@@ -3459,11 +3601,11 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 			     human_time(now.tv_sec - sess->logs.accept_date.tv_sec, 1));
 
 		chunk_appendf(&trash,
-			     "  si[0]=%p (state=%d flags=0x%02x fd=%d exp=%s, et=0x%03x)\n",
+			     "  si[0]=%p (state=%d flags=0x%02x conn=%p exp=%s, et=0x%03x)\n",
 			     &sess->si[0],
 			     sess->si[0].state,
 			     sess->si[0].flags,
-			     sess->si[0].conn->t.sock.fd,
+			     sess->si[0].conn,
 			     sess->si[0].exp ?
 			             tick_is_expired(sess->si[0].exp, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(sess->si[0].exp - now_ms),
@@ -3471,11 +3613,11 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 			     sess->si[0].err_type);
 
 		chunk_appendf(&trash,
-			     "  si[1]=%p (state=%d flags=0x%02x fd=%d exp=%s, et=0x%03x)\n",
+			     "  si[1]=%p (state=%d flags=0x%02x conn=%p exp=%s, et=0x%03x)\n",
 			     &sess->si[1],
 			     sess->si[1].state,
 			     sess->si[1].flags,
-			     sess->si[1].conn->t.sock.fd,
+			     sess->si[1].conn,
 			     sess->si[1].exp ?
 			             tick_is_expired(sess->si[1].exp, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(sess->si[1].exp - now_ms),
@@ -3483,19 +3625,46 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 			     sess->si[1].err_type);
 
 		chunk_appendf(&trash,
-			     "  txn=%p (flags=0x%x meth=%d status=%d req.st=%d rsp.st=%d)\n",
+		              "  lconn=%p ctrl=%s xprt=%s data=%s\n",
+			      sess->si[0].conn,
+			      get_conn_ctrl_name(sess->si[0].conn),
+			      get_conn_xprt_name(sess->si[0].conn),
+			      get_conn_data_name(sess->si[0].conn));
+
+		chunk_appendf(&trash,
+		              "       target=%d flags=0x%08x fd=%d fd_spec=%02x\n",
+		              sess->si[0].conn->target ? *sess->si[0].conn->target : 0,
+		              sess->si[0].conn->flags,
+		              sess->si[0].conn->t.sock.fd,
+		              sess->si[0].conn->t.sock.fd >= 0 ? fdtab[sess->si[0].conn->t.sock.fd].spec_e : 0);
+
+		chunk_appendf(&trash,
+		              "  rconn=%p ctrl=%s xprt=%s data=%s\n",
+			      sess->si[1].conn,
+			      get_conn_ctrl_name(sess->si[1].conn),
+			      get_conn_xprt_name(sess->si[1].conn),
+			      get_conn_data_name(sess->si[1].conn));
+
+		chunk_appendf(&trash,
+		              "     target=%d flags=0x%08x fd=%d fd_spec=%02x\n",
+		              sess->si[1].conn->target ? *sess->si[1].conn->target : 0,
+		              sess->si[1].conn->flags,
+		              sess->si[1].conn->t.sock.fd,
+		              sess->si[1].conn->t.sock.fd >= 0 ? fdtab[sess->si[1].conn->t.sock.fd].spec_e : 0);
+
+		chunk_appendf(&trash,
+			     "  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s\n",
 			     &sess->txn, sess->txn.flags, sess->txn.meth, sess->txn.status,
-			     sess->txn.req.msg_state, sess->txn.rsp.msg_state);
+			     http_msg_state_str(sess->txn.req.msg_state), http_msg_state_str(sess->txn.rsp.msg_state));
 
 
 		chunk_appendf(&trash,
-			     "  req=%p (f=0x%06x an=0x%x i=%d o=%d pipe=%d fwd=%d)\n"
+			     "  req=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
 			     "      an_exp=%s",
 			     sess->req,
 			     sess->req->flags, sess->req->analysers,
-			     sess->req->buf->i, sess->req->buf->o,
 			     sess->req->pipe ? sess->req->pipe->data : 0,
-			     sess->req->to_forward,
+			     sess->req->to_forward, sess->req->total,
 			     sess->req->analyse_exp ?
 			     human_time(TICKS_TO_MS(sess->req->analyse_exp - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>");
@@ -3508,23 +3677,23 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 
 		chunk_appendf(&trash,
 			     " wex=%s\n"
-			     "      data=%p p=%d next=%d total=%lld\n",
+			     "      buf=%p data=%p o=%d p=%d req.next=%d i=%d size=%d\n",
 			     sess->req->wex ?
 			     human_time(TICKS_TO_MS(sess->req->wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
-			     sess->req->buf->data,
+			     sess->req->buf,
+			     sess->req->buf->data, sess->req->buf->o,
 			     (int)(sess->req->buf->p - sess->req->buf->data),
-			     sess->txn.req.next,
-			     sess->req->total);
+			     sess->txn.req.next, sess->req->buf->i,
+			     sess->req->buf->size);
 
 		chunk_appendf(&trash,
-			     "  res=%p (f=0x%06x an=0x%x i=%d o=%d pipe=%d fwd=%d)\n"
+			     "  res=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
 			     "      an_exp=%s",
 			     sess->rep,
 			     sess->rep->flags, sess->rep->analysers,
-			     sess->rep->buf->i, sess->rep->buf->o,
 			     sess->rep->pipe ? sess->rep->pipe->data : 0,
-			     sess->rep->to_forward,
+			     sess->rep->to_forward, sess->rep->total,
 			     sess->rep->analyse_exp ?
 			     human_time(TICKS_TO_MS(sess->rep->analyse_exp - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>");
@@ -3537,14 +3706,15 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 
 		chunk_appendf(&trash,
 			     " wex=%s\n"
-			     "      data=%p p=%d next=%d total=%lld\n",
+			     "      buf=%p data=%p o=%d p=%d rsp.next=%d i=%d size=%d\n",
 			     sess->rep->wex ?
 			     human_time(TICKS_TO_MS(sess->rep->wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
-			     sess->rep->buf->data,
+			     sess->rep->buf,
+			     sess->rep->buf->data, sess->rep->buf->o,
 			     (int)(sess->rep->buf->p - sess->rep->buf->data),
-			     sess->txn.rsp.next,
-			     sess->rep->total);
+			     sess->txn.rsp.next, sess->rep->buf->i,
+			     sess->rep->buf->size);
 
 		if (bi_putchk(si->ib, &trash) == -1)
 			return 0;
@@ -3553,6 +3723,7 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si)
 	}
 	/* end of dump */
 	si->applet.ctx.sess.uid = 0;
+	si->applet.ctx.sess.section = 0;
 	return 1;
 }
 
@@ -3608,19 +3779,23 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 			curr_sess = LIST_ELEM(si->applet.ctx.sess.bref.ref, struct session *, list);
 
 			if (si->applet.ctx.sess.target) {
-				if (si->applet.ctx.sess.target != curr_sess)
+				if (si->applet.ctx.sess.target != (void *)-1 && si->applet.ctx.sess.target != curr_sess)
 					goto next_sess;
 
 				LIST_ADDQ(&curr_sess->back_refs, &si->applet.ctx.sess.bref.users);
 				/* call the proper dump() function and return if we're missing space */
-				if (!stats_dump_full_sess_to_buffer(si))
+				if (!stats_dump_full_sess_to_buffer(si, curr_sess))
 					return 0;
 
 				/* session dump complete */
 				LIST_DEL(&si->applet.ctx.sess.bref.users);
 				LIST_INIT(&si->applet.ctx.sess.bref.users);
-				si->applet.ctx.sess.target = NULL;
-				break;
+				if (si->applet.ctx.sess.target != (void *)-1) {
+					si->applet.ctx.sess.target = NULL;
+					break;
+				}
+				else
+					goto next_sess;
 			}
 
 			chunk_appendf(&trash,
@@ -3740,7 +3915,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 			si->applet.ctx.sess.bref.ref = curr_sess->list.n;
 		}
 
-		if (si->applet.ctx.sess.target) {
+		if (si->applet.ctx.sess.target && si->applet.ctx.sess.target != (void *)-1) {
 			/* specified session not found */
 			if (si->applet.ctx.sess.section > 0)
 				chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
@@ -3764,17 +3939,29 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 	}
 }
 
+/* This is called when the stream interface is closed. For instance, upon an
+ * external abort, we won't call the i/o handler anymore so we may need to
+ * remove back references to the session currently being dumped.
+ */
+void cli_release_handler(struct stream_interface *si)
+{
+	if (si->applet.st0 == STAT_CLI_O_SESS && si->conn->xprt_st == STAT_ST_LIST) {
+		if (!LIST_ISEMPTY(&si->applet.ctx.sess.bref.users))
+			LIST_DEL(&si->applet.ctx.sess.bref.users);
+	}
+}
+
 /* This function dumps all tables' states onto the stream interface's
  * read buffer. The xprt_ctx must have been zeroed first, and the flags
  * properly set. It returns 0 if the output buffer is full and it needs
  * to be called again, otherwise non-zero.
  */
-static int stats_table_request(struct stream_interface *si, bool show)
+static int stats_table_request(struct stream_interface *si, int show)
 {
 	struct session *s = si->conn->xprt_ctx;
 	struct ebmb_node *eb;
 	int dt;
-	bool skip_entry;
+	int skip_entry;
 
 	/*
 	 * We have 3 possible states in si->conn->xprt_st :
@@ -3839,7 +4026,7 @@ static int stats_table_request(struct stream_interface *si, bool show)
 			break;
 
 		case STAT_ST_LIST:
-			skip_entry = false;
+			skip_entry = 0;
 
 			if (si->applet.ctx.table.data_type >= 0) {
 				/* we're filtering on some data contents */
@@ -3881,7 +4068,7 @@ static int stats_table_request(struct stream_interface *si, bool show)
 				     (si->applet.ctx.table.data_op == STD_OP_EQ ||
 				      si->applet.ctx.table.data_op == STD_OP_LT ||
 				      si->applet.ctx.table.data_op == STD_OP_LE)))
-					skip_entry = true;
+					skip_entry = 1;
 			}
 
 			if (show && !skip_entry &&
@@ -4171,7 +4358,7 @@ static struct si_applet cli_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<CLI>", /* used for logging */
 	.fct = cli_io_handler,
-	.release = NULL,
+	.release = cli_release_handler,
 };
 
 static struct cfg_kw_list cfg_kws = {{ },{

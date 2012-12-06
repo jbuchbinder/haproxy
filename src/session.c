@@ -109,6 +109,7 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	s->si[0].conn->t.sock.fd = cfd;
 	s->si[0].conn->ctrl = l->proto;
 	s->si[0].conn->flags = CO_FL_NONE;
+	s->si[0].conn->err_code = CO_ER_NONE;
 	s->si[0].conn->addr.from = *addr;
 	s->si[0].conn->target = &l->obj_type;
 
@@ -242,14 +243,73 @@ int session_accept(struct listener *l, int cfd, struct sockaddr_storage *addr)
 	return ret;
 }
 
+
+/* prepare the trash with a log prefix for session <s> */
+static void prepare_mini_sess_log_prefix(struct session *s)
+{
+	struct tm tm;
+	char pn[INET6_ADDRSTRLEN];
+	int ret;
+	char *end;
+
+	ret = addr_to_str(&s->si[0].conn->addr.from, pn, sizeof(pn));
+	if (ret <= 0)
+		chunk_printf(&trash, "unknown [");
+	else if (ret == AF_UNIX)
+		chunk_printf(&trash, "%s:%d [", pn, s->listener->luid);
+	else
+		chunk_printf(&trash, "%s:%d [", pn, get_host_port(&s->si[0].conn->addr.from));
+
+	get_localtime(s->logs.accept_date.tv_sec, &tm);
+	end = date2str_log(trash.str + trash.len, &tm, &(s->logs.accept_date), trash.size - trash.len);
+	trash.len = end - trash.str;
+	if (s->listener->name)
+		chunk_appendf(&trash, "] %s/%s", s->fe->id, s->listener->name);
+	else
+		chunk_appendf(&trash, "] %s/%d", s->fe->id, s->listener->luid);
+}
+
 /* This function kills an existing embryonic session. It stops the connection's
  * transport layer, releases assigned resources, resumes the listener if it was
  * disabled and finally kills the file descriptor.
  */
 static void kill_mini_session(struct session *s)
 {
+	int level = LOG_INFO;
+	struct connection *conn = s->si[0].conn;
+	unsigned int log = s->logs.logwait;
+	const char *err_msg;
+
+	if (s->fe->options2 & PR_O2_LOGERRORS)
+		level = LOG_ERR;
+
+	if (log && (s->fe->options & PR_O_NULLNOLOG)) {
+		/* with "option dontlognull", we don't log connections with no transfer */
+		if (!conn->err_code ||
+		    conn->err_code == CO_ER_PRX_EMPTY || conn->err_code == CO_ER_PRX_ABORT ||
+		    conn->err_code == CO_ER_SSL_EMPTY || conn->err_code == CO_ER_SSL_ABORT)
+			log = 0;
+	}
+
+	if (log) {
+		if (!conn->err_code && (s->task->state & TASK_WOKEN_TIMER)) {
+			if (conn->flags & CO_FL_ACCEPT_PROXY)
+				conn->err_code = CO_ER_PRX_TIMEOUT;
+			else if (conn->flags & CO_FL_SSL_WAIT_HS)
+				conn->err_code = CO_ER_SSL_TIMEOUT;
+		}
+
+		prepare_mini_sess_log_prefix(s);
+		err_msg = conn_err_code_str(conn);
+		if (err_msg)
+			send_log(s->fe, level, "%s: %s\n", trash.str, err_msg);
+		else
+			send_log(s->fe, level, "%s: unknown connection error (code=%d flags=%08x)\n",
+				 trash.str, conn->err_code, conn->flags);
+	}
+
 	/* kill the connection now */
-	conn_xprt_close(s->si[0].conn);
+	conn_full_close(s->si[0].conn);
 
 	s->fe->feconn--;
 	if (s->stkctr1_entry || s->stkctr2_entry)
@@ -272,11 +332,6 @@ static void kill_mini_session(struct session *s)
 
 	task_delete(s->task);
 	task_free(s->task);
-
-	if (fdtab[s->si[0].conn->t.sock.fd].owner)
-		fd_delete(s->si[0].conn->t.sock.fd);
-	else
-		close(s->si[0].conn->t.sock.fd);
 
 	pool_free2(pool2_connection, s->si[1].conn);
 	pool_free2(pool2_connection, s->si[0].conn);
@@ -408,6 +463,7 @@ int session_complete(struct session *s)
 	 */
 	s->si[1].conn->t.sock.fd = -1; /* just to help with debugging */
 	s->si[1].conn->flags = CO_FL_NONE;
+	s->si[1].conn->err_code = CO_ER_NONE;
 	s->si[1].owner     = t;
 	s->si[1].state     = s->si[1].prev_state = SI_ST_INI;
 	s->si[1].err_type  = SI_ET_NONE;
@@ -565,10 +621,10 @@ static void session_free(struct session *s)
 		sess_change_server(s, NULL);
 	}
 
-	if (s->comp_algo) {
+	if (s->flags & SN_COMP_READY)
 		s->comp_algo->end(&s->comp_ctx);
-		s->comp_algo = NULL;
-	}
+	s->comp_algo = NULL;
+	s->flags &= ~SN_COMP_READY;
 
 	if (s->req->pipe)
 		put_pipe(s->req->pipe);
@@ -2438,12 +2494,18 @@ struct task *process_session(struct task *t)
 		if (n < 1 || n > 5)
 			n = 0;
 
-		if (s->fe->mode == PR_MODE_HTTP)
+		if (s->fe->mode == PR_MODE_HTTP) {
 			s->fe->fe_counters.p.http.rsp[n]++;
-
+			if (s->comp_algo && (s->flags & SN_COMP_READY))
+				s->fe->fe_counters.p.http.comp_rsp++;
+		}
 		if ((s->flags & SN_BE_ASSIGNED) &&
-		    (s->be->mode == PR_MODE_HTTP))
+		    (s->be->mode == PR_MODE_HTTP)) {
 			s->be->be_counters.p.http.rsp[n]++;
+			s->be->be_counters.p.http.cum_req++;
+			if (s->comp_algo && (s->flags & SN_COMP_READY))
+				s->be->be_counters.p.http.comp_rsp++;
+		}
 	}
 
 	/* let's do a final log if we need it */

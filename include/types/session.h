@@ -89,6 +89,8 @@
 #define SN_BE_TRACK_SC1 0x00100000	/* backend tracks stick-counter 1 */
 #define SN_BE_TRACK_SC2 0x00200000	/* backend tracks stick-counter 2 */
 
+#define SN_COMP_READY   0x00400000	/* the compression is initialized */
+
 
 /* WARNING: if new fields are added, they must be initialized in event_accept()
  * and freed in session_free() !
@@ -157,7 +159,7 @@ struct session {
 	void (*srv_error)(struct session *s,	/* the function to call upon unrecoverable server errors (or NULL) */
 			  struct stream_interface *si);
 	unsigned int uniq_id;			/* unique ID used for the traces */
-	struct comp_ctx comp_ctx;		/* HTTP compression context */
+	struct comp_ctx *comp_ctx;		/* HTTP compression context */
 	struct comp_algo *comp_algo;		/* HTTP compression algorithm if not NULL */
 	char *unique_id;			/* custom unique ID */
 };

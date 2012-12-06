@@ -37,6 +37,9 @@
 
 #ifdef USE_ZLIB
 
+static void *alloc_zlib(void *opaque, unsigned int items, unsigned int size);
+static void free_zlib(void *opaque, void *ptr);
+
 /* zlib allocation  */
 static struct pool_head *zlib_pool_deflate_state = NULL;
 static struct pool_head *zlib_pool_window = NULL;
@@ -44,10 +47,12 @@ static struct pool_head *zlib_pool_prev = NULL;
 static struct pool_head *zlib_pool_head = NULL;
 static struct pool_head *zlib_pool_pending_buf = NULL;
 
-static long long zlib_memory_available = -1;
-
+long zlib_used_memory = 0;
 
 #endif
+
+unsigned int compress_min_idle = 0;
+static struct pool_head *pool_comp_ctx = NULL;
 
 
 const struct comp_algo comp_algos[] =
@@ -164,6 +169,7 @@ int http_compression_buffer_init(struct session *s, struct buffer *in, struct bu
 int http_compression_buffer_add_data(struct session *s, struct buffer *in, struct buffer *out)
 {
 	struct http_msg *msg = &s->txn.rsp;
+	int consumed_data = 0;
 	int data_process_len;
 	int left;
 	int ret;
@@ -186,28 +192,23 @@ int http_compression_buffer_add_data(struct session *s, struct buffer *in, struc
 
 	left = data_process_len - bi_contig_data(in);
 	if (left <= 0) {
-		ret = s->comp_algo->add_data(&s->comp_ctx, bi_ptr(in),
-					     data_process_len, bi_end(out),
-					     out->size - buffer_len(out));
+		consumed_data += ret = s->comp_algo->add_data(s->comp_ctx, bi_ptr(in), data_process_len, out);
 		if (ret < 0)
 			return -1;
-		out->i += ret;
 
 	} else {
-		ret = s->comp_algo->add_data(&s->comp_ctx, bi_ptr(in), bi_contig_data(in), bi_end(out), out->size - buffer_len(out));
+		consumed_data += ret = s->comp_algo->add_data(s->comp_ctx, bi_ptr(in), bi_contig_data(in), out);
 		if (ret < 0)
 			return -1;
-		out->i += ret;
-		ret = s->comp_algo->add_data(&s->comp_ctx, in->data, left, bi_end(out), out->size - buffer_len(out));
+		consumed_data += ret = s->comp_algo->add_data(s->comp_ctx, in->data, left, out);
 		if (ret < 0)
 			return -1;
-		out->i += ret;
 	}
 
 	b_adv(in, data_process_len);
 	msg->chunk_len -= data_process_len;
 
-	return 0;
+	return consumed_data;
 }
 
 /*
@@ -216,7 +217,7 @@ int http_compression_buffer_add_data(struct session *s, struct buffer *in, struc
  */
 int http_compression_buffer_end(struct session *s, struct buffer **in, struct buffer **out, int end)
 {
-	int to_forward;
+	int to_forward, forwarded;
 	int left;
 	struct http_msg *msg = &s->txn.rsp;
 	struct buffer *ib = *in, *ob = *out;
@@ -227,9 +228,9 @@ int http_compression_buffer_end(struct session *s, struct buffer **in, struct bu
 	/* flush data here */
 
 	if (end)
-		ret = s->comp_algo->flush(&s->comp_ctx, ob, Z_FINISH); /* end of data */
+		ret = s->comp_algo->flush(s->comp_ctx, ob, Z_FINISH); /* end of data */
 	else
-		ret = s->comp_algo->flush(&s->comp_ctx, ob, Z_SYNC_FLUSH); /* end of buffer */
+		ret = s->comp_algo->flush(s->comp_ctx, ob, Z_SYNC_FLUSH); /* end of buffer */
 
 	if (ret < 0)
 		return -1; /* flush failed */
@@ -263,8 +264,15 @@ int http_compression_buffer_end(struct session *s, struct buffer **in, struct bu
 	to_forward = ob->i;
 
 	/* update input rate */
-	if (s->comp_ctx.cur_lvl > 0)
-		update_freq_ctr(&global.comp_bps_in, ib->o - ob->o);
+	forwarded = ib->o - ob->o;
+	if (s->comp_ctx && s->comp_ctx->cur_lvl > 0) {
+		update_freq_ctr(&global.comp_bps_in, forwarded);
+		s->fe->fe_counters.comp_in += forwarded;
+		s->be->be_counters.comp_in += forwarded;
+	} else {
+		s->fe->fe_counters.comp_byp += forwarded;
+		s->be->be_counters.comp_byp += forwarded;
+	}
 
 	/* copy the remaining data in the tmp buffer. */
 	if (ib->i > 0) {
@@ -281,17 +289,62 @@ int http_compression_buffer_end(struct session *s, struct buffer **in, struct bu
 	*in = ob;
 	*out = ib;
 
-	if (s->comp_ctx.cur_lvl > 0)
+	if (s->comp_ctx && s->comp_ctx->cur_lvl > 0) {
 		update_freq_ctr(&global.comp_bps_out, to_forward);
+		s->fe->fe_counters.comp_out += to_forward;
+		s->be->be_counters.comp_out += to_forward;
+	}
 
 	/* forward the new chunk without remaining data */
 	b_adv(ob, to_forward);
 
-	/* if there are data between p and next, there are trailers, must forward them */
-	b_adv(ob, msg->next);
-	msg->next = 0;
-
 	return to_forward;
+}
+
+/*
+ * Alloc the comp_ctx
+ */
+static inline int init_comp_ctx(struct comp_ctx **comp_ctx)
+{
+#ifdef USE_ZLIB
+	z_stream *strm;
+
+	if (global.maxzlibmem > 0 && (global.maxzlibmem - zlib_used_memory) < sizeof(struct comp_ctx))
+		return -1;
+#endif
+
+	if (unlikely(pool_comp_ctx == NULL))
+		pool_comp_ctx = create_pool("comp_ctx", sizeof(struct comp_ctx), MEM_F_SHARED);
+
+	*comp_ctx = pool_alloc2(pool_comp_ctx);
+	if (*comp_ctx == NULL)
+		return -1;
+#ifdef USE_ZLIB
+	zlib_used_memory += sizeof(struct comp_ctx);
+
+	strm = &(*comp_ctx)->strm;
+	strm->zalloc = alloc_zlib;
+	strm->zfree = free_zlib;
+	strm->opaque = *comp_ctx;
+#endif
+	return 0;
+}
+
+/*
+ * Dealloc the comp_ctx
+ */
+static inline int deinit_comp_ctx(struct comp_ctx **comp_ctx)
+{
+	if (!*comp_ctx)
+		return 0;
+
+	pool_free2(pool_comp_ctx, *comp_ctx);
+	*comp_ctx = NULL;
+
+#ifdef USE_ZLIB
+	zlib_used_memory -= sizeof(struct comp_ctx);
+#endif
+	return 0;
 }
 
 
@@ -302,21 +355,26 @@ int http_compression_buffer_end(struct session *s, struct buffer **in, struct bu
 /*
  * Init the identity algorithm
  */
-int identity_init(struct comp_ctx *comp_ctx, int level)
+int identity_init(struct comp_ctx **comp_ctx, int level)
 {
 	return 0;
 }
 
 /*
  * Process data
- *   Return size of processed data or -1 on error
+ *   Return size of consumed data or -1 on error
  */
-int identity_add_data(struct comp_ctx *comp_ctx, const char *in_data, int in_len, char *out_data, int out_len)
+int identity_add_data(struct comp_ctx *comp_ctx, const char *in_data, int in_len, struct buffer *out)
 {
+	char *out_data = bi_end(out);
+	int out_len = out->size - buffer_len(out);
+
 	if (out_len < in_len)
 		return -1;
 
 	memcpy(out_data, in_data, in_len);
+
+	out->i += in_len;
 
 	return in_len;
 }
@@ -326,7 +384,6 @@ int identity_flush(struct comp_ctx *comp_ctx, struct buffer *out, int flag)
 	return 0;
 }
 
-
 int identity_reset(struct comp_ctx *comp_ctx)
 {
 	return 0;
@@ -335,7 +392,7 @@ int identity_reset(struct comp_ctx *comp_ctx)
 /*
  * Deinit the algorithm
  */
-int identity_end(struct comp_ctx *comp_ctx)
+int identity_end(struct comp_ctx **comp_ctx)
 {
 	return 0;
 }
@@ -352,10 +409,8 @@ static void *alloc_zlib(void *opaque, unsigned int items, unsigned int size)
 	static char round = 0; /* order in deflateInit2 */
 	void *buf = NULL;
 
-	if (global.maxzlibmem > 0 && zlib_memory_available < items * size){
-		buf = NULL;
+	if (global.maxzlibmem > 0 && (global.maxzlibmem - zlib_used_memory) < (long)(items * size))
 		goto end;
-	}
 
 	switch (round) {
 		case 0:
@@ -388,12 +443,18 @@ static void *alloc_zlib(void *opaque, unsigned int items, unsigned int size)
 			ctx->zlib_pending_buf = buf = pool_alloc2(zlib_pool_pending_buf);
 		break;
 	}
-	if (buf != NULL && global.maxzlibmem > 0)
-		zlib_memory_available -= items * size;
+	if (buf != NULL)
+		zlib_used_memory += items * size;
 
 end:
 
-	round = (round + 1) % 5;   /* there are 5 zalloc call in deflateInit2 */
+	/* deflateInit2() first allocates and checks the deflate_state, then if
+	 * it succeeds, it allocates all other 4 areas at ones and checks them
+	 * at the end. So we want to correctly count the rounds depending on when
+	 * zlib is supposed to abort.
+	 */
+	if (buf || round)
+		round = (round + 1) % 5;
 	return buf;
 }
 
@@ -414,27 +475,27 @@ static void free_zlib(void *opaque, void *ptr)
 		pool = zlib_pool_pending_buf;
 
 	pool_free2(pool, ptr);
-	if (global.maxzlibmem > 0)
-		zlib_memory_available += pool->size;
+	zlib_used_memory -= pool->size;
 }
-
 
 /**************************
 ****  gzip algorithm   ****
 ***************************/
-int gzip_init(struct comp_ctx *comp_ctx, int level)
+int gzip_init(struct comp_ctx **comp_ctx, int level)
 {
-	z_stream *strm = &comp_ctx->strm;
+	z_stream *strm;
 
-	if (global.maxzlibmem > 0 && zlib_memory_available < 0)
-		zlib_memory_available = global.maxzlibmem * 1024 * 1024;  /*  Megabytes to bytes */
-
-	strm->zalloc = alloc_zlib;
-	strm->zfree = free_zlib;
-	strm->opaque = comp_ctx;
-
-	if (deflateInit2(&comp_ctx->strm, level, Z_DEFLATED, global.tune.zlibwindowsize + 16, global.tune.zlibmemlevel, Z_DEFAULT_STRATEGY) != Z_OK)
+	if (init_comp_ctx(comp_ctx) < 0)
 		return -1;
+
+	strm = &(*comp_ctx)->strm;
+
+	if (deflateInit2(strm, level, Z_DEFLATED, global.tune.zlibwindowsize + 16, global.tune.zlibmemlevel, Z_DEFAULT_STRATEGY) != Z_OK) {
+		deinit_comp_ctx(comp_ctx);
+		return -1;
+	}
+
+	(*comp_ctx)->cur_lvl = level;
 
 	return 0;
 }
@@ -442,24 +503,32 @@ int gzip_init(struct comp_ctx *comp_ctx, int level)
 **** Deflate algorithm ****
 ***************************/
 
-int deflate_init(struct comp_ctx *comp_ctx, int level)
+int deflate_init(struct comp_ctx **comp_ctx, int level)
 {
-	z_stream *strm = &comp_ctx->strm;
+	z_stream *strm;
 
-	strm->zalloc = alloc_zlib;
-	strm->zfree = free_zlib;
-	strm->opaque = comp_ctx;
-
-	if (deflateInit(&comp_ctx->strm, level) != Z_OK)
+	if (init_comp_ctx(comp_ctx) < 0)
 		return -1;
+
+	strm = &(*comp_ctx)->strm;
+
+	if (deflateInit(strm, level) != Z_OK) {
+		deinit_comp_ctx(comp_ctx);
+		return -1;
+	}
+
+	(*comp_ctx)->cur_lvl = level;
 
 	return 0;
 }
 
-int deflate_add_data(struct comp_ctx *comp_ctx, const char *in_data, int in_len, char *out_data, int out_len)
+/* Return the size of consumed data or -1 */
+int deflate_add_data(struct comp_ctx *comp_ctx, const char *in_data, int in_len, struct buffer *out)
 {
-	z_stream *strm = &comp_ctx->strm;
 	int ret;
+	z_stream *strm = &comp_ctx->strm;
+	char *out_data = bi_end(out);
+	int out_len = out->size - buffer_len(out);
 
 	if (in_len <= 0)
 		return 0;
@@ -478,8 +547,9 @@ int deflate_add_data(struct comp_ctx *comp_ctx, const char *in_data, int in_len,
 		return -1;
 
 	/* deflate update the available data out */
+	out->i += out_len - strm->avail_out;
 
-	return out_len - strm->avail_out;
+	return in_len - strm->avail_in;
 }
 
 int deflate_flush(struct comp_ctx *comp_ctx, struct buffer *out, int flag)
@@ -498,21 +568,19 @@ int deflate_flush(struct comp_ctx *comp_ctx, struct buffer *out, int flag)
 	out_len = (out->size - buffer_len(out)) - strm->avail_out;
 	out->i += out_len;
 
-	/* compression rate limit */
-	if (global.comp_rate_lim > 0) {
-
-		if (read_freq_ctr(&global.comp_bps_out) > global.comp_rate_lim) {
-			/* decrease level */
-			if (comp_ctx->cur_lvl > 0) {
-				comp_ctx->cur_lvl--;
-				deflateParams(&comp_ctx->strm, comp_ctx->cur_lvl, Z_DEFAULT_STRATEGY);
-			}
-
-		} else if (comp_ctx->cur_lvl < global.comp_rate_lim) {
-			/* increase level */
-			comp_ctx->cur_lvl++ ;
+	/* compression limit */
+	if ((global.comp_rate_lim > 0 && (read_freq_ctr(&global.comp_bps_out) > global.comp_rate_lim)) ||    /* rate */
+	   (idle_pct < compress_min_idle)) {                                                                     /* idle */
+		/* decrease level */
+		if (comp_ctx->cur_lvl > 0) {
+			comp_ctx->cur_lvl--;
 			deflateParams(&comp_ctx->strm, comp_ctx->cur_lvl, Z_DEFAULT_STRATEGY);
 		}
+
+	} else if (comp_ctx->cur_lvl < global.tune.comp_maxlevel) {
+		/* increase level */
+		comp_ctx->cur_lvl++ ;
+		deflateParams(&comp_ctx->strm, comp_ctx->cur_lvl, Z_DEFAULT_STRATEGY);
 	}
 
 	return out_len;
@@ -527,14 +595,16 @@ int deflate_reset(struct comp_ctx *comp_ctx)
 	return -1;
 }
 
-int deflate_end(struct comp_ctx *comp_ctx)
+int deflate_end(struct comp_ctx **comp_ctx)
 {
-	z_stream *strm = &comp_ctx->strm;
+	z_stream *strm = &(*comp_ctx)->strm;
+	int ret;
 
-	if (deflateEnd(strm) != Z_OK)
-		return -1;
+	ret = deflateEnd(strm);
 
-	return 0;
+	deinit_comp_ctx(comp_ctx);
+
+	return ret;
 }
 
 #endif /* USE_ZLIB */

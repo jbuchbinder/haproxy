@@ -227,9 +227,7 @@ int stream_int_shutr(struct stream_interface *si)
 		return 0;
 
 	if (si->ob->flags & CF_SHUTW) {
-		conn_xprt_close(si->conn);
-		if (conn->ctrl)
-			fd_delete(si->conn->t.sock.fd);
+		conn_full_close(si->conn);
 		si->state = SI_ST_DIS;
 		si->exp = TICK_ETERNITY;
 
@@ -318,9 +316,7 @@ int stream_int_shutw(struct stream_interface *si)
 		/* we may have to close a pending connection, and mark the
 		 * response buffer as shutr
 		 */
-		conn_xprt_close(si->conn);
-		if (conn->ctrl)
-			fd_delete(si->conn->t.sock.fd);
+		conn_full_close(si->conn);
 		/* fall through */
 	case SI_ST_CER:
 	case SI_ST_QUE:
@@ -489,7 +485,6 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
  out_error:
 	/* Write error on the file descriptor */
 	conn->flags |= CO_FL_ERROR;
-	conn->flags &= ~flag;
 	return 0;
 
  out_wait:
@@ -578,6 +573,8 @@ static int si_conn_wake_cb(struct connection *conn)
 	}
 	else if ((si->ib->flags & (CF_SHUTR|CF_READ_PARTIAL|CF_DONT_READ|CF_READ_NOEXP)) == CF_READ_PARTIAL &&
 		 !channel_full(si->ib)) {
+		/* we must re-enable reading if si_chk_snd() has freed some space */
+		__conn_data_want_recv(conn);
 		if (tick_isset(si->ib->rex))
 			si->ib->rex = tick_add_ifset(now_ms, si->ib->rto);
 	}
@@ -1163,8 +1160,19 @@ void stream_sock_read0(struct stream_interface *si)
 	return;
 
  do_close:
-	conn_xprt_close(si->conn);
-	fd_delete(si->conn->t.sock.fd);
+	/* OK we completely close the socket here just as if we went through si_shut[rw]() */
+	conn_full_close(si->conn);
+
+	si->ib->flags &= ~CF_SHUTR_NOW;
+	si->ib->flags |= CF_SHUTR;
+	si->ib->rex = TICK_ETERNITY;
+
+	si->ob->flags &= ~CF_SHUTW_NOW;
+	si->ob->flags |= CF_SHUTW;
+	si->ob->wex = TICK_ETERNITY;
+
+	si->flags &= ~(SI_FL_WAIT_DATA | SI_FL_WAIT_ROOM);
+
 	si->state = SI_ST_DIS;
 	si->exp = TICK_ETERNITY;
 	if (si->release)

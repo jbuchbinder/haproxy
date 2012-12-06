@@ -93,8 +93,10 @@ void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
 
 	if (where & SSL_CB_HANDSHAKE_START) {
 		/* Disable renegotiation (CVE-2009-3555) */
-		if (conn->flags & CO_FL_CONNECTED)
+		if (conn->flags & CO_FL_CONNECTED) {
 			conn->flags |= CO_FL_ERROR;
+			conn->err_code = CO_ER_SSL_RENEG;
+		}
 	}
 }
 
@@ -125,9 +127,12 @@ int ssl_sock_verifycbk(int ok, X509_STORE_CTX *x_store)
 			conn->xprt_st |= SSL_SOCK_CAEDEPTH_TO_ST(depth);
 		}
 
-		if (objt_listener(conn->target)->bind_conf->ca_ignerr & (1ULL << err))
+		if (objt_listener(conn->target)->bind_conf->ca_ignerr & (1ULL << err)) {
+			ERR_clear_error();
 			return 1;
+		}
 
+		conn->err_code = CO_ER_SSL_CA_FAIL;
 		return 0;
 	}
 
@@ -135,9 +140,12 @@ int ssl_sock_verifycbk(int ok, X509_STORE_CTX *x_store)
 		conn->xprt_st |= SSL_SOCK_CRTERROR_TO_ST(err);
 
 	/* check if certificate error needs to be ignored */
-	if (objt_listener(conn->target)->bind_conf->crt_ignerr & (1ULL << err))
+	if (objt_listener(conn->target)->bind_conf->crt_ignerr & (1ULL << err)) {
+		ERR_clear_error();
 		return 1;
+	}
 
+	conn->err_code = CO_ER_SSL_CRT_FAIL;
 	return 0;
 }
 
@@ -467,6 +475,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, struct proxy *cu
 
 #ifndef SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION   /* needs OpenSSL >= 0.9.7 */
 #define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION 0
+#define SSL_renegotiate_pending(arg) 0
 #endif
 #ifndef SSL_OP_SINGLE_ECDH_USE                          /* needs OpenSSL >= 0.9.8 */
 #define SSL_OP_SINGLE_ECDH_USE 0
@@ -560,6 +569,9 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 		}
 #endif
 	}
+
+	if (global.tune.ssllifetime)
+		SSL_CTX_set_timeout(ctx, global.tune.ssllifetime);
 
 	shared_context_set_cache(ctx);
 	if (bind_conf->ciphers &&
@@ -702,6 +714,9 @@ int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 #endif
 	}
 
+	if (global.tune.ssllifetime)
+		SSL_CTX_set_timeout(srv->ssl_ctx.ctx, global.tune.ssllifetime);
+
 	SSL_CTX_set_session_cache_mode(srv->ssl_ctx.ctx, SSL_SESS_CACHE_OFF);
 	if (srv->ssl_ctx.ciphers &&
 		!SSL_CTX_set_cipher_list(srv->ssl_ctx.ctx, srv->ssl_ctx.ciphers)) {
@@ -793,16 +808,20 @@ static int ssl_sock_init(struct connection *conn)
 	if (conn->xprt_ctx)
 		return 0;
 
-	if (global.maxsslconn && sslconns >= global.maxsslconn)
+	if (global.maxsslconn && sslconns >= global.maxsslconn) {
+		conn->err_code = CO_ER_SSL_TOO_MANY;
 		return -1;
+	}
 
 	/* If it is in client mode initiate SSL session
 	   in connect state otherwise accept state */
 	if (objt_server(conn->target)) {
 		/* Alloc a new SSL session ctx */
 		conn->xprt_ctx = SSL_new(objt_server(conn->target)->ssl_ctx.ctx);
-		if (!conn->xprt_ctx)
+		if (!conn->xprt_ctx) {
+			conn->err_code = CO_ER_SSL_NO_MEM;
 			return -1;
+		}
 
 		SSL_set_connect_state(conn->xprt_ctx);
 		if (objt_server(conn->target)->ssl_ctx.reused_sess)
@@ -820,8 +839,10 @@ static int ssl_sock_init(struct connection *conn)
 	else if (objt_listener(conn->target)) {
 		/* Alloc a new SSL session ctx */
 		conn->xprt_ctx = SSL_new(objt_listener(conn->target)->bind_conf->default_ctx);
-		if (!conn->xprt_ctx)
+		if (!conn->xprt_ctx) {
+			conn->err_code = CO_ER_SSL_NO_MEM;
 			return -1;
+		}
 
 		SSL_set_accept_state(conn->xprt_ctx);
 
@@ -838,6 +859,7 @@ static int ssl_sock_init(struct connection *conn)
 		return 0;
 	}
 	/* don't know how to handle such a target */
+	conn->err_code = CO_ER_SSL_NO_TARGET;
 	return -1;
 }
 
@@ -893,6 +915,15 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				/* if errno is null, then connection was successfully established */
 				if (!errno && conn->flags & CO_FL_WAIT_L4_CONN)
 					conn->flags &= ~CO_FL_WAIT_L4_CONN;
+				if (!conn->err_code) {
+					if (!((SSL *)conn->xprt_ctx)->packet_length)
+						if (!errno)
+							conn->err_code = CO_ER_SSL_EMPTY;
+						else
+							conn->err_code = CO_ER_SSL_ABORT;
+					else
+						conn->err_code = CO_ER_SSL_HANDSHAKE;
+				}
 				goto out_error;
 			}
 			else {
@@ -903,6 +934,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				 * data to avoid this as much as possible.
 				 */
 				ret = recv(conn->t.sock.fd, trash.str, trash.size, MSG_NOSIGNAL|MSG_DONTWAIT);
+				if (!conn->err_code)
+					conn->err_code = CO_ER_SSL_HANDSHAKE;
 				goto out_error;
 			}
 		}
@@ -933,6 +966,14 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			/* if errno is null, then connection was successfully established */
 			if (!errno && conn->flags & CO_FL_WAIT_L4_CONN)
 				conn->flags &= ~CO_FL_WAIT_L4_CONN;
+
+			if (!((SSL *)conn->xprt_ctx)->packet_length)
+				if (!errno)
+					conn->err_code = CO_ER_SSL_EMPTY;
+				else
+					conn->err_code = CO_ER_SSL_ABORT;
+			else
+				conn->err_code = CO_ER_SSL_HANDSHAKE;
 			goto out_error;
 		}
 		else {
@@ -943,6 +984,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			 * data to avoid this as much as possible.
 			 */
 			ret = recv(conn->t.sock.fd, trash.str, trash.size, MSG_NOSIGNAL|MSG_DONTWAIT);
+			if (!conn->err_code)
+				conn->err_code = CO_ER_SSL_HANDSHAKE;
 			goto out_error;
 		}
 	}
@@ -973,7 +1016,8 @@ reneg_ok:
 
 	/* Fail on all other handshake errors */
 	conn->flags |= CO_FL_ERROR;
-	conn->flags &= ~flag;
+	if (!conn->err_code)
+		conn->err_code = CO_ER_SSL_HANDSHAKE;
 	return 0;
 }
 

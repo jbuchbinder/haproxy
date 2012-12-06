@@ -57,26 +57,26 @@ static const struct check_status check_statuses[HCHK_STATUS_SIZE] = {
 	[HCHK_STATUS_INI]	= { SRV_CHK_UNKNOWN,                   "INI",     "Initializing" },
 	[HCHK_STATUS_START]	= { /* SPECIAL STATUS*/ },
 
-	[HCHK_STATUS_HANA]	= { SRV_CHK_ERROR,                     "HANA",    "Health analyze" },
+	[HCHK_STATUS_HANA]	= { SRV_CHK_FAILED,                    "HANA",    "Health analyze" },
 
-	[HCHK_STATUS_SOCKERR]	= { SRV_CHK_ERROR,                     "SOCKERR", "Socket error" },
+	[HCHK_STATUS_SOCKERR]	= { SRV_CHK_FAILED,                    "SOCKERR", "Socket error" },
 
-	[HCHK_STATUS_L4OK]	= { SRV_CHK_RUNNING,                   "L4OK",    "Layer4 check passed" },
-	[HCHK_STATUS_L4TOUT]	= { SRV_CHK_ERROR,                     "L4TOUT",  "Layer4 timeout" },
-	[HCHK_STATUS_L4CON]	= { SRV_CHK_ERROR,                     "L4CON",   "Layer4 connection problem" },
+	[HCHK_STATUS_L4OK]	= { SRV_CHK_PASSED,                    "L4OK",    "Layer4 check passed" },
+	[HCHK_STATUS_L4TOUT]	= { SRV_CHK_FAILED,                    "L4TOUT",  "Layer4 timeout" },
+	[HCHK_STATUS_L4CON]	= { SRV_CHK_FAILED,                    "L4CON",   "Layer4 connection problem" },
 
-	[HCHK_STATUS_L6OK]	= { SRV_CHK_RUNNING,                   "L6OK",    "Layer6 check passed" },
-	[HCHK_STATUS_L6TOUT]	= { SRV_CHK_ERROR,                     "L6TOUT",  "Layer6 timeout" },
-	[HCHK_STATUS_L6RSP]	= { SRV_CHK_ERROR,                     "L6RSP",   "Layer6 invalid response" },
+	[HCHK_STATUS_L6OK]	= { SRV_CHK_PASSED,                    "L6OK",    "Layer6 check passed" },
+	[HCHK_STATUS_L6TOUT]	= { SRV_CHK_FAILED,                    "L6TOUT",  "Layer6 timeout" },
+	[HCHK_STATUS_L6RSP]	= { SRV_CHK_FAILED,                    "L6RSP",   "Layer6 invalid response" },
 
-	[HCHK_STATUS_L7TOUT]	= { SRV_CHK_ERROR,                     "L7TOUT",  "Layer7 timeout" },
-	[HCHK_STATUS_L7RSP]	= { SRV_CHK_ERROR,                     "L7RSP",   "Layer7 invalid response" },
+	[HCHK_STATUS_L7TOUT]	= { SRV_CHK_FAILED,                    "L7TOUT",  "Layer7 timeout" },
+	[HCHK_STATUS_L7RSP]	= { SRV_CHK_FAILED,                    "L7RSP",   "Layer7 invalid response" },
 
 	[HCHK_STATUS_L57DATA]	= { /* DUMMY STATUS */ },
 
-	[HCHK_STATUS_L7OKD]	= { SRV_CHK_RUNNING,                   "L7OK",    "Layer7 check passed" },
-	[HCHK_STATUS_L7OKCD]	= { SRV_CHK_RUNNING | SRV_CHK_DISABLE, "L7OKC",   "Layer7 check conditionally passed" },
-	[HCHK_STATUS_L7STS]	= { SRV_CHK_ERROR,                     "L7STS",   "Layer7 wrong status" },
+	[HCHK_STATUS_L7OKD]	= { SRV_CHK_PASSED,                    "L7OK",    "Layer7 check passed" },
+	[HCHK_STATUS_L7OKCD]	= { SRV_CHK_PASSED | SRV_CHK_DISABLE,  "L7OKC",   "Layer7 check conditionally passed" },
+	[HCHK_STATUS_L7STS]	= { SRV_CHK_FAILED,                    "L7STS",   "Layer7 wrong status" },
 };
 
 static const struct analyze_status analyze_statuses[HANA_STATUS_SIZE] = {		/* 0: ignore, 1: error, 2: OK */
@@ -229,8 +229,8 @@ static void set_server_check_status(struct server *s, short status, char *desc)
 	}
 
 	if (s->proxy->options2 & PR_O2_LOGHCHKS &&
-	(((s->health != 0) && (s->result & SRV_CHK_ERROR)) ||
-	    ((s->health != s->rise + s->fall - 1) && (s->result & SRV_CHK_RUNNING)) ||
+	(((s->health != 0) && (s->result & SRV_CHK_FAILED)) ||
+	    ((s->health != s->rise + s->fall - 1) && (s->result & SRV_CHK_PASSED)) ||
 	    ((s->state & SRV_GOINGDOWN) && !(s->result & SRV_CHK_DISABLE)) ||
 	    (!(s->state & SRV_GOINGDOWN) && (s->result & SRV_CHK_DISABLE)))) {
 
@@ -244,7 +244,7 @@ static void set_server_check_status(struct server *s, short status, char *desc)
 		fall   = s->fall;
 		state  = s->state;
 
-		if (s->result & SRV_CHK_ERROR) {
+		if (s->result & SRV_CHK_FAILED) {
 			if (health > rise) {
 				health--; /* still good */
 			} else {
@@ -255,7 +255,7 @@ static void set_server_check_status(struct server *s, short status, char *desc)
 			}
 		}
 
-		if (s->result & SRV_CHK_RUNNING) {
+		if (s->result & SRV_CHK_PASSED) {
 			if (health < rise + fall - 1) {
 				health++; /* was bad, stays for a while */
 
@@ -277,7 +277,7 @@ static void set_server_check_status(struct server *s, short status, char *desc)
 		             s->state & SRV_BACKUP ? "backup " : "",
 		             s->proxy->id, s->id,
 		             (s->result & SRV_CHK_DISABLE)?"conditionally ":"",
-		             (s->result & SRV_CHK_RUNNING)?"succeeded":"failed");
+		             (s->result & SRV_CHK_PASSED)?"succeeded":"failed");
 
 		server_status_printf(&trash, s, SSP_O_HCHK, -1);
 
@@ -765,7 +765,7 @@ static void event_srv_chk_w(struct connection *conn)
 	int fd = conn->t.sock.fd;
 	struct task *t = s->check.task;
 
-	if (conn->flags & (CO_FL_SOCK_WR_SH | CO_FL_DATA_WR_SH | CO_FL_WAIT_DATA | CO_FL_WAIT_WR))
+	if (conn->flags & (CO_FL_SOCK_WR_SH | CO_FL_DATA_WR_SH))
 		conn->flags |= CO_FL_ERROR;
 
 	if (unlikely(conn->flags & CO_FL_ERROR)) {
@@ -779,11 +779,11 @@ static void event_srv_chk_w(struct connection *conn)
 		goto out_error;
 	}
 
-	if (conn->flags & CO_FL_HANDSHAKE)
+	if (conn->flags & (CO_FL_HANDSHAKE | CO_FL_WAIT_WR))
 		return;
 
 	/* here, we know that the connection is established */
-	if (!(s->result & SRV_CHK_ERROR)) {
+	if (!(s->result & SRV_CHK_FAILED)) {
 		/* we don't want to mark 'UP' a server on which we detected an error earlier */
 		if (s->check.bo->o) {
 			conn->xprt->snd_buf(conn, s->check.bo, MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -791,26 +791,23 @@ static void event_srv_chk_w(struct connection *conn)
 				set_server_check_status(s, HCHK_STATUS_L4CON, strerror(errno));
 				goto out_wakeup;
 			}
+			if (s->check.bo->o) {
+				goto out_incomplete;
+			}
 		}
 
-		if (!s->check.bo->o) {
-			/* full request sent, we allow up to <timeout.check> if nonzero for a response */
-			if (s->proxy->timeout.check) {
-				t->expire = tick_add_ifset(now_ms, s->proxy->timeout.check);
-				task_queue(t);
-			}
-			__conn_data_want_recv(conn);   /* prepare for reading reply */
-			goto out_nowake;
+		/* full request sent, we allow up to <timeout.check> if nonzero for a response */
+		if (s->proxy->timeout.check) {
+			t->expire = tick_add_ifset(now_ms, s->proxy->timeout.check);
+			task_queue(t);
 		}
-		goto out_poll;
+		goto out_nowake;
 	}
  out_wakeup:
 	task_wakeup(t, TASK_WOKEN_IO);
  out_nowake:
 	__conn_data_stop_send(conn);   /* nothing more to write */
-	return;
- out_poll:
-	__conn_data_poll_send(conn);
+ out_incomplete:
 	return;
  out_error:
 	conn->flags |= CO_FL_ERROR;
@@ -840,18 +837,15 @@ static void event_srv_chk_r(struct connection *conn)
 	int done;
 	unsigned short msglen;
 
-	if (conn->flags & (CO_FL_SOCK_WR_SH | CO_FL_DATA_WR_SH | CO_FL_WAIT_DATA | CO_FL_WAIT_WR))
-		conn->flags |= CO_FL_ERROR;
-
-	if (unlikely((s->result & SRV_CHK_ERROR) || (conn->flags & CO_FL_ERROR))) {
+	if (unlikely((s->result & SRV_CHK_FAILED) || (conn->flags & CO_FL_ERROR))) {
 		/* in case of TCP only, this tells us if the connection failed */
-		if (!(s->result & SRV_CHK_ERROR))
+		if (!(s->result & SRV_CHK_FAILED))
 			set_server_check_status(s, HCHK_STATUS_SOCKERR, NULL);
 
 		goto out_wakeup;
 	}
 
-	if (conn->flags & CO_FL_HANDSHAKE)
+	if (conn->flags & (CO_FL_HANDSHAKE | CO_FL_WAIT_RD))
 		return;
 
 	/* Warning! Linux returns EAGAIN on SO_ERROR if data are still available
@@ -875,7 +869,7 @@ static void event_srv_chk_r(struct connection *conn)
 			 * or not. It is very common that an RST sent by the server is
 			 * reported as an error just after the last data chunk.
 			 */
-			if (!(s->result & SRV_CHK_ERROR))
+			if (!(s->result & SRV_CHK_FAILED))
 				set_server_check_status(s, HCHK_STATUS_SOCKERR, NULL);
 			goto out_wakeup;
 		}
@@ -1151,19 +1145,28 @@ static void event_srv_chk_r(struct connection *conn)
 	} /* switch */
 
  out_wakeup:
-	if (s->result & SRV_CHK_ERROR)
+	if (s->result & SRV_CHK_FAILED)
 		conn->flags |= CO_FL_ERROR;
 
 	/* Reset the check buffer... */
 	*s->check.bi->data = '\0';
 	s->check.bi->i = 0;
 
-	/* Close the connection... */
+	/* Close the connection... We absolutely want to perform a hard close
+	 * and reset the connection if some data are pending, otherwise we end
+	 * up with many TIME_WAITs and eat all the source port range quickly.
+	 * To avoid sending RSTs all the time, we first try to drain pending
+	 * data.
+	 */
 	if (conn->xprt && conn->xprt->shutw)
 		conn->xprt->shutw(conn, 0);
-	if (!(conn->flags & (CO_FL_WAIT_L4_CONN|CO_FL_SOCK_WR_SH)))
-		shutdown(conn->t.sock.fd, SHUT_RDWR);
-	__conn_data_stop_recv(conn);
+	if (conn->ctrl) {
+		if (!(conn->flags & CO_FL_WAIT_RD))
+			recv(conn->t.sock.fd, trash.str, trash.size, MSG_NOSIGNAL|MSG_DONTWAIT);
+		setsockopt(conn->t.sock.fd, SOL_SOCKET, SO_LINGER,
+			   (struct linger *) &nolinger, sizeof(struct linger));
+	}
+	__conn_data_stop_both(conn);
 	task_wakeup(t, TASK_WOKEN_IO);
 	return;
 
@@ -1180,9 +1183,15 @@ static int wake_srv_chk(struct connection *conn)
 {
 	struct server *s = conn->owner;
 
-	if (unlikely(conn->flags & CO_FL_ERROR))
+	if (unlikely(conn->flags & CO_FL_ERROR)) {
+		/* Note that we might as well have been woken up by a handshake handler */
+		s->result |= SRV_CHK_FAILED;
+		__conn_data_stop_both(conn);
 		task_wakeup(s->check.task, TASK_WOKEN_IO);
+	}
 
+	if (s->result & (SRV_CHK_FAILED|SRV_CHK_PASSED))
+		conn_full_close(conn);
 	return 0;
 }
 
@@ -1241,38 +1250,27 @@ static struct task *server_warmup(struct task *t)
  */
 static struct task *process_chk(struct task *t)
 {
-	int attempts = 0;
 	struct server *s = t->context;
 	struct connection *conn = s->check.conn;
-	int fd;
 	int rv;
 	int ret;
+	int expired = tick_is_expired(t->expire, now_ms);
 
- new_chk:
-	if (attempts++ > 0) {
-		/* we always fail to create a server, let's stop insisting... */
-		while (tick_is_expired(t->expire, now_ms))
-			t->expire = tick_add(t->expire, MS_TO_TICKS(s->inter));
-		return t;
-	}
-
-	fd = conn->t.sock.fd;
-	if (fd < 0) {   /* no check currently running */
-		if (!tick_is_expired(t->expire, now_ms)) /* woke up too early */
+	if (!(s->state & SRV_CHK_RUNNING)) {
+		/* no check currently running */
+		if (!expired) /* woke up too early */
 			return t;
 
 		/* we don't send any health-checks when the proxy is stopped or when
 		 * the server should not be checked.
 		 */
-		if (!(s->state & SRV_CHECKED) || s->proxy->state == PR_STSTOPPED || (s->state & SRV_MAINTAIN)) {
-			while (tick_is_expired(t->expire, now_ms))
-				t->expire = tick_add(t->expire, MS_TO_TICKS(s->inter));
-			return t;
-		}
+		if (!(s->state & SRV_CHECKED) || s->proxy->state == PR_STSTOPPED || (s->state & SRV_MAINTAIN))
+			goto reschedule;
 
 		/* we'll initiate a new check */
 		set_server_check_status(s, HCHK_STATUS_START, NULL);
 
+		s->state |= SRV_CHK_RUNNING;
 		s->check.bi->p = s->check.bi->data;
 		s->check.bi->i = 0;
 		s->check.bo->p = s->check.bo->data;
@@ -1299,6 +1297,8 @@ static struct task *process_chk(struct task *t)
 		}
 
 		/* prepare a new connection */
+		conn->flags = CO_FL_NONE;
+		conn->err_code = CO_ER_NONE;
 		conn->target = &s->obj_type;
 		conn_prepare(conn, &check_conn_cb, s->check.proto, s->check.xprt, s);
 
@@ -1322,15 +1322,30 @@ static struct task *process_chk(struct task *t)
 		 *  - SN_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
 		 *  - SN_ERR_INTERNAL for any other purely internal errors
 		 * Additionnally, in the case of SN_ERR_RESOURCE, an emergency log will be emitted.
+		 * Note that we try to prevent the network stack from sending the ACK during the
+		 * connect() when a pure TCP check is used (without PROXY protocol).
 		 */
-		ret = s->check.proto->connect(conn, 1);
+		ret = s->check.proto->connect(conn, s->proxy->options2 & PR_O2_CHK_ANY,
+		                              s->check.send_proxy ? 1 : (s->proxy->options2 & PR_O2_CHK_ANY) ? 0 : 2);
 		conn->flags |= CO_FL_WAKE_DATA;
 		if (s->check.send_proxy)
 			conn->flags |= CO_FL_LOCAL_SPROXY;
 
 		switch (ret) {
 		case SN_ERR_NONE:
-			break;
+			/* we allow up to min(inter, timeout.connect) for a connection
+			 * to establish but only when timeout.check is set
+			 * as it may be to short for a full check otherwise
+			 */
+			t->expire = tick_add(now_ms, MS_TO_TICKS(s->inter));
+
+			if (s->proxy->timeout.check && s->proxy->timeout.connect) {
+				int t_con = tick_add(now_ms, s->proxy->timeout.connect);
+				t->expire = tick_first(t->expire, t_con);
+			}
+			conn_data_poll_recv(conn);   /* prepare for reading a possible reply */
+			goto reschedule;
+
 		case SN_ERR_SRVTO: /* ETIMEDOUT */
 		case SN_ERR_SRVCL: /* ECONNREFUSED, ENETUNREACH, ... */
 			set_server_check_status(s, HCHK_STATUS_L4CON, strerror(errno));
@@ -1342,23 +1357,9 @@ static struct task *process_chk(struct task *t)
 			break;
 		}
 
-		if (s->result == SRV_CHK_UNKNOWN) {
-			/* connection attempt was started */
+		/* here, we have seen a synchronous error, no fd was allocated */
 
-			/* we allow up to min(inter, timeout.connect) for a connection
-			 * to establish but only when timeout.check is set
-			 * as it may be to short for a full check otherwise
-			 */
-			t->expire = tick_add(now_ms, MS_TO_TICKS(s->inter));
-
-			if (s->proxy->timeout.check && s->proxy->timeout.connect) {
-				int t_con = tick_add(now_ms, s->proxy->timeout.connect);
-				t->expire = tick_first(t->expire, t_con);
-			}
-			return t;
-		}
-
-		/* here, we have seen a failure */
+		s->state &= ~SRV_CHK_RUNNING;
 		if (s->health > s->rise) {
 			s->health--; /* still good */
 			s->counters.failed_checks++;
@@ -1366,7 +1367,6 @@ static struct task *process_chk(struct task *t)
 		else
 			set_server_down(s);
 
-		//fprintf(stderr, "process_chk: 7, %lu\n", __tv_to_ms(&s->proxy->timeout.connect));
 		/* we allow up to min(inter, timeout.connect) for a connection
 		 * to establish but only when timeout.check is set
 		 * as it may be to short for a full check otherwise
@@ -1380,7 +1380,6 @@ static struct task *process_chk(struct task *t)
 			if (s->proxy->timeout.check)
 				t->expire = tick_first(t->expire, t_con);
 		}
-		goto new_chk;
 	}
 	else {
 		/* there was a test running.
@@ -1388,94 +1387,87 @@ static struct task *process_chk(struct task *t)
 		 * which can happen on connect timeout or error.
 		 */
 		if (s->result == SRV_CHK_UNKNOWN) {
-			if (conn->flags & CO_FL_CONNECTED) {
-				/* good TCP connection is enough */
+			if (expired && conn->xprt) {
+				/* the check expired and the connection was not
+				 * yet closed, start by doing this.
+				 */
+				if (conn->ctrl)
+					setsockopt(conn->t.sock.fd, SOL_SOCKET, SO_LINGER,
+						   (struct linger *) &nolinger, sizeof(struct linger));
+				conn_full_close(conn);
+			}
+
+			if ((conn->flags & (CO_FL_CONNECTED|CO_FL_WAIT_L4_CONN)) == CO_FL_WAIT_L4_CONN) {
+				/* L4 not established (yet) */
+				if (conn->flags & CO_FL_ERROR)
+					set_server_check_status(s, HCHK_STATUS_L4CON, NULL);
+				else if (expired)
+					set_server_check_status(s, HCHK_STATUS_L4TOUT, NULL);
+			}
+			else if ((conn->flags & (CO_FL_CONNECTED|CO_FL_WAIT_L6_CONN)) == CO_FL_WAIT_L6_CONN) {
+				/* L6 not established (yet) */
+				if (conn->flags & CO_FL_ERROR)
+					set_server_check_status(s, HCHK_STATUS_L6RSP, NULL);
+				else if (expired)
+					set_server_check_status(s, HCHK_STATUS_L6TOUT, NULL);
+			}
+			else if (!(s->proxy->options2 & PR_O2_CHK_ANY)) {
+				/* good connection is enough for pure TCP check */
 				if (s->check.use_ssl)
 					set_server_check_status(s, HCHK_STATUS_L6OK, NULL);
 				else
 					set_server_check_status(s, HCHK_STATUS_L4OK, NULL);
 			}
-			else if (conn->flags & CO_FL_WAIT_L4_CONN) {
-				/* L4 failed */
-				if (conn->flags & CO_FL_ERROR)
-					set_server_check_status(s, HCHK_STATUS_L4CON, NULL);
-				else
-					set_server_check_status(s, HCHK_STATUS_L4TOUT, NULL);
-			}
-			else if (conn->flags & CO_FL_WAIT_L6_CONN) {
-				/* L6 failed */
-				if (conn->flags & CO_FL_ERROR)
-					set_server_check_status(s, HCHK_STATUS_L6RSP, NULL);
-				else
+			else if (expired) {
+				/* connection established but expired check */
+				if ((s->proxy->options2 & PR_O2_CHK_ANY) == PR_O2_SSL3_CHK)
 					set_server_check_status(s, HCHK_STATUS_L6TOUT, NULL);
+				else	/* HTTP, SMTP, ... */
+					set_server_check_status(s, HCHK_STATUS_L7TOUT, NULL);
+
 			}
+			else
+				goto out_wait; /* timeout not reached, wait again */
 		}
 
-		if ((s->result & (SRV_CHK_ERROR|SRV_CHK_RUNNING)) == SRV_CHK_RUNNING) { /* good server detected */
-			/* we may have to add/remove this server from the LB group */
-			if ((s->state & SRV_RUNNING) && (s->proxy->options & PR_O_DISABLE404)) {
-				if ((s->state & SRV_GOINGDOWN) &&
-				    ((s->result & (SRV_CHK_RUNNING|SRV_CHK_DISABLE)) == SRV_CHK_RUNNING))
-					set_server_enabled(s);
-				else if (!(s->state & SRV_GOINGDOWN) &&
-					 ((s->result & (SRV_CHK_RUNNING | SRV_CHK_DISABLE)) ==
-					  (SRV_CHK_RUNNING | SRV_CHK_DISABLE)))
-					set_server_disabled(s);
-			}
+		/* check complete or aborted */
 
-			if (s->health < s->rise + s->fall - 1) {
-				s->health++; /* was bad, stays for a while */
-
-				set_server_up(s);
-			}
-			conn->t.sock.fd = -1; /* no check running anymore */
-			conn_xprt_close(conn);
-			if (conn->ctrl)
-				fd_delete(fd);
-
-			rv = 0;
-			if (global.spread_checks > 0) {
-				rv = srv_getinter(s) * global.spread_checks / 100;
-				rv -= (int) (2 * rv * (rand() / (RAND_MAX + 1.0)));
-			}
-			t->expire = tick_add(now_ms, MS_TO_TICKS(srv_getinter(s) + rv));
-			goto new_chk;
-		}
-		else if ((s->result & SRV_CHK_ERROR) || tick_is_expired(t->expire, now_ms)) {
-			if (!(s->result & SRV_CHK_ERROR)) {
-				if (conn->flags & CO_FL_WAIT_L4_CONN) {
-					set_server_check_status(s, HCHK_STATUS_L4TOUT, NULL);
-				} else {
-					if ((s->proxy->options2 & PR_O2_CHK_ANY) == PR_O2_SSL3_CHK)
-						set_server_check_status(s, HCHK_STATUS_L6TOUT, NULL);
-					else	/* HTTP, SMTP */
-						set_server_check_status(s, HCHK_STATUS_L7TOUT, NULL);
-				}
-			}
-
-			/* failure or timeout detected */
+		if (s->result & SRV_CHK_FAILED) {    /* a failure or timeout detected */
 			if (s->health > s->rise) {
 				s->health--; /* still good */
 				s->counters.failed_checks++;
 			}
 			else
 				set_server_down(s);
-			conn->t.sock.fd = -1;
-			conn_xprt_close(conn);
-			if (conn->ctrl)
-				fd_delete(fd);
-
-			rv = 0;
-			if (global.spread_checks > 0) {
-				rv = srv_getinter(s) * global.spread_checks / 100;
-				rv -= (int) (2 * rv * (rand() / (RAND_MAX + 1.0)));
-			}
-			t->expire = tick_add(now_ms, MS_TO_TICKS(srv_getinter(s) + rv));
-			goto new_chk;
 		}
-		/* if result is unknown and there's no timeout, we have to wait again */
+		else {  /* check was OK */
+			/* we may have to add/remove this server from the LB group */
+			if ((s->state & SRV_RUNNING) && (s->proxy->options & PR_O_DISABLE404)) {
+				if ((s->state & SRV_GOINGDOWN) && !(s->result & SRV_CHK_DISABLE))
+					set_server_enabled(s);
+				else if (!(s->state & SRV_GOINGDOWN) && (s->result & SRV_CHK_DISABLE))
+					set_server_disabled(s);
+			}
+
+			if (s->health < s->rise + s->fall - 1) {
+				s->health++; /* was bad, stays for a while */
+				set_server_up(s);
+			}
+		}
+		s->state &= ~SRV_CHK_RUNNING;
+
+		rv = 0;
+		if (global.spread_checks > 0) {
+			rv = srv_getinter(s) * global.spread_checks / 100;
+			rv -= (int) (2 * rv * (rand() / (RAND_MAX + 1.0)));
+		}
+		t->expire = tick_add(now_ms, MS_TO_TICKS(srv_getinter(s) + rv));
 	}
-	s->result = SRV_CHK_UNKNOWN;
+
+ reschedule:
+	while (tick_is_expired(t->expire, now_ms))
+		t->expire = tick_add(t->expire, MS_TO_TICKS(s->inter));
+ out_wait:
 	return t;
 }
 

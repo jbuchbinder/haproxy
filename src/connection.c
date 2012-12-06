@@ -50,6 +50,10 @@ int conn_fd_handler(int fd)
 	 * more easily detect an EAGAIN condition from anywhere.
 	 */
 	flags = conn->flags &= ~(CO_FL_WAIT_DATA|CO_FL_WAIT_ROOM|CO_FL_WAIT_RD|CO_FL_WAIT_WR);
+	flags &= ~CO_FL_ERROR; /* ensure to call the wake handler upon error */
+
+	if (unlikely(conn->flags & CO_FL_ERROR))
+		goto leave;
 
  process_handshake:
 	/* The handshake callbacks are called in sequence. If either of them is
@@ -166,14 +170,6 @@ void conn_update_data_polling(struct connection *c)
 {
 	unsigned int f = c->flags;
 
-	if (unlikely(f & CO_FL_ERROR)) {
-		c->flags &= ~(CO_FL_CURR_RD_ENA | CO_FL_CURR_WR_ENA |
-		              CO_FL_SOCK_RD_ENA | CO_FL_SOCK_WR_ENA |
-		              CO_FL_DATA_RD_ENA | CO_FL_DATA_WR_ENA);
-		fd_stop_both(c->t.sock.fd);
-		return;
-	}
-
 	/* update read status if needed */
 	if (unlikely((f & (CO_FL_DATA_RD_ENA|CO_FL_WAIT_RD)) == (CO_FL_DATA_RD_ENA|CO_FL_WAIT_RD))) {
 		fd_poll_recv(c->t.sock.fd);
@@ -213,14 +209,6 @@ void conn_update_data_polling(struct connection *c)
 void conn_update_sock_polling(struct connection *c)
 {
 	unsigned int f = c->flags;
-
-	if (unlikely(f & CO_FL_ERROR)) {
-		c->flags &= ~(CO_FL_CURR_RD_ENA | CO_FL_CURR_WR_ENA |
-		              CO_FL_SOCK_RD_ENA | CO_FL_SOCK_WR_ENA |
-		              CO_FL_DATA_RD_ENA | CO_FL_DATA_WR_ENA);
-		fd_stop_both(c->t.sock.fd);
-		return;
-	}
 
 	/* update read status if needed */
 	if (unlikely((f & (CO_FL_SOCK_RD_ENA|CO_FL_WAIT_RD)) == (CO_FL_SOCK_RD_ENA|CO_FL_WAIT_RD))) {
@@ -292,9 +280,15 @@ int conn_recv_proxy(struct connection *conn, int flag)
 				conn_sock_poll_recv(conn);
 				return 0;
 			}
-			goto fail;
+			goto recv_abort;
 		}
 	} while (0);
+
+	if (!trash.len) {
+		/* client shutdown */
+		conn->err_code = CO_ER_PRX_EMPTY;
+		goto fail;
+	}
 
 	if (trash.len < 6)
 		goto missing;
@@ -303,8 +297,10 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	end = trash.str + trash.len;
 
 	/* Decode a possible proxy request, fail early if it does not match */
-	if (strncmp(line, "PROXY ", 6) != 0)
+	if (strncmp(line, "PROXY ", 6) != 0) {
+		conn->err_code = CO_ER_PRX_NOT_HDR;
 		goto fail;
+	}
 
 	line += 6;
 	if (trash.len < 18) /* shortest possible line */
@@ -319,27 +315,27 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		if (line == end)
 			goto missing;
 		if (*line++ != ' ')
-			goto fail;
+			goto bad_header;
 
 		dst3 = inetaddr_host_lim_ret(line, end, &line);
 		if (line == end)
 			goto missing;
 		if (*line++ != ' ')
-			goto fail;
+			goto bad_header;
 
 		sport = read_uint((const char **)&line, end);
 		if (line == end)
 			goto missing;
 		if (*line++ != ' ')
-			goto fail;
+			goto bad_header;
 
 		dport = read_uint((const char **)&line, end);
 		if (line > end - 2)
 			goto missing;
 		if (*line++ != '\r')
-			goto fail;
+			goto bad_header;
 		if (*line++ != '\n')
-			goto fail;
+			goto bad_header;
 
 		/* update the session's addresses and mark them set */
 		((struct sockaddr_in *)&conn->addr.from)->sin_family      = AF_INET;
@@ -369,7 +365,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 				*line = 0;
 				line++;
 				if (*line++ != '\n')
-					goto fail;
+					goto bad_header;
 				break;
 			}
 
@@ -386,21 +382,21 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		}
 
 		if (!dst_s || !sport_s || !dport_s)
-			goto fail;
+			goto bad_header;
 
 		sport = read_uint((const char **)&sport_s,dport_s - 1);
 		if (*sport_s != 0)
-			goto fail;
+			goto bad_header;
 
 		dport = read_uint((const char **)&dport_s,line - 2);
 		if (*dport_s != 0)
-			goto fail;
+			goto bad_header;
 
 		if (inet_pton(AF_INET6, src_s, (void *)&src3) != 1)
-			goto fail;
+			goto bad_header;
 
 		if (inet_pton(AF_INET6, dst_s, (void *)&dst3) != 1)
-			goto fail;
+			goto bad_header;
 
 		/* update the session's addresses and mark them set */
 		((struct sockaddr_in6 *)&conn->addr.from)->sin6_family      = AF_INET6;
@@ -413,6 +409,8 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		conn->flags |= CO_FL_ADDR_FROM_SET | CO_FL_ADDR_TO_SET;
 	}
 	else {
+		/* The protocol does not match something known (TCP4/TCP6) */
+		conn->err_code = CO_ER_PRX_BAD_PROTO;
 		goto fail;
 	}
 
@@ -426,7 +424,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		if (len2 < 0 && errno == EINTR)
 			continue;
 		if (len2 != trash.len)
-			goto fail;
+			goto recv_abort;
 	} while (0);
 
 	conn->flags &= ~flag;
@@ -437,10 +435,21 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	 * we have not read anything. Otherwise we need to fail because we won't
 	 * be able to poll anymore.
 	 */
+	conn->err_code = CO_ER_PRX_TRUNCATED;
+	goto fail;
+
+ bad_header:
+	/* This is not a valid proxy protocol header */
+	conn->err_code = CO_ER_PRX_BAD_HDR;
+	goto fail;
+
+ recv_abort:
+	conn->err_code = CO_ER_PRX_ABORT;
+	goto fail;
+
  fail:
 	conn_sock_stop_both(conn);
 	conn->flags |= CO_FL_ERROR;
-	conn->flags &= ~flag;
 	return 0;
 }
 
@@ -543,14 +552,16 @@ int conn_local_send_proxy(struct connection *conn, unsigned int flag)
 	if (conn->flags & CO_FL_SOCK_WR_SH)
 		goto out_error;
 
-	/* The target server expects a PROXY line to be sent first. */
+	/* The target server expects a PROXY line to be sent first. Retrieving
+	 * local or remote addresses may fail until the connection is established.
+	 */
 	conn_get_from_addr(conn);
 	if (!(conn->flags & CO_FL_ADDR_FROM_SET))
-		goto out_error;
+		goto out_wait;
 
 	conn_get_to_addr(conn);
 	if (!(conn->flags & CO_FL_ADDR_TO_SET))
-		goto out_error;
+		goto out_wait;
 
 	trash.len = make_proxy_line(trash.str, trash.size, &conn->addr.from, &conn->addr.to);
 	if (!trash.len)
@@ -584,7 +595,6 @@ int conn_local_send_proxy(struct connection *conn, unsigned int flag)
  out_error:
 	/* Write error on the file descriptor */
 	conn->flags |= CO_FL_ERROR;
-	conn->flags &= ~flag;
 	return 0;
 
  out_wait:

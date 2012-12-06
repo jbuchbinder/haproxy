@@ -60,6 +60,7 @@
 #define SRV_TPROXY_MASK	0x0700	/* bind to a non-local address to reach this server */
 #define SRV_SEND_PROXY	0x0800	/* this server talks the PROXY protocol */
 #define SRV_NON_STICK	0x1000	/* never add connections allocated to this server to a stick table */
+#define SRV_CHK_RUNNING 0x2000  /* a check is currently running on this server */
 
 /* function which act on servers need to return various errors */
 #define SRV_STATUS_OK       0   /* everything is OK. */
@@ -70,8 +71,8 @@
 
 /* bits for s->result used for health-checks */
 #define SRV_CHK_UNKNOWN 0x0000   /* initialized to this by default */
-#define SRV_CHK_ERROR   0x0001   /* error encountered during the check; has precedence */
-#define SRV_CHK_RUNNING 0x0002   /* server seen as running */
+#define SRV_CHK_FAILED  0x0001   /* server check failed, flag has precedence over SRV_CHK_PASSED */
+#define SRV_CHK_PASSED  0x0002   /* server check succeeded unless FAILED is also set */
 #define SRV_CHK_DISABLE 0x0004   /* server returned a "disable" code */
 
 /* various constants */

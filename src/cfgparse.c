@@ -563,13 +563,33 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		global.tune.chksize = atol(args[1]);
 	}
 #ifdef USE_OPENSSL
-	else if (!strcmp(args[0], "tune.sslcachesize")) {
+	else if (!strcmp(args[0], "tune.ssl.cachesize")) {
 		if (*(args[1]) == 0) {
 			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 		global.tune.sslcachesize = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "tune.ssl.lifetime")) {
+		unsigned int ssllifetime;
+		const char *res;
+
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects ssl sessions <lifetime> in seconds as argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		res = parse_time_err(args[1], &ssllifetime, TIME_UNIT_S);
+		if (res) {
+			Alert("parsing [%s:%d]: unexpected character '%c' in argument to <%s>.\n",
+			      file, linenum, *res, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		global.tune.ssllifetime = ssllifetime;
 	}
 #endif
 	else if (!strcmp(args[0], "tune.bufsize")) {
@@ -652,6 +672,14 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.tune.pipesize = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "tune.http.cookielen")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.tune.cookie_len = atol(args[1]) + 1;
 	}
 	else if (!strcmp(args[0], "tune.http.maxhdr")) {
 		if (*(args[1]) == 0) {
@@ -784,11 +812,6 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	}
 	/* end of user/group name handling*/
 	else if (!strcmp(args[0], "nbproc")) {
-		if (global.nbproc != 0) {
-			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT;
-			goto out;
-		}
 		if (*(args[1]) == 0) {
 			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -870,8 +893,22 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		global.maxzlibmem = atol(args[1]);
+		global.maxzlibmem = atol(args[1]) * 1024L * 1024L;
 	}
+	else if (!strcmp(args[0], "maxcompcpuusage")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument between 0 and 100.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		compress_min_idle = 100 - atoi(args[1]);
+		if (compress_min_idle < 0 || compress_min_idle > 100) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument between 0 and 100.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+}
+
 	else if (!strcmp(args[0], "ulimit-n")) {
 		if (global.rlimit_nofile != 0) {
 			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
@@ -1164,6 +1201,75 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			Alert("parsing [%s:%d]: 'spread-checks' needs a positive value in range 0..50.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
+	}
+	else if (strcmp(args[0], "cpu-map") == 0) {  /* map a process list to a CPU set */
+#ifdef USE_CPU_AFFINITY
+		int cur_arg, i;
+		unsigned int proc = 0;
+		unsigned long cpus = 0;
+
+		if (strcmp(args[1], "all") == 0)
+			proc = 0xFFFFFFFF;
+		else if (strcmp(args[1], "odd") == 0)
+			proc = 0x55555555;
+		else if (strcmp(args[1], "even") == 0)
+			proc = 0xAAAAAAAA;
+		else {
+			proc = atoi(args[1]);
+			if (proc >= 1 && proc <= 32)
+				proc = 1 << (proc - 1);
+		}
+
+		if (!proc || !*args[2]) {
+			Alert("parsing [%s:%d]: %s expects a process number including 'all', 'odd', 'even', or a number from 1 to 32, followed by a list of CPU ranges with numbers from 0 to 31.\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		cur_arg = 2;
+		while (*args[cur_arg]) {
+			unsigned int low, high;
+
+			if (isdigit((int)*args[cur_arg])) {
+				char *dash = strchr(args[cur_arg], '-');
+
+				low = high = str2uic(args[cur_arg]);
+				if (dash)
+					high = str2uic(dash + 1);
+
+				if (high < low) {
+					unsigned int swap = low;
+					low = high;
+					high = swap;
+				}
+
+				if (low < 0 || high >= sizeof(long) * 8) {
+					Alert("parsing [%s:%d]: %s supports CPU numbers from 0 to %d.\n",
+					      file, linenum, args[0], (int)(sizeof(long) * 8 - 1));
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				while (low <= high)
+					cpus |= 1UL << low++;
+			}
+			else {
+				Alert("parsing [%s:%d]: %s : '%s' is not a CPU range.\n",
+				      file, linenum, args[0], args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			cur_arg++;
+		}
+		for (i = 0; i < 32; i++)
+			if (proc & (1 << i))
+				global.cpu_map[i] = cpus;
+#else
+		Alert("parsing [%s:%d] : '%s' is not enabled, please check build options for USE_CPU_AFFINITY.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
 	}
 	else {
 		struct cfg_kw_list *kwl;
@@ -2028,7 +2134,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		unsigned int set = 0;
 
 		while (*args[cur_arg]) {
-			int u;
+			unsigned int low, high;
+
 			if (strcmp(args[cur_arg], "all") == 0) {
 				set = 0;
 				break;
@@ -2039,20 +2146,39 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			else if (strcmp(args[cur_arg], "even") == 0) {
 				set |= 0xAAAAAAAA;
 			}
-			else {
-				u = str2uic(args[cur_arg]);
-				if (u < 1 || u > 32) {
-					Alert("parsing [%s:%d]: %s expects 'all', 'odd', 'even', or process numbers from 1 to 32.\n",
+			else if (isdigit((int)*args[cur_arg])) {
+				char *dash = strchr(args[cur_arg], '-');
+
+				low = high = str2uic(args[cur_arg]);
+				if (dash)
+					high = str2uic(dash + 1);
+
+				if (high < low) {
+					unsigned int swap = low;
+					low = high;
+					high = swap;
+				}
+
+				if (low < 1 || high > 32) {
+					Alert("parsing [%s:%d]: %s supports process numbers from 1 to 32.\n",
 					      file, linenum, args[0]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
-				if (u > global.nbproc) {
-					Warning("parsing [%s:%d]: %s references process number higher than global.nbproc.\n",
-						file, linenum, args[0]);
+
+				if (high > global.nbproc) {
+					Warning("parsing [%s:%d]: %s references process number %d which is higher than global.nbproc (%d).\n",
+						file, linenum, args[0], high, global.nbproc);
 					err_code |= ERR_WARN;
 				}
-				set |= 1 << (u - 1);
+				while (low <= high)
+					set |= 1 << (low++ - 1);
+			}
+			else {
+				Alert("parsing [%s:%d]: %s expects 'all', 'odd', 'even', or a list of process ranges with numbers from 1 to 32.\n",
+				      file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
 			}
 			cur_arg++;
 		}
@@ -2377,12 +2503,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curproxy->capture_name = strdup(args[2]);
 			curproxy->capture_namelen = strlen(curproxy->capture_name);
 			curproxy->capture_len = atol(args[4]);
-			if (curproxy->capture_len >= CAPTURE_LEN) {
-				Warning("parsing [%s:%d] : truncating capture length to %d bytes.\n",
-					file, linenum, CAPTURE_LEN - 1);
-				err_code |= ERR_WARN;
-				curproxy->capture_len = CAPTURE_LEN - 1;
-			}
 			curproxy->to_log |= LW_COOKIE;
 		}
 		else if (!strcmp(args[1], "request") && !strcmp(args[2], "header")) {
@@ -4479,7 +4599,7 @@ stats_error_parsing:
 								name = end;
 								if (*end == '-')
 									end++;
-								while (isdigit(*end))
+								while (isdigit((int)*end))
 									end++;
 								newsrv->bind_hdr_occ = strl2ic(name, end-name);
 							}
@@ -4912,7 +5032,7 @@ stats_error_parsing:
 						name = end;
 						if (*end == '-')
 							end++;
-						while (isdigit(*end))
+						while (isdigit((int)*end))
 							end++;
 						curproxy->bind_hdr_occ = strl2ic(name, end-name);
 					}
@@ -5338,7 +5458,7 @@ stats_error_parsing:
 
 		if (!strcmp(args[1], "algo")) {
 			int cur_arg;
-			struct comp_ctx ctx;
+			struct comp_ctx *ctx;
 
 			cur_arg = 2;
 			if (!*args[cur_arg]) {
@@ -5833,6 +5953,14 @@ int check_config_validity()
 	/* will be needed further to delay some tasks */
 	tv_update_date(0,1);
 
+	if (!global.tune.max_http_hdr)
+		global.tune.max_http_hdr = MAX_HTTP_HDR;
+
+	if (!global.tune.cookie_len)
+		global.tune.cookie_len = CAPTURE_LEN;
+
+	pool2_capture = create_pool("capture", global.tune.cookie_len, MEM_F_SHARED);
+
 	/* first, we will invert the proxy list order */
 	curproxy = NULL;
 	while (proxy) {
@@ -5853,6 +5981,7 @@ int check_config_validity()
 		struct tcp_rule *trule;
 		struct listener *listener;
 		unsigned int next_id;
+		int nbproc;
 
 		if (curproxy->uuid < 0) {
 			/* proxy ID not set, use automatic numbering with first
@@ -5871,6 +6000,9 @@ int check_config_validity()
 			curproxy = curproxy->next;
 			continue;
 		}
+
+		/* number of processes this proxy is bound to */
+		nbproc = curproxy->bind_proc ? popcount(curproxy->bind_proc) : global.nbproc;
 
 		switch (curproxy->mode) {
 		case PR_MODE_HEALTH:
@@ -6316,6 +6448,14 @@ out_uri_auth_compat:
 			memcpy(curproxy->check_req, sslv3_client_hello_pkt, curproxy->check_len);
 		}
 
+		/* ensure that cookie capture length is not too large */
+		if (curproxy->capture_len >= global.tune.cookie_len) {
+			Warning("config : truncating capture length to %d bytes for %s '%s'.\n",
+				global.tune.cookie_len - 1, proxy_type_str(curproxy), curproxy->id);
+			err_code |= ERR_WARN;
+			curproxy->capture_len = global.tune.cookie_len - 1;
+		}
+
 		/* The small pools required for the capture lists */
 		if (curproxy->nb_req_cap) {
 			if (curproxy->mode == PR_MODE_HTTP) {
@@ -6656,14 +6796,19 @@ out_uri_auth_compat:
 				curproxy->be_req_ana |= AN_REQ_PRST_RDP_COOKIE;
 		}
 
+#ifdef USE_OPENSSL
 		/* Configure SSL for each bind line.
 		 * Note: if configuration fails at some point, the ->ctx member
 		 * remains NULL so that listeners can later detach.
 		 */
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
-			if (!bind_conf->is_ssl)
+			if (!bind_conf->is_ssl) {
+				if (bind_conf->default_ctx) {
+					Warning("Proxy '%s': A certificate was specified but SSL was not enabled on bind '%s' at [%s:%d] (use 'ssl').\n",
+					        curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+				}
 				continue;
-#ifdef USE_OPENSSL
+			}
 			if (!bind_conf->default_ctx) {
 				Alert("Proxy '%s': no SSL certificate specified for bind '%s' at [%s:%d] (use 'crt').\n",
 				      curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
@@ -6679,8 +6824,8 @@ out_uri_auth_compat:
 
 			/* initialize all certificate contexts */
 			cfgerr += ssl_sock_prepare_all_ctx(bind_conf, curproxy);
-#endif /* USE_OPENSSL */
 		}
+#endif /* USE_OPENSSL */
 
 		/* adjust this proxy's listeners */
 		next_id = 1;
@@ -6708,6 +6853,22 @@ out_uri_auth_compat:
 				listener->maxconn = curproxy->maxconn;
 			if (!listener->backlog)
 				listener->backlog = curproxy->backlog;
+			if (!listener->maxaccept)
+				listener->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : 64;
+
+			/* we want to have an optimal behaviour on single process mode to
+			 * maximize the work at once, but in multi-process we want to keep
+			 * some fairness between processes, so we target half of the max
+			 * number of events to be balanced over all the processes the proxy
+			 * is bound to. Rememeber that maxaccept = -1 must be kept as it is
+			 * used to disable the limit.
+			 */
+			if (listener->maxaccept > 0) {
+				if (nbproc > 1)
+					listener->maxaccept = (listener->maxaccept + 1) / 2;
+				listener->maxaccept = (listener->maxaccept + nbproc - 1) / nbproc;
+			}
+
 			listener->timeout = &curproxy->timeout.client;
 			listener->accept = session_accept;
 			listener->handler = process_session;
@@ -6974,6 +7135,7 @@ out_uri_auth_compat:
 		while (*last) {
 			curpeers = *last;
 			if (curpeers->peers_fe) {
+				LIST_NEXT(&curpeers->peers_fe->conf.listeners, struct listener *, by_fe)->maxaccept = 1;
 				last = &curpeers->next;
 				continue;
 			}
@@ -6998,9 +7160,6 @@ out_uri_auth_compat:
 			*last = curpeers;
 		}
 	}
-
-	if (!global.tune.max_http_hdr)
-		global.tune.max_http_hdr = MAX_HTTP_HDR;
 
 	pool2_hdr_idx = create_pool("hdr_idx",
 				    global.tune.max_http_hdr * sizeof(struct hdr_idx_elem),

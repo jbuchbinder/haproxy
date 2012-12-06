@@ -142,6 +142,30 @@ enum {
 	CO_FL_XPRT_TRACKED  = 0x80000000,
 };
 
+
+/* possible connection error codes */
+enum {
+	CO_ER_NONE,             /* no error */
+	CO_ER_PRX_EMPTY,        /* nothing received in PROXY protocol header */
+	CO_ER_PRX_ABORT,        /* client abort during PROXY protocol header */
+	CO_ER_PRX_TIMEOUT,      /* timeout while waiting for a PROXY header */
+	CO_ER_PRX_TRUNCATED,    /* truncated PROXY protocol header */
+	CO_ER_PRX_NOT_HDR,      /* not a PROXY protocol header */
+	CO_ER_PRX_BAD_HDR,      /* bad PROXY protocol header */
+	CO_ER_PRX_BAD_PROTO,    /* unsupported protocol in PROXY header */
+
+	CO_ER_SSL_EMPTY,        /* client closed during SSL handshake */
+	CO_ER_SSL_ABORT,        /* client abort during SSL handshake */
+	CO_ER_SSL_TIMEOUT,      /* timeout during SSL handshake */
+	CO_ER_SSL_TOO_MANY,     /* too many SSL connections */
+	CO_ER_SSL_NO_MEM,       /* no more memory to allocate an SSL connection */
+	CO_ER_SSL_RENEG,        /* forbidden client renegociation */
+	CO_ER_SSL_CA_FAIL,      /* client cert verification failed in the CA chain */
+	CO_ER_SSL_CRT_FAIL,     /* client cert verification failed on the certificate */
+	CO_ER_SSL_HANDSHAKE,    /* SSL error during handshake */
+	CO_ER_SSL_NO_TARGET,    /* unkonwn target (not client nor server) */
+};
+
 /* xprt_ops describes transport-layer operations for a connection. They
  * generally run over a socket-based control layer, but not always. Some
  * of them are used for data transfer with the upper layer (rcv_*, snd_*)
@@ -186,7 +210,7 @@ struct connection {
 	const struct protocol *ctrl;  /* operations at the socket layer */
 	const struct xprt_ops *xprt;  /* operations at the transport layer */
 	const struct data_cb  *data;  /* data layer callbacks */
-	unsigned int flags;           /* CO_F_* */
+	unsigned int flags;           /* CO_FL_* */
 	int xprt_st;                  /* transport layer state, initialized to zero */
 	void *xprt_ctx;               /* general purpose pointer, initialized to NULL */
 	void *owner;                  /* pointer to upper layer's entity (eg: stream interface) */
@@ -195,6 +219,7 @@ struct connection {
 			int fd;       /* file descriptor for a stream driver when known */
 		} sock;
 	} t;
+	unsigned int err_code;        /* CO_ER_* */
 	enum obj_type *target;        /* the target to connect to (server, proxy, applet, ...) */
 	struct {
 		struct sockaddr_storage from;	/* client address, or address to spoof when connecting to the server */

@@ -223,7 +223,11 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
  * depending on conn->target. Only OBJ_TYPE_PROXY and OBJ_TYPE_SERVER are
  * supported. The <data> parameter is a boolean indicating whether there are data
  * waiting for being sent or not, in order to adjust data write polling and on
- * some platforms, the ability to avoid an empty initial ACK.
+ * some platforms, the ability to avoid an empty initial ACK. The <delack> argument
+ * allows the caller to force using a delayed ACK when establishing the connection :
+ *   - 0 = no delayed ACK unless data are advertised and backend has tcp-smart-connect
+ *   - 1 = delayed ACK if backend has tcp-smart-connect, regardless of data
+ *   - 2 = delayed ACK regardless of backend options
  *
  * It can return one of :
  *  - SN_ERR_NONE if everything's OK
@@ -233,9 +237,12 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
  *  - SN_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
  *  - SN_ERR_INTERNAL for any other purely internal errors
  * Additionnally, in the case of SN_ERR_RESOURCE, an emergency log will be emitted.
+ *
+ * The connection's fd is inserted only when SN_ERR_NONE is returned, otherwise
+ * it's invalid and the caller has nothing to do.
  */
 
-int tcp_connect_server(struct connection *conn, int data)
+int tcp_connect_server(struct connection *conn, int data, int delack)
 {
 	int fd;
 	struct server *srv;
@@ -417,7 +424,7 @@ int tcp_connect_server(struct connection *conn, int data)
 	 * machine with the first ACK. We only do this if there are pending
 	 * data in the buffer.
 	 */
-	if ((be->options2 & PR_O2_SMARTCON) && data)
+	if (delack == 2 || ((delack || data) && (be->options2 & PR_O2_SMARTCON)))
                 setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof(zero));
 #endif
 
@@ -693,6 +700,13 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		}
 	}
 #endif
+#if defined(IPV6_V6ONLY)
+	if (listener->options & LI_O_V6ONLY)
+                setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+	else if (listener->options & LI_O_V4V6)
+                setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
+#endif
+
 	if (bind(fd, (struct sockaddr *)&listener->addr, listener->proto->sock_addrlen) == -1) {
 		err |= ERR_RETRYABLE | ERR_ALERT;
 		msg = "cannot bind socket";
@@ -1714,6 +1728,34 @@ static int val_payload_lv(struct arg *arg, char **err_msg)
 	return 1;
 }
 
+#ifdef IPV6_V6ONLY
+/* parse the "v4v6" bind keyword */
+static int bind_parse_v4v6(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_V4V6;
+	}
+
+	return 0;
+}
+
+/* parse the "v6only" bind keyword */
+static int bind_parse_v6only(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		if (l->addr.ss_family == AF_INET6)
+			l->options |= LI_O_V6ONLY;
+	}
+
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_HAP_LINUX_TPROXY
 /* parse the "transparent" bind keyword */
 static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
@@ -1871,11 +1913,17 @@ static struct bind_kw_list bind_kws = { "TCP", { }, {
 #ifdef CONFIG_HAP_LINUX_TPROXY
 	{ "transparent",   bind_parse_transparent,  0 }, /* transparently bind to the specified addresses */
 #endif
+#ifdef IPV6_V6ONLY
+	{ "v4v6",          bind_parse_v4v6,         0 }, /* force socket to bind to IPv4+IPv6 */
+	{ "v6only",        bind_parse_v6only,       0 }, /* force socket to bind to IPv6 only */
+#endif
 	/* the versions with the NULL parse function*/
 	{ "defer-accept",  NULL,  0 },
 	{ "interface",     NULL,  1 },
 	{ "mss",           NULL,  1 },
 	{ "transparent",   NULL,  0 },
+	{ "v4v6",          NULL,  0 },
+	{ "v6only",        NULL,  0 },
 	{ NULL, NULL, 0 },
 }};
 

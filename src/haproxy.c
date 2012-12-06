@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2011  Willy Tarreau <w@1wt.eu>.
+ * Copyright 2000-2012  Willy Tarreau <w@1wt.eu>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -44,6 +44,11 @@
 #include <sys/resource.h>
 #include <time.h>
 #include <syslog.h>
+#ifdef USE_CPU_AFFINITY
+#define __USE_GNU
+#include <sched.h>
+#undef __USE_GNU
+#endif
 
 #ifdef DEBUG_FULL
 #include <assert.h>
@@ -112,10 +117,11 @@ int  relative_pid = 1;		/* process id starting at 1 */
 
 /* global options */
 struct global global = {
+	.nbproc = 1,
 	.req_count = 0,
 	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
 #ifdef DEFAULT_MAXZLIBMEM
-	.maxzlibmem = DEFAULT_MAXZLIBMEM,
+	.maxzlibmem = DEFAULT_MAXZLIBMEM * 1024U * 1024U,
 #else
 	.maxzlibmem = 0,
 #endif
@@ -717,18 +723,6 @@ void init(int argc, char **argv)
 
 	if (global.tune.maxpollevents <= 0)
 		global.tune.maxpollevents = MAX_POLL_EVENTS;
-
-	if (global.tune.maxaccept == 0) {
-		/* Note: we should not try to accept too many connections at once,
-		 * because past one point we're significantly reducing the cache
-		 * efficiency and the highest session rate significantly drops.
-		 * Values between 15 and 35 seem fine on a Core i5 with 4M L3 cache.
-		 */
-		if (global.nbproc > 1)
-			global.tune.maxaccept = 8;  /* leave some conns to other processes */
-		else
-			global.tune.maxaccept = 32; /* accept more incoming conns at once */
-	}
 
 	if (global.tune.recv_enough == 0)
 		global.tune.recv_enough = MIN_RECV_AT_ONCE_ENOUGH;
@@ -1466,6 +1460,13 @@ int main(int argc, char **argv)
 			}
 			relative_pid++; /* each child will get a different one */
 		}
+
+#ifdef USE_CPU_AFFINITY
+		if (proc < global.nbproc &&  /* child */
+		    proc < 32 &&             /* only the first 32 processes may be pinned */
+		    global.cpu_map[proc])    /* only do this if the process has a CPU map */
+			sched_setaffinity(0, sizeof(unsigned long), (void *)&global.cpu_map[proc]);
+#endif
 		/* close the pidfile both in children and father */
 		if (pidfd >= 0) {
 			//lseek(pidfd, 0, SEEK_SET);  /* debug: emulate eglibc bug */

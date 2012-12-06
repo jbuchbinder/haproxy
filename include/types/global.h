@@ -87,7 +87,7 @@ struct global {
 	int maxsock;		/* max # of sockets */
 	int rlimit_nofile;	/* default ulimit-n value : 0=unset */
 	int rlimit_memmax;	/* default ulimit-d in megs value : 0=unset */
-	int maxzlibmem;         /* max RAM for zlib in megs */
+	long maxzlibmem;        /* max RAM for zlib in bytes */
 	int mode;
 	unsigned int req_count; /* HTTP request counter */
 	int last_checks;
@@ -112,8 +112,10 @@ struct global {
 		int chksize;       /* check buffer size in bytes, defaults to BUFSIZE */
 		int pipesize;      /* pipe size in bytes, system defaults if zero */
 		int max_http_hdr;  /* max number of HTTP headers, use MAX_HTTP_HDR if zero */
+		int cookie_len;    /* max length of cookie captures */
 #ifdef USE_OPENSSL
 		int sslcachesize;  /* SSL cache size in session, defaults to 20000 */
+		unsigned int ssllifetime;   /* SSL session lifetime in seconds */
 #endif
 #ifdef USE_ZLIB
 		int zlibmemlevel;    /* zlib memlevel */
@@ -130,6 +132,9 @@ struct global {
 			int level;      /* access level (ACCESS_LVL_*) */
 		} ux;
 	} unix_bind;
+#ifdef USE_CPU_AFFINITY
+	unsigned long cpu_map[32];  /* list of CPU masks for the 32 first processes */
+#endif
 	struct proxy *stats_fe;     /* the frontend holding the stats settings */
 };
 

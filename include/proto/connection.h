@@ -26,6 +26,7 @@
 #include <common/memory.h>
 #include <types/connection.h>
 #include <types/listener.h>
+#include <proto/fd.h>
 #include <proto/obj_type.h>
 
 extern struct pool_head *pool2_connection;
@@ -62,6 +63,23 @@ static inline void conn_xprt_close(struct connection *conn)
 	if (conn->xprt && !(conn->flags & CO_FL_XPRT_TRACKED)) {
 		if (conn->xprt->close)
 			conn->xprt->close(conn);
+		conn->xprt = NULL;
+	}
+}
+
+/* If the connection still has a transport layer, then call its close() function
+ * if any, and delete the file descriptor if a control layer is set. This is
+ * used to close everything at once and atomically. However this is not done if
+ * the CO_FL_XPRT_TRACKED flag is set, which allows logs to take data from the
+ * transport layer very late if needed.
+ */
+static inline void conn_full_close(struct connection *conn)
+{
+	if (conn->xprt && !(conn->flags & CO_FL_XPRT_TRACKED)) {
+		if (conn->xprt->close)
+			conn->xprt->close(conn);
+		if (conn->ctrl)
+			fd_delete(conn->t.sock.fd);
 		conn->xprt = NULL;
 	}
 }
@@ -162,6 +180,17 @@ static inline void conn_cond_update_sock_polling(struct connection *c)
 		conn_update_sock_polling(c);
 }
 
+/* Stop all polling on the fd. This might be used when an error is encountered
+ * for example.
+ */
+static inline void conn_stop_polling(struct connection *c)
+{
+	c->flags &= ~(CO_FL_CURR_RD_ENA | CO_FL_CURR_WR_ENA |
+		      CO_FL_SOCK_RD_ENA | CO_FL_SOCK_WR_ENA |
+		      CO_FL_DATA_RD_ENA | CO_FL_DATA_WR_ENA);
+	fd_stop_both(c->t.sock.fd);
+}
+
 /* Automatically update polling on connection <c> depending on the DATA and
  * SOCK flags, and on whether a handshake is in progress or not. This may be
  * called at any moment when there is a doubt about the effectiveness of the
@@ -169,7 +198,9 @@ static inline void conn_cond_update_sock_polling(struct connection *c)
  */
 static inline void conn_cond_update_polling(struct connection *c)
 {
-	if (!(c->flags & CO_FL_POLL_SOCK) && conn_data_polling_changes(c))
+	if (unlikely(c->flags & CO_FL_ERROR))
+		conn_stop_polling(c);
+	else if (!(c->flags & CO_FL_POLL_SOCK) && conn_data_polling_changes(c))
 		conn_update_data_polling(c);
 	else if ((c->flags & CO_FL_POLL_SOCK) && conn_sock_polling_changes(c))
 		conn_update_sock_polling(c);
@@ -429,6 +460,34 @@ static inline void conn_prepare(struct connection *conn, const struct data_cb *d
 	conn_assign(conn, data, ctrl, xprt, owner);
 	conn->xprt_st = 0;
 	conn->xprt_ctx = NULL;
+}
+
+/* returns a human-readable error code for conn->err_code, or NULL if the code
+ * is unknown.
+ */
+static inline const char *conn_err_code_str(struct connection *c)
+{
+	switch (c->err_code) {
+	case CO_ER_NONE:          return "Success";
+	case CO_ER_PRX_EMPTY:     return "Connection closed while waiting for PROXY protocol header";
+	case CO_ER_PRX_ABORT:     return "Connection error while waiting for PROXY protocol header";
+	case CO_ER_PRX_TIMEOUT:   return "Timeout while waiting for PROXY protocol header";
+	case CO_ER_PRX_TRUNCATED: return "Truncated PROXY protocol header received";
+	case CO_ER_PRX_NOT_HDR:   return "Received something which does not look like a PROXY protocol header";
+	case CO_ER_PRX_BAD_HDR:   return "Received an invalid PROXY protocol header";
+	case CO_ER_PRX_BAD_PROTO: return "Received an unhandled protocol in the PROXY protocol header";
+	case CO_ER_SSL_EMPTY:     return "Connection closed during SSL handshake";
+	case CO_ER_SSL_ABORT:     return "Connection error during SSL handshake";
+	case CO_ER_SSL_TIMEOUT:   return "Timeout during SSL handshake";
+	case CO_ER_SSL_TOO_MANY:  return "Too many SSL connections";
+	case CO_ER_SSL_NO_MEM:    return "Out of memory when initializing an SSL connection";
+	case CO_ER_SSL_RENEG:     return "Rejected a client-initiated SSL renegociation attempt";
+	case CO_ER_SSL_CA_FAIL:   return "SSL client CA chain cannot be verified";
+	case CO_ER_SSL_CRT_FAIL:  return "SSL client certificate not trusted";
+	case CO_ER_SSL_HANDSHAKE: return "SSL handshake failure";
+	case CO_ER_SSL_NO_TARGET: return "Attempt to use SSL on an unknownn target (internal error)";
+	}
+	return NULL;
 }
 
 #endif /* _PROTO_CONNECTION_H */

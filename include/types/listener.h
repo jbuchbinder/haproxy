@@ -90,6 +90,8 @@ enum {
 #define LI_O_ACC_PROXY  0x0040  /* find the proxied address in the first request line */
 #define LI_O_UNLIMITED  0x0080  /* listener not subject to global limits (peers & stats socket) */
 #define LI_O_TCP_FO     0x0100  /* enable TCP Fast Open (linux >= 3.6) */
+#define LI_O_V6ONLY     0x0200  /* bind to IPv6 only on Linux >= 2.4.21 */
+#define LI_O_V4V6       0x0400  /* bind to IPv4/IPv6 on Linux >= 2.4.21 */
 
 /* Note: if a listener uses LI_O_UNLIMITED, it is highly recommended that it adds its own
  * maxconn setting to the global.maxsock value so that its resources are reserved.
@@ -159,6 +161,7 @@ struct listener {
 	int nbconn;			/* current number of connections on this listener */
 	int maxconn;			/* maximum connections allowed on this listener */
 	unsigned int backlog;		/* if set, listen backlog */
+	unsigned int maxaccept;         /* if set, max number of connections accepted at once */
 	struct list proto_list;         /* list in the protocol header */
 	int (*accept)(struct listener *l, int fd, struct sockaddr_storage *addr); /* upper layer's accept() */
 	struct task * (*handler)(struct task *t); /* protocol handler. It is a task */

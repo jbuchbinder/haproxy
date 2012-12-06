@@ -4,7 +4,7 @@
                          ----------------------
                              version 1.5
                              willy tarreau
-                              2012/09/10
+                              2012/11/26
 
 
 This document covers the configuration language as implemented in the version
@@ -79,6 +79,7 @@ Summary
 8.2.2.        TCP log format
 8.2.3.        HTTP log format
 8.2.4.        Custom log format
+8.2.5.        Error log format
 8.3.      Advanced logging options
 8.3.1.        Disabling logging of external tests
 8.3.2.        Logging before waiting for the session to terminate
@@ -456,6 +457,7 @@ The following keywords are supported in the "global" section :
    - maxconn
    - maxconnrate
    - maxcomprate
+   - maxcompcpuusage
    - maxpipes
    - maxsslconn
    - noepoll
@@ -466,6 +468,7 @@ The following keywords are supported in the "global" section :
    - tune.bufsize
    - tune.chksize
    - tune.comp.maxlevel
+   - tune.http.cookielen
    - tune.http.maxhdr
    - tune.maxaccept
    - tune.maxpollevents
@@ -475,6 +478,7 @@ The following keywords are supported in the "global" section :
    - tune.rcvbuf.server
    - tune.sndbuf.client
    - tune.sndbuf.server
+   - tune.ssl.cachesize
    - tune.zlib.memlevel
    - tune.zlib.windowsize
 
@@ -498,6 +502,21 @@ chroot <jail dir>
   attacker to exploit the system. This only works when the process is started
   with superuser privileges. It is important to ensure that <jail_dir> is both
   empty and unwritable to anyone.
+
+cpu-map <"all"|"odd"|"even"|process_num> <cpu-set>...
+  On Linux 2.6 and above, it is possible to bind a process to a specific CPU
+  set. This means that the process will never run on other CPUs. The "cpu-map"
+  directive specifies CPU sets for process sets. The first argument is the
+  process number to bind. This process must have a number between 1 and 32,
+  and any process IDs above nbproc are ignored. It is possible to specify all
+  processes at once using "all", only odd numbers using "odd" or even numbers
+  using "even", just like with the "bind-process" directive. The second and
+  forthcoming arguments are CPU sets. Each CPU set is either a unique number
+  between 0 and 31 or a range with two such numbers delimited by a dash ('-').
+  Multiple CPU numbers or ranges may be specified, and the processes will be
+  allowed to bind to all of them. Obviously, multiple "cpu-map" directives may
+  be specified. Each "cpu-map" directive will replace the previous ones when
+  they overlap.
 
 crt-base <dir>
   Assigns a default directory to fetch SSL certificates from when a relative
@@ -580,7 +599,7 @@ pidfile <pidfile>
   the "-p" command line argument. The file must be accessible to the user
   starting the process. See also "daemon".
 
-stats bind-process [ all | odd | even | <number 1-32> ] ...
+stats bind-process [ all | odd | even | <number 1-32>[-<number 1-32>] ] ...
   Limits the stats socket to a certain set of processes numbers. By default the
   stats socket is bound to all processes, causing a warning to be emitted when
   nbproc is greater than 1 because there is no way to select the target process
@@ -681,6 +700,16 @@ maxcomprate <number>
   tune.comp.maxlevel.  A value of zero means there is no limit, this is the
   default value.
 
+maxcompcpuusage <number>
+  Sets the maximum CPU usage HAProxy can reach before stopping the compression
+  for new requests or decreasing the compression level of current requests.
+  It works like 'maxcomprate' but measures CPU usage instead of incoming data
+  bandwidth. The value is expressed in percent of the CPU used by haproxy. In
+  case of multiple processes (nbproc > 1), each process manages its individual
+  usage. A value of 100 disable the limit. The default value is 100. Setting
+  a lower value will prevent the compression work from slowing the whole
+  process down and from introducing high latencies.
+
 maxpipes <number>
   Sets the maximum per-process number of pipes to <number>. Currently, pipes
   are only used by kernel-based tcp splicing. Since a pipe contains two file
@@ -702,7 +731,9 @@ maxzlibmem <number>
   Sets the maximum amount of RAM in megabytes per process usable by the zlib.
   When the maximum amount is reached, future sessions will not compress as long
   as RAM is unavailable. When sets to 0, there is no limit.
-  The default value is 0.
+  The default value is 0. The value is available in bytes on the UNIX socket
+  with "show info" on the line "MaxZlibMemUsage", the memory used by zlib is
+  "ZlibMemUsage" in bytes.
 
 noepoll
   Disables the use of the "epoll" event polling system on Linux. It is
@@ -763,6 +794,16 @@ tune.comp.maxlevel <number>
   Each session using compression initializes the compression algorithm with
   this value. The default value is 1.
 
+tune.http.cookielen <number>
+  Sets the maximum length of captured cookies. This is the maximum value that
+  the "capture cookie xxx len yyy" will be allowed to take, and any upper value
+  will automatically be truncated to this one. It is important not to set too
+  high a value because all cookie captures still allocate this size whatever
+  their configured value (they share a same pool). This value is per request
+  per response, so the memory allocated is twice this value per connection.
+  When not specified, the limit is set to 63 characters. It is recommended not
+  to change this value.
+
 tune.http.maxhdr <number>
   Sets the maximum number of headers in a request. When a request comes with a
   number of headers greater than this value (including the first line), it is
@@ -775,14 +816,16 @@ tune.http.maxhdr <number>
   limit too high.
 
 tune.maxaccept <number>
-  Sets the maximum number of consecutive accepts that a process may perform on
-  a single wake up. High values give higher priority to high connection rates,
-  while lower values give higher priority to already established connections.
-  This value is limited to 100 by default in single process mode. However, in
-  multi-process mode (nbproc > 1), it defaults to 8 so that when one process
-  wakes up, it does not take all incoming connections for itself and leaves a
-  part of them to other processes. Setting this value to -1 completely disables
-  the limitation. It should normally not be needed to tweak this value.
+  Sets the maximum number of consecutive connections a process may accept in a
+  row before switching to other work. In single process mode, higher numbers
+  give better performance at high connection rates. However in multi-process
+  modes, keeping a bit of fairness between processes generally is better to
+  increase performance. This value applies individually to each listener, so
+  that the number of processes a listener is bound to is taken into account.
+  This value defaults to 64. In multi-process mode, it is divided by twice
+  the number of processes the listener is bound to. Setting this value to -1
+  completely disables the limitation. It should normally not be needed to tweak
+  this value.
 
 tune.maxpollevents <number>
   Sets the maximum amount of events that can be processed at once in a call to
@@ -833,6 +876,26 @@ tune.sndbuf.server <number>
   Another use case is to prevent write timeouts with extremely slow clients due
   to the kernel waiting for a large part of the buffer to be read before
   notifying haproxy again.
+
+tune.ssl.cachesize <number>
+  Sets the size of the global SSL session cache, in a number of blocks. A block
+  is large enough to contain an encoded session without peer certificate.
+  An encoded session with peer certificate is stored in multiple blocks
+  depending on the size of the peer certificate. A block use approximatively
+  200 bytes of memory. The default value may be forced at build time, otherwise
+  defaults to 20000.  When the cache is full, the most idle entries are purged
+  and reassigned. Higher values reduce the occurrence of such a purge, hence
+  the number of CPU-intensive SSL handshakes by ensuring that all users keep
+  their session as long as possible. All entries are pre-allocated upon startup
+  and are shared between all processes if "nbproc" is greater than 1.
+
+tune.ssl.lifetime <timeout>
+  Sets how long a cached SSL session may remain valid. This time is expressed
+  in seconds and defaults to 300 (5 mn). It is important to understand that it
+  does not guarantee that sessions will last that long, because if the cache is
+  full, the longest idle sessions will be purged despite their configured
+  lifetime. The real usefulness of this setting is to prevent sessions from
+  being used for too long.
 
 tune.zlib.memlevel <number>
   Sets the memLevel parameter in zlib initialization for each session. It
@@ -1582,7 +1645,7 @@ bind /<path> [, ...] [param*]
              documentation, and section 5 about bind options.
 
 
-bind-process [ all | odd | even | <number 1-32> ] ...
+bind-process [ all | odd | even | <number 1-32>[-<number 1-32>] ] ...
   Limit visibility of an instance to a certain set of processes numbers.
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   yes
@@ -1598,10 +1661,11 @@ bind-process [ all | odd | even | <number 1-32> ] ...
                   with less than 2 processes otherwise some instances might be
                   missing from all processes.
 
-    number        The instance will be enabled on this process number, between
-                  1 and 32. You must be careful not to reference a process
-                  number greater than the configured global.nbproc, otherwise
-                  some instances might be missing from all processes.
+    number        The instance will be enabled on this process number or range,
+                  whose values must all be between 1 and 32. You must be
+                  careful not to reference a process number greater than the
+                  configured global.nbproc, otherwise some instances might be
+                  missing from all processes.
 
   This keyword limits binding of certain instances to certain processes. This
   is useful in order not to have too many processes listening to the same
@@ -1629,6 +1693,10 @@ bind-process [ all | odd | even | <number 1-32> ] ...
         listen management
             bind 10.0.0.3:80
             bind-process 1 2 3 4
+
+        listen management
+            bind 10.0.0.4:80
+            bind-process 1-4
 
   See also : "nbproc" in global section.
 
@@ -1682,9 +1750,9 @@ capture cookie <name> len <length>
   The capture is performed in the frontend only because it is necessary that
   the log format does not change for a given frontend depending on the
   backends. This may change in the future. Note that there can be only one
-  "capture cookie" statement in a frontend. The maximum capture length is
-  configured in the sources by default to 64 characters. It is not possible to
-  specify a capture in a "defaults" section.
+  "capture cookie" statement in a frontend. The maximum capture length is set
+  by the global "tune.http.cookielen" setting and defaults to 63 characters. It
+  is not possible to specify a capture in a "defaults" section.
 
   Example:
         capture cookie ASPSESSION len 32
@@ -1694,7 +1762,7 @@ capture cookie <name> len <length>
 
 
 capture request header <name> len <length>
-  Capture and log the first occurrence of the specified request header.
+  Capture and log the last occurrence of the specified request header.
   May be used in sections :   defaults | frontend | listen | backend
                                   no   |    yes   |   yes  |   no
   Arguments :
@@ -1708,7 +1776,7 @@ capture request header <name> len <length>
               report in the logs. The string will be truncated on the right if
               it exceeds <length>.
 
-  Only the first value of the last occurrence of the header is captured. The
+  The complete value of the last occurrence of the header is captured. The
   value will be added to the logs between braces ('{}'). If multiple headers
   are captured, they will be delimited by a vertical bar ('|') and will appear
   in the same order they were declared in the configuration. Non-existent
@@ -1723,10 +1791,11 @@ capture request header <name> len <length>
   you log if you know your log parser is not smart enough to rely on the
   braces.
 
-  There is no limit to the number of captured request headers, but each capture
-  is limited to 64 characters. In order to keep log format consistent for a
-  same frontend, header captures can only be declared in a frontend. It is not
-  possible to specify a capture in a "defaults" section.
+  There is no limit to the number of captured request headers nor to their
+  length, though it is wise to keep them low to limit memory usage per session.
+  In order to keep log format consistent for a same frontend, header captures
+  can only be declared in a frontend. It is not possible to specify a capture
+  in a "defaults" section.
 
   Example:
         capture request header Host len 15
@@ -1738,7 +1807,7 @@ capture request header <name> len <length>
 
 
 capture response header <name> len <length>
-  Capture and log the first occurrence of the specified response header.
+  Capture and log the last occurrence of the specified response header.
   May be used in sections :   defaults | frontend | listen | backend
                                   no   |    yes   |   yes  |   no
   Arguments :
@@ -1752,7 +1821,7 @@ capture response header <name> len <length>
               report in the logs. The string will be truncated on the right if
               it exceeds <length>.
 
-  Only the first value of the last occurrence of the header is captured. The
+  The complete value of the last occurrence of the header is captured. The
   result will be added to the logs between braces ('{}') after the captured
   request headers. If multiple headers are captured, they will be delimited by
   a vertical bar ('|') and will appear in the same order they were declared in
@@ -1761,10 +1830,11 @@ capture response header <name> len <length>
   header which indicates how many bytes are expected to be returned, the
   "Location" header to track redirections.
 
-  There is no limit to the number of captured response headers, but each
-  capture is limited to 64 characters. In order to keep log format consistent
-  for a same frontend, header captures can only be declared in a frontend. It
-  is not possible to specify a capture in a "defaults" section.
+  There is no limit to the number of captured response headers nor to their
+  length, though it is wise to keep them low to limit memory usage per session.
+  In order to keep log format consistent for a same frontend, header captures
+  can only be declared in a frontend. It is not possible to specify a capture
+  in a "defaults" section.
 
   Example:
         capture response header Content-length len 9
@@ -1820,7 +1890,7 @@ compression offload
     offload  makes haproxy work as a compression offloader only (see notes).
 
   The currently supported algorithms are :
-    identity  this is mostly for debugging, and it was useful for developping
+    identity  this is mostly for debugging, and it was useful for developing
               the compression feature. Identity does not apply any change on
               data.
 
@@ -1834,18 +1904,36 @@ compression offload
               This setting is only available when support for zlib was built
               in.
 
-  Compression will be activated depending of the Accept-Encoding request
+  Compression will be activated depending on the Accept-Encoding request
   header. With identity, it does not take care of that header.
+  If backend servers support HTTP compression, these directives
+  will be no-op: haproxy will see the compressed response and will not
+  compress again. If backend servers do not support HTTP compression and
+  there is Accept-Encoding header in request, haproxy will compress the
+  matching response.
 
   The "offload" setting makes haproxy remove the Accept-Encoding header to
   prevent backend servers from compressing responses. It is strongly
   recommended not to do this because this means that all the compression work
   will be done on the single point where haproxy is located. However in some
   deployment scenarios, haproxy may be installed in front of a buggy gateway
-  and need to prevent it from emitting invalid payloads. In this case, simply
-  removing the header in the configuration does not work because it applies
-  before the header is parsed, so that prevents haproxy from compressing. The
-  "offload" setting should then be used for such scenarios.
+  with broken HTTP compression implementation which can't be turned off.
+  In that case haproxy can be used to prevent that gateway from emitting
+  invalid payloads. In this case, simply removing the header in the
+  configuration does not work because it applies before the header is parsed,
+  so that prevents haproxy from compressing. The "offload" setting should
+  then be used for such scenarios.
+
+  Compression is disabled when:
+    * the server is not HTTP/1.1.
+    * HTTP status code is not 200
+    * requests does not contain Transfer-Encoding: chunked or Content-Length.
+    * Content-Type is multipart
+    * the request contains "Cache-control: no-transform".
+    * User-Agent matches "Mozilla/4" except MSIE 6 with XP SP2, or MSIE 7 and later.
+    * The response is already compressed (see compression offload).
+
+  The compression does not rewrite Etag headers
 
   Examples :
         compression algo gzip
@@ -7080,6 +7168,20 @@ transparent
   kernel version. Some distribution kernels include backports of the feature,
   so check for support with your vendor.
 
+v4v6
+  Is an optional keyword which is supported only on most recent systems
+  including Linux kernels >= 2.4.21. It is used to bind a socket to both IPv4
+  and IPv6 when it uses the default address. Doing so is sometimes necessary
+  on systems which bind to IPv6 only by default. It has no effect on non-IPv6
+  sockets, and is overriden by the "v6only" option.
+
+v6only
+  Is an optional keyword which is supported only on most recent systems
+  including Linux kernels >= 2.4.21. It is used to bind a socket to IPv6 only
+  when it uses the default address. Doing so is sometimes preferred to doing it
+  system-wide as it is per-listener. It has no effect on non-IPv6 sockets and
+  has precedence over the "v4v6" option.
+
 uid <uid>
   Sets the owner of the UNIX sockets to the designated system uid. It can also
   be set by default in the global section's "unix-bind" statement. Note that
@@ -10141,6 +10243,34 @@ Please refer to the table below for currently defined variables :
 
     R = Restrictions : H = mode http only ; S = SSL only
 
+
+8.2.5. Error log format
+-----------------------
+
+When an incoming connection fails due to an SSL handshake or an invalid PROXY
+protocol header, haproxy will log the event using a shorter, fixed line format.
+By default, logs are emitted at the LOG_INFO level, unless the option
+"log-separate-errors" is set in the backend, in which case the LOG_ERR level
+will be used. Connections on which no data are exchanged (eg: probes) are not
+logged if the "dontlognull" option is set.
+
+The format looks like this :
+
+    >>> Dec  3 18:27:14 localhost \
+          haproxy[6103]: 127.0.0.1:56059 [03/Dec/2012:17:35:10.380] frt/f1: \
+          Connection error during SSL handshake
+
+  Field   Format                                Extract from the example above
+      1   process_name '[' pid ']:'                             haproxy[6103]:
+      2   client_ip ':' client_port                            127.0.0.1:56059
+      3   '[' accept_date ']'                       [03/Dec/2012:17:35:10.380]
+      4   frontend_name "/" bind_name ":"                              frt/f1:
+      5   message                        Connection error during SSL handshake
+
+These fields just provide minimal information to help debugging connection
+failures.
+
+
 8.3. Advanced logging options
 -----------------------------
 
@@ -10950,6 +11080,10 @@ page. Both means provide a CSV format whose fields follow.
  48. req_tot: total number of HTTP requests received
  49. cli_abrt: number of data transfers aborted by the client
  50. srv_abrt: number of data transfers aborted by the server (inc. in eresp)
+ 51. comp_in: number of HTTP response bytes fed to the compressor
+ 52. comp_out: number of HTTP response bytes emitted by the compressor
+ 53. comp_byp: number of bytes that bypassed the HTTP compressor (CPU/BW limit)
+ 54. comp_rsp: number of HTTP responses that were compressed
 
 
 9.2. Unix Socket commands
@@ -11134,7 +11268,8 @@ set rate-limit connections global <value>
 set rate-limit http-compression global <value>
   Change the maximum input compression rate, which is set by the global
   'maxcomprate' setting. A value of zero disables the limitation. The value is
-  passed in number of kilobytes per second.
+  passed in number of kilobytes per second. The value is available in the "show
+  info" on the line "CompressBpsRateLim" in bytes.
 
 set table <table> key <key> data.<data_type> <value>
   Create or update a stick-table entry in the table. If the key is not present,
@@ -11231,7 +11366,9 @@ show sess <id>
   of "show sess" (it corresponds to the session pointer). Those information are
   useless to most users but may be used by haproxy developers to troubleshoot a
   complex bug. The output format is intentionally not documented so that it can
-  freely evolve depending on demands.
+  freely evolve depending on demands. The special id "all" dumps the states of
+  all sessions, which can be avoided as much as possible as it is highly CPU
+  intensive and can take a lot of time.
 
 show stat [<iid> <type> <sid>]
   Dump statistics in the CSV format. By passing <id>, <type> and <sid>, it is
