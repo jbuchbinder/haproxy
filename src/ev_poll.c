@@ -154,23 +154,39 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 		if (!fdtab[fd].owner)
 			continue;
 
+		/* it looks complicated but gcc can optimize it away when constants
+		 * have same values... In fact it depends on gcc :-(
+		 */
 		fdtab[fd].ev &= FD_POLL_STICKY;
-		fdtab[fd].ev |=
-			((e & POLLIN ) ? FD_POLL_IN  : 0) |
-			((e & POLLOUT) ? FD_POLL_OUT : 0) |
-			((e & POLLERR) ? FD_POLL_ERR : 0) |
-			((e & POLLHUP) ? FD_POLL_HUP : 0);
+		if (POLLIN == FD_POLL_IN && POLLOUT == FD_POLL_OUT &&
+		    POLLERR == FD_POLL_ERR && POLLHUP == FD_POLL_HUP) {
+			fdtab[fd].ev |= e & (POLLIN|POLLOUT|POLLERR|POLLHUP);
+		}
+		else {
+			fdtab[fd].ev |=
+				((e & POLLIN ) ? FD_POLL_IN  : 0) |
+				((e & POLLOUT) ? FD_POLL_OUT : 0) |
+				((e & POLLERR) ? FD_POLL_ERR : 0) |
+				((e & POLLHUP) ? FD_POLL_HUP : 0);
+		}
 
-		if (fdtab[fd].iocb && fdtab[fd].owner && fdtab[fd].ev) {
+		if (fdtab[fd].iocb && fdtab[fd].ev) {
 			/* Mark the events as speculative before processing
 			 * them so that if nothing can be done we don't need
 			 * to poll again.
 			 */
-			if (fdtab[fd].ev & (FD_POLL_IN|FD_POLL_HUP|FD_POLL_ERR))
+			if (fdtab[fd].ev & FD_POLL_IN)
 				fd_ev_set(fd, DIR_RD);
 
-			if (fdtab[fd].ev & (FD_POLL_OUT|FD_POLL_ERR))
+			if (fdtab[fd].ev & FD_POLL_OUT)
 				fd_ev_set(fd, DIR_WR);
+
+			if (fdtab[fd].spec_p) {
+				/* This fd was already scheduled for being
+				 * called as a speculative I/O
+				 */
+				continue;
+			}
 
 			fdtab[fd].iocb(fd);
 		}

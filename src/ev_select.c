@@ -156,16 +156,23 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			if (FD_ISSET(fd, tmp_evts[DIR_WR]))
 				fdtab[fd].ev |= FD_POLL_OUT;
 
-			if (fdtab[fd].iocb && fdtab[fd].owner && fdtab[fd].ev) {
+			if (fdtab[fd].iocb && fdtab[fd].ev) {
 				/* Mark the events as speculative before processing
 				 * them so that if nothing can be done we don't need
 				 * to poll again.
 				 */
-				if (fdtab[fd].ev & (FD_POLL_IN|FD_POLL_HUP|FD_POLL_ERR))
+				if (fdtab[fd].ev & FD_POLL_IN)
 					fd_ev_set(fd, DIR_RD);
 
-				if (fdtab[fd].ev & (FD_POLL_OUT|FD_POLL_ERR))
+				if (fdtab[fd].ev & FD_POLL_OUT)
 					fd_ev_set(fd, DIR_WR);
+
+				if (fdtab[fd].spec_p) {
+					/* This fd was already scheduled for being
+					 * called as a speculative I/O.
+					 */
+					continue;
+				}
 
 				fdtab[fd].iocb(fd);
 			}

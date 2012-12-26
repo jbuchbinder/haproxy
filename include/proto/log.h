@@ -55,10 +55,10 @@ void sess_log(struct session *s);
 int parse_logformat_var_args(char *args, struct logformat_node *node);
 
 /*
- * Parse a variable '%varname' or '%{args}varname' in logformat
+ * Parse a variable '%varname' or '%{args}varname' in log-format
  *
  */
-int parse_logformat_var(char *str, size_t len, struct proxy *curproxy, struct list *list_format, int *defoptions);
+int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct proxy *curproxy, struct list *list_format, int *defoptions);
 
 /*
  * add to the logformat linked list
@@ -70,7 +70,7 @@ void add_to_logformat_list(char *start, char *end, int type, struct list *list_f
  * Variable name are preceded by % and composed by characters [a-zA-Z0-9]* : %varname
  * You can set arguments using { } : %{many arguments}varname
  */
-void parse_logformat_string(char *str, struct proxy *curproxy, struct list *list_format, int capabilities);
+void parse_logformat_string(const char *str, struct proxy *curproxy, struct list *list_format, int capabilities);
 /*
  * Displays the message on stderr with the date and pid. Overrides the quiet
  * mode during startup.
@@ -122,7 +122,7 @@ int get_log_facility(const char *fac);
  *
  * Return the adress of the \0 character, or NULL on error
  */
-char *lf_text(char *dst, const char *src, size_t size, struct logformat_node *node);
+char *lf_text_len(char *dst, const char *src, size_t len, size_t size, struct logformat_node *node);
 
 /*
  * Write a IP adress to the log string

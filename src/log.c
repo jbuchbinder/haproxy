@@ -10,6 +10,7 @@
  *
  */
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -32,6 +33,7 @@
 
 #include <proto/frontend.h>
 #include <proto/log.h>
+#include <proto/sample.h>
 #include <proto/stream_interface.h>
 #ifdef USE_OPENSSL
 #include <proto/ssl_sock.h>
@@ -63,6 +65,7 @@ struct logformat_type {
 	int mode;
 	int lw; /* logwait bitsfield */
 	int (*config_callback)(struct logformat_node *node, struct proxy *curproxy);
+	const char *replace_by; /* new option to use instead of old one */
 };
 
 int prepare_addrsource(struct logformat_node *node, struct proxy *curproxy);
@@ -70,58 +73,74 @@ int prepare_addrsource(struct logformat_node *node, struct proxy *curproxy);
 /* log_format variable names */
 static const struct logformat_type logformat_keywords[] = {
 	{ "o", LOG_FMT_GLOBAL, PR_MODE_TCP, 0, NULL },  /* global option */
-	{ "Ci", LOG_FMT_CLIENTIP, PR_MODE_TCP, LW_CLIP, NULL },  /* client ip */
-	{ "Cp", LOG_FMT_CLIENTPORT, PR_MODE_TCP, LW_CLIP, NULL }, /* client port */
-	{ "Bp", LOG_FMT_BACKENDPORT, PR_MODE_TCP, LW_BCKIP, prepare_addrsource }, /* backend source port */
-	{ "Bi", LOG_FMT_BACKENDIP, PR_MODE_TCP, LW_BCKIP, prepare_addrsource }, /* backend source ip */
-	{ "Fp", LOG_FMT_FRONTENDPORT, PR_MODE_TCP, LW_FRTIP, NULL }, /* frontend port */
-	{ "Fi", LOG_FMT_FRONTENDIP, PR_MODE_TCP, LW_FRTIP, NULL }, /* frontend ip */
-	{ "Sp", LOG_FMT_SERVERPORT, PR_MODE_TCP, LW_SVIP, NULL }, /* server destination port */
-	{ "Si", LOG_FMT_SERVERIP, PR_MODE_TCP, LW_SVIP, NULL }, /* server destination ip */
-	{ "t", LOG_FMT_DATE, PR_MODE_TCP, LW_INIT, NULL },      /* date */
-	{ "T", LOG_FMT_DATEGMT, PR_MODE_TCP, LW_INIT, NULL },   /* date GMT */
-	{ "Tl", LOG_FMT_DATELOCAL, PR_MODE_TCP, LW_INIT, NULL },   /* date local timezone */
-	{ "Ts", LOG_FMT_TS, PR_MODE_TCP, LW_INIT, NULL },   /* timestamp GMT */
-	{ "ms", LOG_FMT_MS, PR_MODE_TCP, LW_INIT, NULL },       /* accept date millisecond */
-	{ "f", LOG_FMT_FRONTEND, PR_MODE_TCP, LW_INIT, NULL },  /* frontend */
-	{ "ft", LOG_FMT_FRONTEND_XPRT, PR_MODE_TCP, LW_INIT, NULL },  /* frontend with transport mode */
-	{ "b", LOG_FMT_BACKEND, PR_MODE_TCP, LW_INIT, NULL },   /* backend */
-	{ "s", LOG_FMT_SERVER, PR_MODE_TCP, LW_SVID, NULL },    /* server */
-	{ "B", LOG_FMT_BYTES, PR_MODE_TCP, LW_BYTES, NULL },     /* bytes read */
-	{ "Tq", LOG_FMT_TQ, PR_MODE_HTTP, LW_BYTES, NULL },       /* Tq */
-	{ "Tw", LOG_FMT_TW, PR_MODE_TCP, LW_BYTES, NULL },       /* Tw */
-	{ "Tc", LOG_FMT_TC, PR_MODE_TCP, LW_BYTES, NULL },       /* Tc */
-	{ "Tr", LOG_FMT_TR, PR_MODE_HTTP, LW_BYTES, NULL },       /* Tr */
-	{ "Tt", LOG_FMT_TT, PR_MODE_TCP, LW_BYTES, NULL },       /* Tt */
-	{ "st", LOG_FMT_STATUS, PR_MODE_HTTP, LW_RESP, NULL },   /* status code */
-	{ "cc", LOG_FMT_CCLIENT, PR_MODE_HTTP, LW_REQHDR, NULL },  /* client cookie */
-	{ "cs", LOG_FMT_CSERVER, PR_MODE_HTTP, LW_RSPHDR, NULL },  /* server cookie */
-	{ "ts", LOG_FMT_TERMSTATE, PR_MODE_TCP, LW_BYTES, NULL },/* termination state */
-	{ "tsc", LOG_FMT_TERMSTATE_CK, PR_MODE_TCP, LW_INIT, NULL },/* termination state */
-	{ "ac", LOG_FMT_ACTCONN, PR_MODE_TCP, LW_BYTES, NULL },  /* actconn */
-	{ "fc", LOG_FMT_FECONN, PR_MODE_TCP, LW_BYTES, NULL },   /* feconn */
-	{ "bc", LOG_FMT_BECONN, PR_MODE_TCP, LW_BYTES, NULL },   /* beconn */
-	{ "sc", LOG_FMT_SRVCONN, PR_MODE_TCP, LW_BYTES, NULL },  /* srv_conn */
-	{ "rc", LOG_FMT_RETRIES, PR_MODE_TCP, LW_BYTES, NULL },  /* retries */
-	{ "sq", LOG_FMT_SRVQUEUE, PR_MODE_TCP, LW_BYTES, NULL  }, /* srv_queue */
-	{ "bq", LOG_FMT_BCKQUEUE, PR_MODE_TCP, LW_BYTES, NULL }, /* backend_queue */
-	{ "hr", LOG_FMT_HDRREQUEST, PR_MODE_HTTP, LW_REQHDR, NULL }, /* header request */
-	{ "hs", LOG_FMT_HDRRESPONS, PR_MODE_HTTP, LW_RSPHDR, NULL },  /* header response */
-	{ "hrl", LOG_FMT_HDRREQUESTLIST, PR_MODE_HTTP, LW_REQHDR, NULL }, /* header request list */
-	{ "hsl", LOG_FMT_HDRRESPONSLIST, PR_MODE_HTTP, LW_RSPHDR, NULL },  /* header response list */
-	{ "r", LOG_FMT_REQ, PR_MODE_HTTP, LW_REQ, NULL },  /* request */
-	{ "pid", LOG_FMT_PID, PR_MODE_TCP, LW_INIT, NULL }, /* log pid */
-	{ "rt", LOG_FMT_COUNTER, PR_MODE_HTTP, LW_REQ, NULL }, /* HTTP request counter */
+
+	/* please keep these lines sorted ! */
+	{ "B", LOG_FMT_BYTES, PR_MODE_TCP, LW_BYTES, NULL },     /* bytes from server to client */
+	{ "CC", LOG_FMT_CCLIENT, PR_MODE_HTTP, LW_REQHDR, NULL },  /* client cookie */
+	{ "CS", LOG_FMT_CSERVER, PR_MODE_HTTP, LW_RSPHDR, NULL },  /* server cookie */
 	{ "H", LOG_FMT_HOSTNAME, PR_MODE_TCP, LW_INIT, NULL }, /* Hostname */
 	{ "ID", LOG_FMT_UNIQUEID, PR_MODE_HTTP, LW_BYTES, NULL }, /* Unique ID */
+	{ "ST", LOG_FMT_STATUS, PR_MODE_HTTP, LW_RESP, NULL },   /* status code */
+	{ "T", LOG_FMT_DATEGMT, PR_MODE_TCP, LW_INIT, NULL },   /* date GMT */
+	{ "Tc", LOG_FMT_TC, PR_MODE_TCP, LW_BYTES, NULL },       /* Tc */
+	{ "Tl", LOG_FMT_DATELOCAL, PR_MODE_TCP, LW_INIT, NULL },   /* date local timezone */
+	{ "Tq", LOG_FMT_TQ, PR_MODE_HTTP, LW_BYTES, NULL },       /* Tq */
+	{ "Tr", LOG_FMT_TR, PR_MODE_HTTP, LW_BYTES, NULL },       /* Tr */
+	{ "Ts", LOG_FMT_TS, PR_MODE_TCP, LW_INIT, NULL },   /* timestamp GMT */
+	{ "Tt", LOG_FMT_TT, PR_MODE_TCP, LW_BYTES, NULL },       /* Tt */
+	{ "Tw", LOG_FMT_TW, PR_MODE_TCP, LW_BYTES, NULL },       /* Tw */
+	{ "U", LOG_FMT_BYTES_UP, PR_MODE_TCP, LW_BYTES, NULL },  /* bytes from client to server */
+	{ "ac", LOG_FMT_ACTCONN, PR_MODE_TCP, LW_BYTES, NULL },  /* actconn */
+	{ "b", LOG_FMT_BACKEND, PR_MODE_TCP, LW_INIT, NULL },   /* backend */
+	{ "bc", LOG_FMT_BECONN, PR_MODE_TCP, LW_BYTES, NULL },   /* beconn */
+	{ "bi", LOG_FMT_BACKENDIP, PR_MODE_TCP, LW_BCKIP, prepare_addrsource }, /* backend source ip */
+	{ "bp", LOG_FMT_BACKENDPORT, PR_MODE_TCP, LW_BCKIP, prepare_addrsource }, /* backend source port */
+	{ "bq", LOG_FMT_BCKQUEUE, PR_MODE_TCP, LW_BYTES, NULL }, /* backend_queue */
+	{ "ci", LOG_FMT_CLIENTIP, PR_MODE_TCP, LW_CLIP, NULL },  /* client ip */
+	{ "cp", LOG_FMT_CLIENTPORT, PR_MODE_TCP, LW_CLIP, NULL }, /* client port */
+	{ "f", LOG_FMT_FRONTEND, PR_MODE_TCP, LW_INIT, NULL },  /* frontend */
+	{ "fc", LOG_FMT_FECONN, PR_MODE_TCP, LW_BYTES, NULL },   /* feconn */
+	{ "fi", LOG_FMT_FRONTENDIP, PR_MODE_TCP, LW_FRTIP, NULL }, /* frontend ip */
+	{ "fp", LOG_FMT_FRONTENDPORT, PR_MODE_TCP, LW_FRTIP, NULL }, /* frontend port */
+	{ "ft", LOG_FMT_FRONTEND_XPRT, PR_MODE_TCP, LW_INIT, NULL },  /* frontend with transport mode */
+	{ "hr", LOG_FMT_HDRREQUEST, PR_MODE_HTTP, LW_REQHDR, NULL }, /* header request */
+	{ "hrl", LOG_FMT_HDRREQUESTLIST, PR_MODE_HTTP, LW_REQHDR, NULL }, /* header request list */
+	{ "hs", LOG_FMT_HDRRESPONS, PR_MODE_HTTP, LW_RSPHDR, NULL },  /* header response */
+	{ "hsl", LOG_FMT_HDRRESPONSLIST, PR_MODE_HTTP, LW_RSPHDR, NULL },  /* header response list */
+	{ "ms", LOG_FMT_MS, PR_MODE_TCP, LW_INIT, NULL },       /* accept date millisecond */
+	{ "pid", LOG_FMT_PID, PR_MODE_TCP, LW_INIT, NULL }, /* log pid */
+	{ "r", LOG_FMT_REQ, PR_MODE_HTTP, LW_REQ, NULL },  /* request */
+	{ "rc", LOG_FMT_RETRIES, PR_MODE_TCP, LW_BYTES, NULL },  /* retries */
+	{ "rt", LOG_FMT_COUNTER, PR_MODE_HTTP, LW_REQ, NULL }, /* HTTP request counter */
+	{ "s", LOG_FMT_SERVER, PR_MODE_TCP, LW_SVID, NULL },    /* server */
+	{ "sc", LOG_FMT_SRVCONN, PR_MODE_TCP, LW_BYTES, NULL },  /* srv_conn */
+	{ "si", LOG_FMT_SERVERIP, PR_MODE_TCP, LW_SVIP, NULL }, /* server destination ip */
+	{ "sp", LOG_FMT_SERVERPORT, PR_MODE_TCP, LW_SVIP, NULL }, /* server destination port */
+	{ "sq", LOG_FMT_SRVQUEUE, PR_MODE_TCP, LW_BYTES, NULL  }, /* srv_queue */
 	{ "sslc", LOG_FMT_SSL_CIPHER, PR_MODE_TCP, LW_XPRT, NULL }, /* client-side SSL ciphers */
 	{ "sslv", LOG_FMT_SSL_VERSION, PR_MODE_TCP, LW_XPRT, NULL }, /* client-side SSL protocol version */
+	{ "t", LOG_FMT_DATE, PR_MODE_TCP, LW_INIT, NULL },      /* date */
+	{ "ts", LOG_FMT_TERMSTATE, PR_MODE_TCP, LW_BYTES, NULL },/* termination state */
+	{ "tsc", LOG_FMT_TERMSTATE_CK, PR_MODE_TCP, LW_INIT, NULL },/* termination state */
+
+	/* The following tags are deprecated and will be removed soon */
+	{ "Bi", LOG_FMT_BACKENDIP, PR_MODE_TCP, LW_BCKIP, prepare_addrsource, "bi" }, /* backend source ip */
+	{ "Bp", LOG_FMT_BACKENDPORT, PR_MODE_TCP, LW_BCKIP, prepare_addrsource, "bp" }, /* backend source port */
+	{ "Ci", LOG_FMT_CLIENTIP, PR_MODE_TCP, LW_CLIP, NULL, "ci" },  /* client ip */
+	{ "Cp", LOG_FMT_CLIENTPORT, PR_MODE_TCP, LW_CLIP, NULL, "cp" }, /* client port */
+	{ "Fi", LOG_FMT_FRONTENDIP, PR_MODE_TCP, LW_FRTIP, NULL, "fi" }, /* frontend ip */
+	{ "Fp", LOG_FMT_FRONTENDPORT, PR_MODE_TCP, LW_FRTIP, NULL, "fp" }, /* frontend port */
+	{ "Si", LOG_FMT_SERVERIP, PR_MODE_TCP, LW_SVIP, NULL, "si" }, /* server destination ip */
+	{ "Sp", LOG_FMT_SERVERPORT, PR_MODE_TCP, LW_SVIP, NULL, "sp" }, /* server destination port */
+	{ "cc", LOG_FMT_CCLIENT, PR_MODE_HTTP, LW_REQHDR, NULL, "CC" },  /* client cookie */
+	{ "cs", LOG_FMT_CSERVER, PR_MODE_HTTP, LW_RSPHDR, NULL, "CS" },  /* server cookie */
+	{ "st", LOG_FMT_STATUS, PR_MODE_HTTP, LW_RESP, NULL, "ST" },   /* status code */
 	{ 0, 0, 0, 0, NULL }
 };
 
-char default_http_log_format[] = "%Ci:%Cp [%t] %ft %b/%s %Tq/%Tw/%Tc/%Tr/%Tt %st %B %cc %cs %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r"; // default format
-char clf_http_log_format[] = "%{+Q}o %{-Q}Ci - - [%T] %r %st %B \"\" \"\" %Cp %ms %ft %b %s %Tq %Tw %Tc %Tr %Tt %tsc %ac %fc %bc %sc %rc %sq %bq %cc %cs %hrl %hsl";
-char default_tcp_log_format[] = "%Ci:%Cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq";
+char default_http_log_format[] = "%ci:%cp [%t] %ft %b/%s %Tq/%Tw/%Tc/%Tr/%Tt %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r"; // default format
+char clf_http_log_format[] = "%{+Q}o %{-Q}ci - - [%T] %r %ST %B \"\" \"\" %cp %ms %ft %b %s %Tq %Tw %Tc %Tr %Tt %tsc %ac %fc %bc %sc %rc %sq %bq %CC %CS %hrl %hsl";
+char default_tcp_log_format[] = "%ci:%cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq";
 char *log_format = NULL;
 
 /* This is a global syslog line, common to all outgoing messages. It begins
@@ -183,7 +202,7 @@ int parse_logformat_var_args(char *args, struct logformat_node *node)
 
 		if (*args == '\0' || *args == ',') {
 			*args = '\0';
-			for (i = 0; var_args_list[i].name; i++) {
+			for (i = 0; sp && var_args_list[i].name; i++) {
 				if (strcmp(sp, var_args_list[i].name) == 0) {
 					if (flags == 1) {
 						node->options |= var_args_list[i].mask;
@@ -198,72 +217,60 @@ int parse_logformat_var_args(char *args, struct logformat_node *node)
 			if (end)
 				break;
 		}
-	args++;
+		args++;
 	}
 	return 0;
 }
 
 /*
- * Parse a variable '%varname' or '%{args}varname' in logformat
- *
+ * Parse a variable '%varname' or '%{args}varname' in log-format. The caller
+ * must pass the args part in the <arg> pointer with its length in <arg_len>,
+ * and varname with its length in <var> and <var_len> respectively. <arg> is
+ * ignored when arg_len is 0. Neither <var> nor <var_len> may be null.
  */
-int parse_logformat_var(char *str, size_t len, struct proxy *curproxy, struct list *list_format, int *defoptions)
+int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct proxy *curproxy, struct list *list_format, int *defoptions)
 {
-	int i, j;
-	char *arg = NULL; // arguments
-	int fparam = 0;
-	char *name = NULL;
-	struct logformat_node *node = NULL;
-	char varname[255] = { 0 }; // variable name
+	int j;
+	struct logformat_node *node;
 
-	for (i = 1; i < len; i++) { // escape first char %
-		if (!arg && str[i] == '{') {
-			arg = str + i;
-			fparam = 1;
-		} else if (arg && str[i] == '}') {
-			char *tmp = arg;
-			arg = calloc(str + i - tmp, 1); // without {}
-			strncpy(arg, tmp + 1, str + i - tmp - 1); // copy without { and }
-			arg[str + i - tmp - 1] = '\0';
-			fparam = 0;
-		} else if (!name && !fparam) {
-			strncpy(varname, str + i, len - i + 1);
-			varname[len - i] = '\0';
-			for (j = 0; logformat_keywords[j].name; j++) { // search a log type
-				if (strcmp(varname, logformat_keywords[j].name) == 0) {
-					if (!((logformat_keywords[j].mode == PR_MODE_HTTP) && (curproxy->mode == PR_MODE_TCP))) {
-						node = calloc(1, sizeof(struct logformat_node));
-						node->type = logformat_keywords[j].type;
-						node->options = *defoptions;
-						node->arg = arg;
-						parse_logformat_var_args(node->arg, node);
-						if (node->type == LOG_FMT_GLOBAL) {
-							*defoptions = node->options;
-							free(node);
-						} else {
-							if (logformat_keywords[j].config_callback != NULL) {
-								if (logformat_keywords[j].config_callback(node, curproxy) != 0) {
-									return -1;
-								 }
-							}
-							curproxy->to_log |= logformat_keywords[j].lw;
-							LIST_ADDQ(list_format, &node->list);
-						}
-						return 0;
-					} else {
-						Warning("Warning: No such variable name '%s' in this log mode\n", varname);
-						if (arg)
-							free(arg);
+	for (j = 0; logformat_keywords[j].name; j++) { // search a log type
+		if (strlen(logformat_keywords[j].name) == var_len &&
+		    strncmp(var, logformat_keywords[j].name, var_len) == 0) {
+			if (logformat_keywords[j].mode != PR_MODE_HTTP || curproxy->mode == PR_MODE_HTTP) {
+				node = calloc(1, sizeof(struct logformat_node));
+				node->type = logformat_keywords[j].type;
+				node->options = *defoptions;
+				if (arg_len) {
+					node->arg = my_strndup(arg, arg_len);
+					parse_logformat_var_args(node->arg, node);
+				}
+				if (node->type == LOG_FMT_GLOBAL) {
+					*defoptions = node->options;
+					free(node->arg);
+					free(node);
+				} else {
+					if (logformat_keywords[j].config_callback &&
+					    logformat_keywords[j].config_callback(node, curproxy) != 0) {
 						return -1;
 					}
+					curproxy->to_log |= logformat_keywords[j].lw;
+					LIST_ADDQ(list_format, &node->list);
 				}
+				if (logformat_keywords[j].replace_by)
+					Warning("Warning: deprecated variable '%s' in log-format, please replace it with '%s'\n",
+					        logformat_keywords[j].name, logformat_keywords[j].replace_by);
+				return 0;
+			} else {
+				Warning("Warning: log-format variable name '%s' is not suited to HTTP mode\n", logformat_keywords[j].name);
+				return -1;
 			}
-			Warning("Warning: No such variable name '%s' in logformat\n", varname);
-			if (arg)
-				free(arg);
-			return -1;
 		}
 	}
+
+	j = var[var_len];
+	var[var_len] = 0;
+	Warning("Warning: no such variable name '%s' in log-format\n", var);
+	var[var_len] = j;
 	return -1;
 }
 
@@ -282,7 +289,7 @@ void add_to_logformat_list(char *start, char *end, int type, struct list *list_f
 {
 	char *str;
 
-	if (type == LOG_FMT_TEXT) { /* type text */
+	if (type == LF_TEXT) { /* type text */
 		struct logformat_node *node = calloc(1, sizeof(struct logformat_node));
 		str = calloc(end - start + 1, 1);
 		strncpy(str, start, end - start);
@@ -290,11 +297,56 @@ void add_to_logformat_list(char *start, char *end, int type, struct list *list_f
 		node->arg = str;
 		node->type = LOG_FMT_TEXT; // type string
 		LIST_ADDQ(list_format, &node->list);
-	} else if (type == LOG_FMT_SEPARATOR) {
+	} else if (type == LF_SEPARATOR) {
 		struct logformat_node *node = calloc(1, sizeof(struct logformat_node));
 		node->type = LOG_FMT_SEPARATOR;
 		LIST_ADDQ(list_format, &node->list);
 	}
+}
+
+/*
+ * Parse the sample fetch expression <text> and add a node to <list_format> upon
+ * success. At the moment, sample converters are not yet supported but fetch arguments
+ * should work.
+ */
+void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options)
+{
+	char *cmd[2];
+	struct sample_expr *expr;
+	struct logformat_node *node;
+	int cmd_arg;
+
+	cmd[0] = text;
+	cmd[1] = "";
+	cmd_arg = 0;
+
+	expr = sample_parse_expr(cmd, &cmd_arg, trash.str, trash.size);
+	if (!expr) {
+		Warning("log-format: sample fetch <%s> failed with : %s\n", text, trash.str);
+		return;
+	}
+
+	node = calloc(1, sizeof(struct logformat_node));
+	node->type = LOG_FMT_EXPR;
+	node->expr = expr;
+	node->options = options;
+
+	if (arg_len) {
+		node->arg = my_strndup(arg, arg_len);
+		parse_logformat_var_args(node->arg, node);
+	}
+	if (expr->fetch->cap & SMP_CAP_REQ)
+		node->options |= LOG_OPT_REQ_CAP; /* fetch method is request-compatible */
+
+	if (expr->fetch->cap & SMP_CAP_RES)
+		node->options |= LOG_OPT_RES_CAP; /* fetch method is response-compatible */
+
+	/* check if we need to allocate an hdr_idx struct for HTTP parsing */
+	/* Note, we may also need to set curpx->to_log with certain fetches */
+	if (expr->fetch->cap & SMP_CAP_L7)
+		curpx->acl_requires |= ACL_USE_L7_ANY;
+
+	LIST_ADDQ(list_format, &node->list);
 }
 
 /*
@@ -307,14 +359,19 @@ void add_to_logformat_list(char *start, char *end, int type, struct list *list_f
  *  list_format: the destination list
  *  capabilities: PR_MODE_TCP_ | PR_MODE_HTTP
  */
-void parse_logformat_string(char *str, struct proxy *curproxy, struct list *list_format, int capabilities)
+void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list *list_format, int capabilities)
 {
-	char *sp = str; /* start pointer */
-	int cformat = -1; /* current token format : LOG_TEXT, LOG_SEPARATOR, LOG_VARIABLE */
-	int pformat = -1; /* previous token format */
+	char *sp, *str, *backfmt; /* start pointer for text parts */
+	char *arg = NULL; /* start pointer for args */
+	char *var = NULL; /* start pointer for vars */
+	int arg_len = 0;
+	int var_len = 0;
+	int cformat; /* current token format */
+	int pformat; /* previous token format */
 	struct logformat_node *tmplf, *back;
 	int options = 0;
 
+	sp = str = backfmt = strdup(fmt);
 	curproxy->to_log |= LW_INIT;
 
 	/* flush the list first. */
@@ -323,87 +380,110 @@ void parse_logformat_string(char *str, struct proxy *curproxy, struct list *list
 		free(tmplf);
 	}
 
-	while (1) {
-
-		// push the variable only if formats are different, not
-		// within a variable, and not the first iteration
-		if ((cformat != pformat && cformat != -1 && pformat != -1) || *str == '\0') {
-			if (((pformat != LF_STARTVAR && cformat != LF_VAR) &&
-			    (pformat != LF_STARTVAR && cformat != LF_STARG) &&
-			    (pformat != LF_STARG && cformat !=  LF_VAR)) || *str == '\0') {
-				if (pformat > LF_VAR) // unfinished string
-					pformat = LF_TEXT;
-				if (pformat == LF_VAR)
-					parse_logformat_var(sp, str - sp, curproxy, list_format, &options);
-				else
-					add_to_logformat_list(sp, str, pformat, list_format);
-				sp = str;
-				if (*str == '\0')
-					break;
-			    }
-		}
-
-		if (cformat != -1)
-			str++; // consume the string, except on the first tour
-
+	for (cformat = LF_INIT; cformat != LF_END; str++) {
 		pformat = cformat;
 
-		if (*str == '\0') {
-			cformat = LF_STARTVAR; // for breaking in all cases
-			continue;
-		}
+		if (!*str)
+			cformat = LF_END;              // preset it to save all states from doing this
 
-		if (pformat == LF_STARTVAR) { // after a %
-			if ( (*str >= 'a' && *str <= 'z') || // parse varname
-			     (*str >= 'A' && *str <= 'Z') ||
-			     (*str >= '0' && *str <= '9')) {
-				cformat = LF_VAR; // varname
-				continue;
-			} else if (*str == '{') {
-				cformat = LF_STARG; // variable arguments
-				continue;
-			} else { // another unexpected token
-				pformat = LF_TEXT; // redefine the format of the previous token to TEXT
-				cformat = LF_TEXT;
-				continue;
-			}
-
-		} else if (pformat == LF_VAR) { // after a varname
-			if ( (*str >= 'a' && *str <= 'z') || // parse varname
-			     (*str >= 'A' && *str <= 'Z') ||
-			     (*str >= '0' && *str <= '9')) {
-				cformat = LF_VAR;
-				continue;
-			}
-		} else if (pformat  == LF_STARG) { // inside variable arguments
-			if (*str == '}') { // end of varname
-				cformat = LF_EDARG;
-				continue;
-			} else { // all tokens are acceptable within { }
+		/* The prinicple of the two-step state machine below is to first detect a change, and
+		 * second have all common paths processed at one place. The common paths are the ones
+		 * encountered in text areas (LF_INIT, LF_TEXT, LF_SEPARATOR) and at the end (LF_END).
+		 * We use the common LF_INIT state to dispatch to the different final states.
+		 */
+		switch (pformat) {
+		case LF_STARTVAR:                      // text immediately following a '%'
+			arg = NULL; var = NULL;
+			arg_len = var_len = 0;
+			if (*str == '{') {             // optional argument
 				cformat = LF_STARG;
-				continue;
+				arg = str + 1;
 			}
-		} else if (pformat == LF_EDARG) { //  after arguments
-			if ( (*str >= 'a' && *str <= 'z') || // parse a varname
-			     (*str >= 'A' && *str <= 'Z') ||
-			     (*str >= '0' && *str <= '9')) {
+			else if (*str == '[') {
+				cformat = LF_STEXPR;
+				var = str + 1;         // store expr in variable name
+			}
+			else if (isalnum((int)*str)) { // variable name
 				cformat = LF_VAR;
-				continue;
-			} else { // if no varname after arguments, transform in TEXT
-				pformat = LF_TEXT;
-				cformat = LF_TEXT;
+				var = str;
+			}
+			else if (*str == '%')
+				cformat = LF_TEXT;     // convert this character to a litteral (useful for '%')
+			else
+				cformat = LF_INIT;     // handle other cases of litterals
+			break;
+
+		case LF_STARG:                         // text immediately following '%{'
+			if (*str == '}') {             // end of arg
+				cformat = LF_EDARG;
+				arg_len = str - arg;
+				*str = 0;              // used for reporting errors
+			}
+			break;
+
+		case LF_EDARG:                         // text immediately following '%{arg}'
+			if (*str == '[') {
+				cformat = LF_STEXPR;
+				var = str + 1;         // store expr in variable name
+				break;
+			}
+			else if (isalnum((int)*str)) { // variable name
+				cformat = LF_VAR;
+				var = str;
+				break;
+			}
+			Warning("Skipping isolated argument in log-format line : '%%{%s}'\n", arg);
+			cformat = LF_INIT;
+			break;
+
+		case LF_STEXPR:                        // text immediately following '%['
+			if (*str == ']') {             // end of arg
+				cformat = LF_EDEXPR;
+				var_len = str - var;
+				*str = 0;              // needed for parsing the expression
+			}
+			break;
+
+		case LF_VAR:                           // text part of a variable name
+			var_len = str - var;
+			if (!isalnum((int)*str))
+				cformat = LF_INIT;     // not variable name anymore
+			break;
+
+		default:                               // LF_INIT, LF_TEXT, LF_SEPARATOR, LF_END, LF_EDEXPR
+			cformat = LF_INIT;
+		}
+
+		if (cformat == LF_INIT) { /* resynchronize state to text/sep/startvar */
+			switch (*str) {
+			case '%': cformat = LF_STARTVAR;  break;
+			case ' ': cformat = LF_SEPARATOR; break;
+			case  0 : cformat = LF_END;       break;
+			default : cformat = LF_TEXT;      break;
 			}
 		}
 
-		// others tokens that don't match previous conditions
-		if (*str == '%') {
-			cformat = LF_STARTVAR;
-		} else if (*str == ' ') {
-			cformat = LF_SEPARATOR;
-		} else {
-			cformat = LF_TEXT;
+		if (cformat != pformat || pformat == LF_SEPARATOR) {
+			switch (pformat) {
+			case LF_VAR:
+				parse_logformat_var(arg, arg_len, var, var_len, curproxy, list_format, &options);
+				break;
+			case LF_STEXPR:
+				add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options);
+				break;
+			case LF_TEXT:
+			case LF_SEPARATOR:
+				add_to_logformat_list(sp, str, pformat, list_format);
+				break;
+			}
+			sp = str; /* new start of text at every state switch and at every separator */
 		}
 	}
+
+	if (pformat == LF_STARTVAR || pformat == LF_STARG || pformat == LF_STEXPR)
+		Warning("Ignoring end of truncated log-format line after '%s'\n", var ? var : arg ? arg : "%");
+
+	free(backfmt);
 }
 
 /*
@@ -498,51 +578,38 @@ int get_log_facility(const char *fac)
  *
  * Return the adress of the \0 character, or NULL on error
  */
-char *lf_text(char *dst, const char *src, size_t size, struct logformat_node *node)
+char *lf_text_len(char *dst, const char *src, size_t len, size_t size, struct logformat_node *node)
 {
-	int n;
+	if (size < 2)
+		return NULL;
 
-	if (src == NULL || *src == '\0') {
-		if (node->options & LOG_OPT_QUOTE) {
-			if (size > 2) {
-				*(dst++) = '"';
-				*(dst++) = '"';
-				*dst = '\0';
-			} else {
-				dst = NULL;
-				return dst;
-			}
-		} else {
-			if (size > 1) {
-				*(dst++) = '-';
-				*dst = '\0';
-			} else { // error no space available
-				dst = NULL;
-				return dst;
-			}
-		}
-	} else {
-		if (node->options & LOG_OPT_QUOTE) {
-			if (size-- > 1 ) {
-				*(dst++) = '"';
-			} else {
-				dst = NULL;
-				return NULL;
-			}
-			n = strlcpy2(dst, src, size);
-			size -= n;
-			dst += n;
-			if (size > 1) {
-				*(dst++) = '"';
-				*dst = '\0';
-			} else {
-				dst = NULL;
-			}
-		} else {
-			dst += strlcpy2(dst, src, size);
-		}
+	if (node->options & LOG_OPT_QUOTE) {
+		*(dst++) = '"';
+		size--;
 	}
+
+	if (src) {
+		if (++len > size)
+			len = size;
+		len = strlcpy2(dst, src, len);
+
+		size -= len;
+		dst += len;
+	}
+
+	if (node->options & LOG_OPT_QUOTE) {
+		if (size < 2)
+			return NULL;
+		*(dst++) = '"';
+	}
+
+	*dst = '\0';
 	return dst;
+}
+
+static inline char *lf_text(char *dst, const char *src, size_t size, struct logformat_node *node)
+{
+	return lf_text_len(dst, src, size, size, node);
 }
 
 /*
@@ -824,8 +891,9 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 
 	list_for_each_entry(tmp, list_format, list) {
 		const char *src = NULL;
-		switch (tmp->type) {
+		struct sample *key;
 
+		switch (tmp->type) {
 			case LOG_FMT_SEPARATOR:
 				if (!last_isspace) {
 					LOGCHAR(' ');
@@ -842,7 +910,22 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_CLIENTIP:  // %Ci
+			case LOG_FMT_EXPR: // sample expression, may be request or response
+				key = NULL;
+				if (tmp->options & LOG_OPT_REQ_CAP)
+					key = sample_fetch_string(be, s, txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, tmp->expr);
+				if (!key && (tmp->options & LOG_OPT_RES_CAP))
+					key = sample_fetch_string(be, s, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL, tmp->expr);
+				if (!key)
+					break;
+				ret = lf_text_len(tmplog, key->data.str.str, key->data.str.len, dst + maxsize - tmplog, tmp);
+				if (ret == 0)
+					goto out;
+				tmplog = ret;
+				last_isspace = 0;
+				break;
+
+			case LOG_FMT_CLIENTIP:  // %ci
 				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.from,
 					    dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -851,7 +934,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_CLIENTPORT:  // %Cp
+			case LOG_FMT_CLIENTPORT:  // %cp
 				if (s->req->prod->conn->addr.from.ss_family == AF_UNIX) {
 					ret = ltoa_o(s->listener->luid, tmplog, dst + maxsize - tmplog);
 				} else {
@@ -864,7 +947,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_FRONTENDIP: // %Fi
+			case LOG_FMT_FRONTENDIP: // %fi
 				conn_get_to_addr(s->req->prod->conn);
 				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.to,
 					    dst + maxsize - tmplog, tmp);
@@ -874,7 +957,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case  LOG_FMT_FRONTENDPORT: // %Fp
+			case  LOG_FMT_FRONTENDPORT: // %fp
 				conn_get_to_addr(s->req->prod->conn);
 				if (s->req->prod->conn->addr.to.ss_family == AF_UNIX) {
 					ret = ltoa_o(s->listener->luid,
@@ -889,7 +972,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_BACKENDIP:  // %Bi
+			case LOG_FMT_BACKENDIP:  // %bi
 				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.from,
 					    dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -898,7 +981,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_BACKENDPORT:  // %Bp
+			case LOG_FMT_BACKENDPORT:  // %bp
 				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.from,
 					      dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -907,7 +990,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_SERVERIP: // %Si
+			case LOG_FMT_SERVERIP: // %si
 				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.to,
 					    dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -916,7 +999,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_SERVERPORT: // %Sp
+			case LOG_FMT_SERVERPORT: // %sp
 				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.to,
 					      dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -1099,7 +1182,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_STATUS: // %st
+			case LOG_FMT_STATUS: // %ST
 				ret = ltoa_o(txn->status, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
@@ -1117,7 +1200,17 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_CCLIENT: // %cc
+			case LOG_FMT_BYTES_UP: // %U
+				if (!(tolog & LW_BYTES))
+					LOGCHAR('+');
+				ret = lltoa(s->logs.bytes_in, tmplog, dst + maxsize - tmplog);
+				if (ret == NULL)
+					goto out;
+				tmplog = ret;
+				last_isspace = 0;
+				break;
+
+			case LOG_FMT_CCLIENT: // %CC
 				src = txn->cli_cookie;
 				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
@@ -1126,7 +1219,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				last_isspace = 0;
 				break;
 
-			case LOG_FMT_CSERVER: // %cs
+			case LOG_FMT_CSERVER: // %CS
 				src = txn->srv_cookie;
 				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)

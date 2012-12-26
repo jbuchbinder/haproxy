@@ -46,11 +46,8 @@ int conn_fd_handler(int fd)
 	if (unlikely(!conn))
 		return 0;
 
-	/* before engaging there, we clear the new WAIT_* flags so that we can
-	 * more easily detect an EAGAIN condition from anywhere.
-	 */
-	flags = conn->flags &= ~(CO_FL_WAIT_DATA|CO_FL_WAIT_ROOM|CO_FL_WAIT_RD|CO_FL_WAIT_WR);
-	flags &= ~CO_FL_ERROR; /* ensure to call the wake handler upon error */
+	conn_refresh_polling_flags(conn);
+	flags = conn->flags & ~CO_FL_ERROR; /* ensure to call the wake handler upon error */
 
 	if (unlikely(conn->flags & CO_FL_ERROR))
 		goto leave;
@@ -153,7 +150,7 @@ int conn_fd_handler(int fd)
 		conn->flags |= CO_FL_CONNECTED;
 
 	/* remove the events before leaving */
-	fdtab[fd].ev &= ~(FD_POLL_IN | FD_POLL_OUT | FD_POLL_HUP | FD_POLL_ERR);
+	fdtab[fd].ev &= FD_POLL_STICKY;
 
 	/* commit polling changes */
 	conn_cond_update_polling(conn);
@@ -277,7 +274,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 			if (errno == EINTR)
 				continue;
 			if (errno == EAGAIN) {
-				conn_sock_poll_recv(conn);
+				__conn_sock_poll_recv(conn);
 				return 0;
 			}
 			goto recv_abort;
@@ -448,7 +445,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	goto fail;
 
  fail:
-	conn_sock_stop_both(conn);
+	__conn_sock_stop_both(conn);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }

@@ -26,13 +26,6 @@
 /* static sample used in sample_process() when <p> is NULL */
 static struct sample temp_smp;
 
-/* trash chunk used for sample conversions */
-static struct chunk trash_chunk;
-
-/* trash buffers used or sample conversions */
-char *sample_trash_buf1;
-char *sample_trash_buf2;
-
 /* list head of all known sample fetch keywords */
 static struct sample_fetch_kw_list sample_fetches = {
 	.list = LIST_HEAD_INIT(sample_fetches.list)
@@ -101,24 +94,6 @@ struct sample_conv *find_sample_conv(const char *kw, int len)
 	return NULL;
 }
 
-
-/*
-* Returns a static trash struct chunk to use in sample casts or format conversions
-* Swiths the 2 available trash buffers to protect data during convert
-*/
-struct chunk *sample_get_trash_chunk(void)
-{
-	char *sample_trash_buf;
-
-	sample_trash_buf  = sample_trash_buf1;
-	sample_trash_buf1 = sample_trash_buf2;
-	sample_trash_buf2 = sample_trash_buf1;
-
-	chunk_init(&trash_chunk, sample_trash_buf, global.tune.bufsize);
-
-	return &trash_chunk;
-}
-
 /******************************************************************/
 /*          Sample casts functions                                */
 /*   Note: these functions do *NOT* set the output type on the    */
@@ -133,7 +108,7 @@ static int c_ip2int(struct sample *smp)
 
 static int c_ip2str(struct sample *smp)
 {
-	struct chunk *trash = sample_get_trash_chunk();
+	struct chunk *trash = get_trash_chunk();
 
 	if (!inet_ntop(AF_INET, (void *)&smp->data.ipv4, trash->str, trash->size))
 		return 0;
@@ -152,7 +127,7 @@ static int c_ip2ipv6(struct sample *smp)
 
 static int c_ipv62str(struct sample *smp)
 {
-	struct chunk *trash = sample_get_trash_chunk();
+	struct chunk *trash = get_trash_chunk();
 
 	if (!inet_ntop(AF_INET6, (void *)&smp->data.ipv6, trash->str, trash->size))
 		return 0;
@@ -189,7 +164,7 @@ static int c_str2ipv6(struct sample *smp)
 
 static int c_bin2str(struct sample *smp)
 {
-	struct chunk *trash = sample_get_trash_chunk();
+	struct chunk *trash = get_trash_chunk();
 	unsigned char c;
 	int ptr = 0;
 
@@ -205,7 +180,7 @@ static int c_bin2str(struct sample *smp)
 
 static int c_int2str(struct sample *smp)
 {
-	struct chunk *trash = sample_get_trash_chunk();
+	struct chunk *trash = get_trash_chunk();
 	char *pos;
 
 	pos = ultoa_r(smp->data.uint, trash->str, trash->size);
@@ -222,7 +197,7 @@ static int c_int2str(struct sample *smp)
 
 static int c_datadup(struct sample *smp)
 {
-	struct chunk *trash = sample_get_trash_chunk();
+	struct chunk *trash = get_trash_chunk();
 
 	trash->len = smp->data.str.len < trash->size ? smp->data.str.len : trash->size;
 	memcpy(trash->str, smp->data.str.str, trash->len);
@@ -263,7 +238,7 @@ static int c_str2int(struct sample *smp)
 typedef int (*sample_cast_fct)(struct sample *smp);
 static sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
 /*            to:  BOOL       UINT       SINT       IPV4      IPV6        STR         BIN        CSTR        CBIN   */
-/* from: BOOL */ { c_none,    c_none,    c_none,    NULL,     NULL,       NULL,       NULL,      NULL,       NULL   },
+/* from: BOOL */ { c_none,    c_none,    c_none,    NULL,     NULL,       c_int2str,  NULL,      c_int2str,  NULL   },
 /*       UINT */ { c_none,    c_none,    c_none,    c_int2ip, NULL,       c_int2str,  NULL,      c_int2str,  NULL   },
 /*       SINT */ { c_none,    c_none,    c_none,    c_int2ip, NULL,       c_int2str,  NULL,      c_int2str,  NULL   },
 /*       IPV4 */ { NULL,      c_ip2int,  c_ip2int,  c_none,   c_ip2ipv6,  c_ip2str,   NULL,      c_ip2str,   NULL   },
@@ -537,6 +512,31 @@ struct sample *sample_process(struct proxy *px, struct session *l4, void *l7,
 			return NULL;
 	}
 	return p;
+}
+
+/*
+ * Process a fetch + format conversion as defined by the sample expression <expr>
+ * on request or response considering the <opt> parameter. The output is always of
+ * type string. Returns either NULL if no sample could be extracted, or a pointer
+ * to the converted result stored in static temp_smp in format string.
+ */
+struct sample *sample_fetch_string(struct proxy *px, struct session *l4, void *l7,
+                                   unsigned int opt, struct sample_expr *expr)
+{
+	struct sample *smp;
+
+	smp = sample_process(px, l4, l7, opt, expr, NULL);
+	if (!smp)
+		return NULL;
+
+	if (!sample_casts[smp->type][SMP_T_CSTR])
+		return NULL;
+
+	if (!sample_casts[smp->type][SMP_T_CSTR](smp))
+		return NULL;
+
+	smp->type = SMP_T_CSTR;
+	return smp;
 }
 
 /*****************************************************************/

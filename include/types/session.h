@@ -96,6 +96,12 @@
  * and freed in session_free() !
  */
 
+/* stick counter */
+struct stkctr {
+	struct stksess *entry;          /* entry containing counters currently being tracked  by this session */
+	struct stktable *table;         /* table the counters above belong to (undefined if counters are null) */
+};
+
 /*
  * Note: some session flags have dependencies :
  *  - SN_DIRECT cannot exist without SN_ASSIGNED, because a server is
@@ -135,10 +141,7 @@ struct session {
 	} store[8];				/* tracked stickiness values to store */
 	int store_count;
 
-	struct stksess *stkctr1_entry;          /* entry containing counters currently being tracked as set 1 by this session */
-	struct stktable *stkctr1_table;         /* table the counters above belong to (undefined if counters are null) */
-	struct stksess *stkctr2_entry;          /* entry containing counters currently being tracked as set 2 by this session */
-	struct stktable *stkctr2_table;         /* table the counters above belong to (undefined if counters are null) */
+	struct stkctr stkctr[2];                /* stick counters */
 
 	struct stream_interface si[2];          /* client and server stream interfaces */
 	struct {
@@ -166,7 +169,7 @@ struct session {
 
 /* parameters to configure tracked counters */
 struct track_ctr_prm {
-	int type;				/* type of the key */
+	struct sample_expr *expr;		/* expression used as the key */
 	union {
 		struct stktable *t;		/* a pointer to the table */
 		char *n;			/* or its name during parsing. */

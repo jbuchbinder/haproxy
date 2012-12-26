@@ -247,6 +247,7 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 	int fd;
 	struct server *srv;
 	struct proxy *be;
+	struct conn_src *src;
 
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
@@ -303,17 +304,24 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 	 * - server-specific at first
 	 * - proxy-specific next
 	 */
-	if (srv != NULL && srv->state & SRV_BIND_SRC) {
+	if (srv && srv->conn_src.opts & CO_SRC_BIND)
+		src = &srv->conn_src;
+	else if (be->conn_src.opts & CO_SRC_BIND)
+		src = &be->conn_src;
+	else
+		src = NULL;
+
+	if (src) {
 		int ret, flags = 0;
 
 		if (is_addr(&conn->addr.from)) {
-			switch (srv->state & SRV_TPROXY_MASK) {
-			case SRV_TPROXY_ADDR:
-			case SRV_TPROXY_CLI:
+			switch (src->opts & CO_SRC_TPROXY_MASK) {
+			case CO_SRC_TPROXY_ADDR:
+			case CO_SRC_TPROXY_CLI:
 				flags = 3;
 				break;
-			case SRV_TPROXY_CIP:
-			case SRV_TPROXY_DYN:
+			case CO_SRC_TPROXY_CIP:
+			case CO_SRC_TPROXY_DYN:
 				flags = 1;
 				break;
 			}
@@ -321,16 +329,16 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 
 #ifdef SO_BINDTODEVICE
 		/* Note: this might fail if not CAP_NET_RAW */
-		if (srv->iface_name)
-			setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, srv->iface_name, srv->iface_len + 1);
+		if (src->iface_name)
+			setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, src->iface_name, src->iface_len + 1);
 #endif
 
-		if (srv->sport_range) {
+		if (src->sport_range) {
 			int attempts = 10; /* should be more than enough to find a spare port */
-			struct sockaddr_storage src;
+			struct sockaddr_storage sa;
 
 			ret = 1;
-			src = srv->source_addr;
+			sa = src->source_addr;
 
 			do {
 				/* note: in case of retry, we may have to release a previously
@@ -343,76 +351,36 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 					break;
 				attempts--;
 
-				fdinfo[fd].local_port = port_range_alloc_port(srv->sport_range);
+				fdinfo[fd].local_port = port_range_alloc_port(src->sport_range);
 				if (!fdinfo[fd].local_port)
 					break;
 
-				fdinfo[fd].port_range = srv->sport_range;
-				set_host_port(&src, fdinfo[fd].local_port);
+				fdinfo[fd].port_range = src->sport_range;
+				set_host_port(&sa, fdinfo[fd].local_port);
 
-				ret = tcp_bind_socket(fd, flags, &src, &conn->addr.from);
+				ret = tcp_bind_socket(fd, flags, &sa, &conn->addr.from);
 			} while (ret != 0); /* binding NOK */
 		}
 		else {
-			ret = tcp_bind_socket(fd, flags, &srv->source_addr, &conn->addr.from);
+			ret = tcp_bind_socket(fd, flags, &src->source_addr, &conn->addr.from);
 		}
 
-		if (ret) {
+		if (unlikely(ret != 0)) {
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
 
 			if (ret == 1) {
-				Alert("Cannot bind to source address before connect() for server %s/%s. Aborting.\n",
-				      be->id, srv->id);
-				send_log(be, LOG_EMERG,
-					 "Cannot bind to source address before connect() for server %s/%s.\n",
-					 be->id, srv->id);
-			} else {
-				Alert("Cannot bind to tproxy source address before connect() for server %s/%s. Aborting.\n",
-				      be->id, srv->id);
-				send_log(be, LOG_EMERG,
-					 "Cannot bind to tproxy source address before connect() for server %s/%s.\n",
-					 be->id, srv->id);
-			}
-			return SN_ERR_RESOURCE;
-		}
-	}
-	else if (be->options & PR_O_BIND_SRC) {
-		int ret, flags = 0;
-
-		if (is_addr(&conn->addr.from)) {
-			switch (be->options & PR_O_TPXY_MASK) {
-			case PR_O_TPXY_ADDR:
-			case PR_O_TPXY_CLI:
-				flags = 3;
-				break;
-			case PR_O_TPXY_CIP:
-			case PR_O_TPXY_DYN:
-				flags = 1;
-				break;
-			}
-		}
-
-#ifdef SO_BINDTODEVICE
-		/* Note: this might fail if not CAP_NET_RAW */
-		if (be->iface_name)
-			setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, be->iface_name, be->iface_len + 1);
-#endif
-		ret = tcp_bind_socket(fd, flags, &be->source_addr, &conn->addr.from);
-		if (ret) {
-			close(fd);
-			if (ret == 1) {
-				Alert("Cannot bind to source address before connect() for proxy %s. Aborting.\n",
+				Alert("Cannot bind to source address before connect() for backend %s. Aborting.\n",
 				      be->id);
 				send_log(be, LOG_EMERG,
-					 "Cannot bind to source address before connect() for proxy %s.\n",
+					 "Cannot bind to source address before connect() for backend %s.\n",
 					 be->id);
 			} else {
-				Alert("Cannot bind to tproxy source address before connect() for proxy %s. Aborting.\n",
+				Alert("Cannot bind to tproxy source address before connect() for backend %s. Aborting.\n",
 				      be->id);
 				send_log(be, LOG_EMERG,
-					 "Cannot bind to tproxy source address before connect() for proxy %s.\n",
+					 "Cannot bind to tproxy source address before connect() for backend %s.\n",
 					 be->id);
 			}
 			return SN_ERR_RESOURCE;
@@ -437,20 +405,18 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 	if ((connect(fd, (struct sockaddr *)&conn->addr.to, get_addr_len(&conn->addr.to)) == -1) &&
 	    (errno != EINPROGRESS) && (errno != EALREADY) && (errno != EISCONN)) {
 
-		if (errno == EAGAIN || errno == EADDRINUSE) {
+		if (errno == EAGAIN || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
 			char *msg;
-			if (errno == EAGAIN) /* no free ports left, try again later */
+			if (errno == EAGAIN || errno == EADDRNOTAVAIL)
 				msg = "no free ports";
 			else
 				msg = "local address already in use";
 
-			qfprintf(stderr,"Cannot connect: %s.\n",msg);
+			qfprintf(stderr,"Connect() failed for backend %s: %s.\n", be->id, msg);
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
-			send_log(be, LOG_EMERG,
-				 "Connect() failed for server %s/%s: %s.\n",
-				 be->id, srv->id, msg);
+			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s.\n", be->id, msg);
 			return SN_ERR_RESOURCE;
 		} else if (errno == ETIMEDOUT) {
 			//qfprintf(stderr,"Connect(): ETIMEDOUT");
@@ -470,6 +436,7 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 
 	fdtab[fd].owner = conn;
 	conn->flags  = CO_FL_WAIT_L4_CONN; /* connection in progress */
+	conn->flags |= CO_FL_ADDR_TO_SET;
 
 	fdtab[fd].iocb = conn_fd_handler;
 	fd_insert(fd);
@@ -553,8 +520,8 @@ int tcp_connect_probe(struct connection *conn)
 	 */
 	if (connect(fd, (struct sockaddr *)&conn->addr.to, get_addr_len(&conn->addr.to)) < 0) {
 		if (errno == EALREADY || errno == EINPROGRESS) {
-			conn_sock_stop_recv(conn);
-			conn_sock_poll_send(conn);
+			__conn_sock_stop_recv(conn);
+			__conn_sock_poll_send(conn);
 			return 0;
 		}
 
@@ -577,7 +544,7 @@ int tcp_connect_probe(struct connection *conn)
 	 */
 
 	conn->flags |= CO_FL_ERROR;
-	conn_sock_stop_both(conn);
+	__conn_sock_stop_both(conn);
 	return 0;
 }
 
@@ -869,33 +836,23 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 					s->flags |= SN_FINST_R;
 				return 0;
 			}
-			else if (rule->action == TCP_ACT_TRK_SC1) {
-				if (!s->stkctr1_entry) {
-					/* only the first valid track-sc1 directive applies.
-					 * Also, note that right now we can only track SRC so we
-					 * don't check how to get the key, but later we may need
-					 * to consider rule->act_prm->trk_ctr.type.
-					 */
-					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
-					if (ts) {
-						session_track_stkctr1(s, t, ts);
+			else if ((rule->action == TCP_ACT_TRK_SC1 && !s->stkctr[0].entry) ||
+			         (rule->action == TCP_ACT_TRK_SC2 && !s->stkctr[1].entry)) {
+				/* Note: only the first valid tracking parameter of each
+				 * applies.
+				 */
+				struct stktable_key *key;
+
+				t = rule->act_prm.trk_ctr.table.t;
+				key = stktable_fetch_key(t, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->act_prm.trk_ctr.expr);
+
+				if (key && (ts = stktable_get_entry(t, key))) {
+					if (rule->action == TCP_ACT_TRK_SC1) {
+						session_track_stkctr(&s->stkctr[0], t, ts);
 						if (s->fe != s->be)
 							s->flags |= SN_BE_TRACK_SC1;
-					}
-				}
-			}
-			else if (rule->action == TCP_ACT_TRK_SC2) {
-				if (!s->stkctr2_entry) {
-					/* only the first valid track-sc2 directive applies.
-					 * Also, note that right now we can only track SRC so we
-					 * don't check how to get the key, but later we may need
-					 * to consider rule->act_prm->trk_ctr.type.
-					 */
-					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
-					if (ts) {
-						session_track_stkctr2(s, t, ts);
+					} else {
+						session_track_stkctr(&s->stkctr[1], t, ts);
 						if (s->fe != s->be)
 							s->flags |= SN_BE_TRACK_SC2;
 					}
@@ -1039,30 +996,21 @@ int tcp_exec_req_rules(struct session *s)
 				result = 0;
 				break;
 			}
-			else if (rule->action == TCP_ACT_TRK_SC1) {
-				if (!s->stkctr1_entry) {
-					/* only the first valid track-sc1 directive applies.
-					 * Also, note that right now we can only track SRC so we
-					 * don't check how to get the key, but later we may need
-					 * to consider rule->act_prm->trk_ctr.type.
-					 */
-					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
-					if (ts)
-						session_track_stkctr1(s, t, ts);
-				}
-			}
-			else if (rule->action == TCP_ACT_TRK_SC2) {
-				if (!s->stkctr2_entry) {
-					/* only the first valid track-sc2 directive applies.
-					 * Also, note that right now we can only track SRC so we
-					 * don't check how to get the key, but later we may need
-					 * to consider rule->act_prm->trk_ctr.type.
-					 */
-					t = rule->act_prm.trk_ctr.table.t;
-					ts = stktable_get_entry(t, addr_to_stktable_key(&s->si[0].conn->addr.from));
-					if (ts)
-						session_track_stkctr2(s, t, ts);
+			else if ((rule->action == TCP_ACT_TRK_SC1 && !s->stkctr[0].entry) ||
+			         (rule->action == TCP_ACT_TRK_SC2 && !s->stkctr[1].entry)) {
+				/* Note: only the first valid tracking parameter of each
+				 * applies.
+				 */
+				struct stktable_key *key;
+
+				t = rule->act_prm.trk_ctr.table.t;
+				key = stktable_fetch_key(t, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->act_prm.trk_ctr.expr);
+
+				if (key && (ts = stktable_get_entry(t, key))) {
+					if (rule->action == TCP_ACT_TRK_SC1)
+						session_track_stkctr(&s->stkctr[0], t, ts);
+					else
+						session_track_stkctr(&s->stkctr[1], t, ts);
 				}
 			}
 			else {
@@ -1138,37 +1086,51 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 		arg++;
 		rule->action = TCP_ACT_REJECT;
 	}
-	else if (strcmp(args[arg], "track-sc1") == 0) {
-		int ret;
+	else if (strcmp(args[arg], "track-sc1") == 0 || strcmp(args[arg], "track-sc2") == 0) {
+		struct sample_expr *expr;
 		int kw = arg;
 
 		arg++;
-		ret = parse_track_counters(args, &arg, section_type, curpx,
-					   &rule->act_prm.trk_ctr, defpx, err);
 
-		if (ret < 0) { /* nb: warnings are not handled yet */
+		expr = sample_parse_expr(args, &arg, trash.str, trash.size);
+		if (!expr) {
 			memprintf(err,
-			          "'%s %s %s' : %s in %s '%s'",
-			          args[0], args[1], args[kw], *err, proxy_type_str(curpx), curpx->id);
-			return ret;
+			          "'%s %s %s' : %s",
+			          args[0], args[1], args[kw], trash.str);
+			return -1;
 		}
-		rule->action = TCP_ACT_TRK_SC1;
-	}
-	else if (strcmp(args[arg], "track-sc2") == 0) {
-		int ret;
-		int kw = arg;
 
-		arg++;
-		ret = parse_track_counters(args, &arg, section_type, curpx,
-					   &rule->act_prm.trk_ctr, defpx, err);
-
-		if (ret < 0) { /* nb: warnings are not handled yet */
+		if (!(expr->fetch->cap & SMP_CAP_REQ)) {
 			memprintf(err,
-			          "'%s %s %s' : %s in %s '%s'",
-			          args[0], args[1], args[kw], *err, proxy_type_str(curpx), curpx->id);
-			return ret;
+			          "'%s %s %s' : fetch method '%s' cannot be used on request",
+			          args[0], args[1], args[kw], trash.str);
+			free(expr);
+			return -1;
 		}
-		rule->action = TCP_ACT_TRK_SC2;
+
+		/* check if we need to allocate an hdr_idx struct for HTTP parsing */
+		if (expr->fetch->cap & SMP_CAP_L7)
+			curpx->acl_requires |= ACL_USE_L7_ANY;
+
+		if (strcmp(args[arg], "table") == 0) {
+			arg++;
+			if (!args[arg]) {
+				memprintf(err,
+					  "'%s %s %s' : missing table name",
+					  args[0], args[1], args[kw]);
+				free(expr);
+				return -1;
+			}
+			/* we copy the table name for now, it will be resolved later */
+			rule->act_prm.trk_ctr.table.n = strdup(args[arg]);
+			arg++;
+		}
+		rule->act_prm.trk_ctr.expr = expr;
+
+		if (args[kw][8] == '1')
+			rule->action = TCP_ACT_TRK_SC1;
+		else
+			rule->action = TCP_ACT_TRK_SC2;
 	}
 	else {
 		memprintf(err,
@@ -1345,6 +1307,15 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 			          name, args[0], args[1]);
 			warn++;
 		}
+
+		if ((rule->action == TCP_ACT_TRK_SC1 || rule->action == TCP_ACT_TRK_SC2) &&
+		    !(rule->act_prm.trk_ctr.expr->fetch->cap & SMP_CAP_REQ)) {
+			memprintf(err,
+			          "fetch '%s' cannot be used on requests and will be ignored in '%s %s'",
+			          rule->act_prm.trk_ctr.expr->fetch->kw, args[0], args[1]);
+			warn++;
+		}
+
 		LIST_ADDQ(&curpx->tcp_req.inspect_rules, &rule->list);
 	}
 	else if (strcmp(args[1], "connection") == 0) {
@@ -1379,6 +1350,23 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 				          name, args[0], args[1]);
 			warn++;
 		}
+
+		if ((rule->action == TCP_ACT_TRK_SC1 || rule->action == TCP_ACT_TRK_SC2) &&
+		    !(rule->act_prm.trk_ctr.expr->fetch->cap & SMP_CAP_REQ)) {
+			memprintf(err,
+			          "fetch '%s' cannot be used on requests and will be ignored in '%s %s'",
+			          rule->act_prm.trk_ctr.expr->fetch->kw, args[0], args[1]);
+			warn++;
+		}
+
+		if ((rule->action == TCP_ACT_TRK_SC1 || rule->action == TCP_ACT_TRK_SC2) &&
+		    (rule->act_prm.trk_ctr.expr->fetch->cap & SMP_CAP_L7)) {
+			memprintf(err,
+			          "fetch '%s' involves some layer7-only criteria which will be ignored in '%s %s'",
+			          rule->act_prm.trk_ctr.expr->fetch->kw, args[0], args[1]);
+			warn++;
+		}
+
 		LIST_ADDQ(&curpx->tcp_req.l4_rules, &rule->list);
 	}
 	else {

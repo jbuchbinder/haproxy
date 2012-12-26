@@ -4,7 +4,7 @@
                          ----------------------
                              version 1.5
                              willy tarreau
-                              2012/11/26
+                              2012/12/24
 
 
 This document covers the configuration language as implemented in the version
@@ -2606,22 +2606,54 @@ http-check send-state
 
   See also : "option httpchk", "http-check disable-on-404"
 
-http-request { allow | deny | auth [realm <realm>] }
+http-request { allow | deny | auth [realm <realm>] |
+              add-header <name> <fmt> | set-header <name> <fmt> }
              [ { if | unless } <condition> ]
   Access control for Layer 7 requests
 
   May be used in sections:   defaults | frontend | listen | backend
                                 no    |    yes   |   yes  |   yes
 
-  These set of options allow to fine control access to a
-  frontend/listen/backend. Each option may be followed by if/unless and acl.
-  First option with matched condition (or option without condition) is final.
-  For "deny" a 403 error will be returned, for "allow" normal processing is
-  performed, for "auth" a 401/407 error code is returned so the client
-  should be asked to enter a username and password.
+  The http-request statement defines a set of rules which apply to layer 7
+  processing. The rules are evaluated in their declaration order when they are
+  met in a frontend, listen or backend section. Any rule may optionally be
+  followed by an ACL-based condition, in which case it will only be evaluated
+  if the condition is true.
 
-  There is no fixed limit to the number of http-request statements per
-  instance.
+  The first keyword is the rule's action. Currently supported actions include :
+    - "allow" : this stops the evaluation of the rules and lets the request
+      pass the check. No further "http-request" rules are evaluated.
+
+    - "deny" : this stops the evaluation of the rules and immediately rejects
+      the request and emits an HTTP 403 error. No further "http-request" rules
+      are evaluated.
+
+    - "auth" : this stops the evaluation of the rules and immediately responds
+      with an HTTP 401 or 407 error code to invite the user to present a valid
+      user name and password. No further "http-request" rules are evaluated. An
+      optional "realm" parameter is supported, it sets the authentication realm
+      that is returned with the response (typically the application's name).
+
+    - "add-header" appends an HTTP header field whose name is specified in
+      <name> and whose value is defined by <fmt> which follows the log-format
+      rules (see Custom Log Format in section 8.2.4). This is particularly
+      useful to pass connection-specific information to the server (eg: the
+      client's SSL certificate), or to combine several headers into one. This
+      rule is not final, so it is possible to add other similar rules. Note
+      that header addition is performed immediately, so one rule might reuse
+      the resulting header from a previous rule.
+
+    - "set-header" does the same as "add-header" except that the header name
+      is first removed if it existed. This is useful when passing security
+      information to the server, where the header must not be manipulated by
+      external users.
+
+  There is no limit to the number of http-request statements per instance.
+
+  It is important to know that http-request rules are processed very early in
+  the HTTP processing, just after "block" rules and before "reqdel" or "reqrep"
+  rules. That way, headers added by "add-header"/"set-header" are visible by
+  almost all further ACL rules.
 
   Example:
         acl nagios src 192.168.129.3
@@ -2635,8 +2667,18 @@ http-request { allow | deny | auth [realm <realm>] }
 
   Example:
         acl auth_ok http_auth_group(L1) G1
-
         http-request auth unless auth_ok
+
+  Example:
+        http-request set-header X-Haproxy-Current-Date %T
+        http-request set-header X-SSL                  %[ssl_fc]
+        http-request set-header X-SSL-Session_ID       %[ssl_fc_session_id]
+        http-request set-header X-SSL-Client-Verify    %[ssl_c_verify]
+        http-request set-header X-SSL-Client-DN        %{+Q}[ssl_c_s_dn]
+        http-request set-header X-SSL-Client-CN        %{+Q}[ssl_c_s_dn(cn)]
+        http-request set-header X-SSL-Issuer           %{+Q}[ssl_c_i_dn]
+        http-request set-header X-SSL-Client-NotBefore %{+Q}[ssl_c_notbefore]
+        http-request set-header X-SSL-Client-NotAfter  %{+Q}[ssl_c_notafter]
 
   See also : "stats http-request", section 3.4 about userlists and section 7
              about ACL usage.
@@ -6149,9 +6191,12 @@ tcp-request connection <action> [{if | unless} <condition>]
         the per-frontend counters and the second set for the per-backend ones.
 
         These actions take one or two arguments :
-          <key>   is mandatory, and defines the criterion the tracking key will
-                  be derived from. At the moment, only "src" is supported. With
-                  it, the key will be the connection's source IPv4 address.
+          <key>   is mandatory, and is a pattern extraction rule as described
+                  in section 7.8. It describes what elements of the incoming
+                  request or connection will be analysed, extracted, combined,
+                  and used to select which table entry to update the counters.
+                  Note that "tcp-request connection" cannot use content-based
+                  fetches.
 
          <table>  is an optional table to be used instead of the default one,
                   which is the stick-table declared in the current proxy. All
@@ -6163,6 +6208,11 @@ tcp-request connection <action> [{if | unless} <condition>]
         that entry is kept during all the session's life, and this entry's
         counters are updated as often as possible, every time the session's
         counters are updated, and also systematically when the session ends.
+        Counters are only updated for events that happen after the tracking has
+        been started. For example, connection counters will not be updated when
+        tracking layer 7 information, since the connection event happens before
+        layer7 information is extracted.
+
         If the entry tracks concurrent connection counters, one connection is
         counted for as long as the entry is tracked, and the entry will not
         expire during that time. Tracking counters also provides a performance
@@ -6237,9 +6287,12 @@ tcp-request content <action> [{if | unless} <condition>]
   Also, it is worth noting that if sticky counters are tracked from a rule
   defined in a backend, this tracking will automatically end when the session
   releases the backend. That allows per-backend counter tracking even in case
-  of HTTP keep-alive requests when the backend changes. While there is nothing
-  mandatory about it, it is recommended to use the track-sc1 pointer to track
-  per-frontend counters and track-sc2 to track per-backend counters.
+  of HTTP keep-alive requests when the backend changes. This makes a subtle
+  difference because tracking rules in "frontend" and "listen" section last for
+  all the session, as opposed to the backend rules. The difference appears when
+  some layer 7 information is tracked. While there is nothing mandatory about
+  it, it is recommended to use the track-sc1 pointer to track per-frontend
+  counters and track-sc2 to track per-backend counters.
 
   Note that the "if/unless" condition is optional. If no condition is set on
   the action, it is simply performed unconditionally. That can be useful for
@@ -6251,6 +6304,11 @@ tcp-request content <action> [{if | unless} <condition>]
   contents do not parse as a valid HTTP message, then the ACL does not match.
   The parser which is involved there is exactly the same as for all other HTTP
   processing, so there is no risk of parsing something differently.
+
+  Tracking layer7 information is also possible provided that the information
+  are present when the rule is processed. The current solution for making the
+  rule engine wait for such information is to set an inspect delay and to
+  condition its execution with an ACL relying on such information.
 
   Example:
         # Accept HTTP requests containing a Host header saying "example.com"
@@ -6271,6 +6329,16 @@ tcp-request content <action> [{if | unless} <condition>]
         acl content_present req_len gt 0
         tcp-request content accept if content_present
         tcp-request content reject
+
+  Example:
+        # Track the last IP from X-Forwarded-For
+        tcp-request inspect-delay 10s
+        tcp-request content track-sc1 hdr(x-forwarded-for,-1) if HTTP
+
+  Example:
+        # track request counts per "base" (concatenation of Host+URL)
+        tcp-request inspect-delay 10s
+        tcp-request content track-sc1 base table req-rate if HTTP
 
   Example: track per-frontend and per-backend counters, block abusers at the
            frontend when the backend detects abuse.
@@ -8021,6 +8089,20 @@ be_sess_rate(<backend>) <integer>
             acl being_scanned be_sess_rate gt 100
             redirect location /denied.html if being_scanned
 
+srv_sess_rate(<backend>/<server>) <integer>
+  Returns true when the sessions creation rate on the server matches the
+  specified values or ranges, in number of new sessions per second. This is
+  used to switch to an alternate backend when an expensive or fragile one
+  reaches too high a session rate, or to limit abuse of service (eg. prevent
+  latent requests from overloading servers).
+
+  Example :
+        # Redirect to a separate back
+        acl srv1_full srv_sess_rate(be1/srv1) gt 50
+        acl srv2_full srv_sess_rate(be1/srv2) gt 50
+        use_backend be2 if srv1_full or srv2_full
+
+
 connslots <integer>
 connslots(<backend>) <integer>
   The basic idea here is to be able to measure the number of connection "slots"
@@ -8235,6 +8317,15 @@ sc2_sess_rate
   rules. A backend may count more sessions than connections because each
   connection could result in many backend sessions if some HTTP keep-alive is
   performed over the connection with the client. See also src_sess_rate.
+
+sc1_trackers
+sc2_trackers
+  Returns the current amount of concurrent connections tracking the same
+  tracked counters. This number is automatically incremented when tracking
+  begins and decremented when tracking stops. It differs from sc1_conn_cur in
+  that it does not rely on any stored information but on the table's reference
+  count (the "use" value which is returned by "show table" on the CLI). This
+  may sometimes be more suited for layer7 tracking.
 
 so_id <integer>
   Applies to the socket's id. Useful in frontends with many bind keywords.
@@ -8592,6 +8683,10 @@ ssl_c_sig_alg <string>
   layer, and the name of the algorithm used to sign the certificate presented
   by the client matches the string.
 
+ssl_c_used
+  Returns true if current SSL session uses a client certificate even if current
+  connection uses SSL session resumption. See also "ssl_fc_has_crt".
+
 ssl_c_verify <integer>
   Returns true when the incoming connection was made over an SSL/TLS transport
   layer, and the verify result matches the specified value (check man verify
@@ -8670,6 +8765,10 @@ ssl_fc_cipher <string>
 ssl_fc_has_crt
   Returns true if a client certificate is present in an incoming connection over
   SSL/TLS transport layer. Useful if 'verify' statement is set to 'optional'.
+  Note: on SSL session resumption with Session ID or TLS ticket, client
+  certificate is not present in the current connection but may be retrieved
+  from the cache or the ticket. So prefer "ssl_c_used" if you want to check if
+  current SSL session uses a client certificate.
 
 ssl_fc_has_sni
   This is used to check for presence of a Server Name Indication TLS extension
@@ -9267,6 +9366,17 @@ The list of currently supported pattern fetch functions is the following :
                table also allows one to collect statistics about most commonly
                requested objects by host/path.
 
+  base32       This returns a 32-bit hash of the value returned by the "base"
+               fetch method above. This is useful to track per-URL activity on
+               high traffic sites without having to store all URLs. Instead a
+               shorter hash is stored, saving a lot of memory. The output type
+               is an unsigned integer.
+
+  base32+src   This returns the concatenation of the base32 fetch above and the
+               src fetch below. The resulting type is of type binary, with a
+               size of 8 or 20 bytes depending on the source address family.
+               This can be used to track per-IP, per-URL counters.
+
   src          This is the source IPv4 address of the client of the session.
                It is of type IPv4 and works on both IPv4 and IPv6 tables.
                On IPv6 tables, IPv4 address is mapped to its IPv6 equivalent,
@@ -9379,6 +9489,10 @@ The list of currently supported pattern fetch functions is the following :
                presented by the client when the incoming connection was made
                over an SSL/TLS transport layer.
 
+  ssl_c_used
+               Returns 1 if current SSL session use a client certificate,
+               otherwise 0. See also "ssl_fc_has_crt".
+
   ssl_c_verify Returns the verify result errorID when the incoming connection
                was made over an SSL/TLS transport layer, otherwise zero if no
                error is encountered.
@@ -9456,6 +9570,11 @@ The list of currently supported pattern fetch functions is the following :
   ssl_fc_has_crt
                Returns 1 if a client certificate is present in the front
                connection over SSL/TLS transport layer, otherwise 0.
+               Note: on SSL session resumption with Session ID or TLS ticket,
+               client certificate is not present in the current connection but
+               may be retrieved from the cache or the ticket. So prefer
+               "ssl_c_used" if you want to check if current SSL session uses
+               a client certificate.
 
   ssl_fc_has_sni
                This checks the transport layer used by the front connection, and
@@ -10146,7 +10265,7 @@ Detailed fields description :
 8.2.4. Custom log format
 ------------------------
 
-The directive log-format allows you to custom the logs in http mode and tcp
+The directive log-format allows you to customize the logs in http mode and tcp
 mode. It takes a string as argument.
 
 HAproxy understands some log format variables. % precedes log format variables.
@@ -10157,6 +10276,11 @@ prefixing them with a '+' or '-' sign.
 Special variable "%o" may be used to propagate its flags to all other
 variables on the same format string. This is particularly handy with quoted
 string formats ("Q").
+
+If a variable is named between square brackets ('[' .. ']') then it is used
+as a pattern extraction rule (see section 7.8). This it useful to add some
+less common information such as the client's SSL certificate's DN, or to log
+the key that would be used to store an entry into a stick table.
 
 Note: spaces must be escaped. A space character is considered as a separator.
 HAproxy will automatically merge consecutive separators.
@@ -10172,18 +10296,18 @@ Flags are :
 
 At the moment, the default HTTP format is defined this way :
 
-    log-format %Ci:%Cp\ [%t]\ %ft\ %b/%s\ %Tq/%Tw/%Tc/%Tr/%Tt\ %st\ %B\ %cc\ \
-               %cs\ %tsc\ %ac/%fc/%bc/%sc/%rc\ %sq/%bq\ %hr\ %hs\ %{+Q}r
+    log-format %ci:%cp\ [%t]\ %ft\ %b/%s\ %Tq/%Tw/%Tc/%Tr/%Tt\ %ST\ %B\ %CC\ \
+               %CS\ %tsc\ %ac/%fc/%bc/%sc/%rc\ %sq/%bq\ %hr\ %hs\ %{+Q}r
 
 the default CLF format is defined this way :
 
-    log-format %{+Q}o\ %{-Q}Ci\ -\ -\ [%T]\ %r\ %st\ %B\ \"\"\ \"\"\ %Cp\ \
+    log-format %{+Q}o\ %{-Q}ci\ -\ -\ [%T]\ %r\ %ST\ %B\ \"\"\ \"\"\ %cp\ \
                %ms\ %ft\ %b\ %s\ \%Tq\ %Tw\ %Tc\ %Tr\ %Tt\ %tsc\ %ac\ %fc\ \
-               %bc\ %sc\ %rc\ %sq\ %bq\ %cc\ %cs\ \%hrl\ %hsl
+               %bc\ %sc\ %rc\ %sq\ %bq\ %CC\ %CS\ \%hrl\ %hsl
 
 and the default TCP format is defined this way :
 
-    log-format %Ci:%Cp\ [%t]\ %ft\ %b/%s\ %Tw/%Tc/%Tt\ %B\ %ts\ \
+    log-format %ci:%cp\ [%t]\ %ft\ %b/%s\ %Tw/%Tc/%Tt\ %B\ %ts\ \
                %ac/%fc/%bc/%sc/%rc\ %sq/%bq
 
 Please refer to the table below for currently defined variables :
@@ -10193,17 +10317,12 @@ Please refer to the table below for currently defined variables :
   +---+------+-----------------------------------------------+-------------+
   |   | %o   | special variable, apply flags on all next var |             |
   +---+------+-----------------------------------------------+-------------+
-  |   | %B   | bytes_read                                    | numeric     |
-  |   | %Ci  | client_ip                                     | IP          |
-  |   | %Cp  | client_port                                   | numeric     |
-  |   | %Bi  | backend_source_ip                             | IP          |
-  |   | %Bp  | backend_source_port                           | numeric     |
-  |   | %Fi  | frontend_ip                                   | IP          |
-  |   | %Fp  | frontend_port                                 | numeric     |
+  |   | %B   | bytes_read           (from server to client)  | numeric     |
+  | H | %CC  | captured_request_cookie                       | string      |
+  | H | %CS  | captured_response_cookie                      | string      |
   |   | %H   | hostname                                      | string      |
   |   | %ID  | unique-id                                     | string      |
-  |   | %Si  | server_IP                                     | IP          |
-  |   | %Sp  | server_port                                   | numeric     |
+  | H | %ST  | status_code                                   | numeric     |
   |   | %T   | gmt_date_time                                 | date        |
   |   | %Tc  | Tc                                            | numeric     |
   |   | %Tl  | local_date_time                               | date        |
@@ -10212,16 +10331,20 @@ Please refer to the table below for currently defined variables :
   |   | %Ts  | timestamp                                     | numeric     |
   |   | %Tt  | Tt                                            | numeric     |
   |   | %Tw  | Tw                                            | numeric     |
+  |   | %U   | bytes_uploaded       (from client to server)  | numeric     |
   |   | %ac  | actconn                                       | numeric     |
   |   | %b   | backend_name                                  | string      |
-  |   | %bc  | beconn                                        | numeric     |
+  |   | %bc  | beconn      (backend concurrent connections)  | numeric     |
+  |   | %bi  | backend_source_ip       (connecting address)  | IP          |
+  |   | %bp  | backend_source_port     (connecting address)  | numeric     |
   |   | %bq  | backend_queue                                 | numeric     |
-  | H | %cc  | captured_request_cookie                       | string      |
-  | H | %rt  | http_request_counter                          | numeric     |
-  | H | %cs  | captured_response_cookie                      | string      |
+  |   | %ci  | client_ip                 (accepted address)  | IP          |
+  |   | %cp  | client_port               (accepted address)  | numeric     |
   |   | %f   | frontend_name                                 | string      |
+  |   | %fc  | feconn     (frontend concurrent connections)  | numeric     |
+  |   | %fi  | frontend_ip              (accepting address)  | IP          |
+  |   | %fp  | frontend_port            (accepting address)  | numeric     |
   |   | %ft  | frontend_name_transport ('~' suffix for SSL)  | string      |
-  |   | %fc  | feconn                                        | numeric     |
   | H | %hr  | captured_request_headers default style        | string      |
   | H | %hrl | captured_request_headers CLF style            | string list |
   | H | %hs  | captured_response_headers default style       | string      |
@@ -10230,13 +10353,15 @@ Please refer to the table below for currently defined variables :
   |   | %pid | PID                                           | numeric     |
   | H | %r   | http_request                                  | string      |
   |   | %rc  | retries                                       | numeric     |
+  | H | %rt  | http_request_counter                          | numeric     |
   |   | %s   | server_name                                   | string      |
-  |   | %sc  | srv_conn                                      | numeric     |
+  |   | %sc  | srv_conn     (server concurrent connections)  | numeric     |
+  |   | %si  | server_IP                   (target address)  | IP          |
+  |   | %sp  | server_port                 (target address)  | numeric     |
   |   | %sq  | srv_queue                                     | numeric     |
   | S | %sslc| ssl_ciphers (ex: AES-SHA)                     | string      |
   | S | %sslv| ssl_version (ex: TLSv1)                       | string      |
-  | H | %st  | status_code                                   | numeric     |
-  |   | %t   | date_time                                     | date        |
+  |   | %t   | date_time      (with millisecond resolution)  | date        |
   |   | %ts  | termination_state                             | string      |
   | H | %tsc | termination_state with cookie status          | string      |
   +---+------+-----------------------------------------------+-------------+

@@ -884,74 +884,46 @@ static void assign_tproxy_address(struct session *s)
 {
 #if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
 	struct server *srv = objt_server(s->target);
+	struct conn_src *src;
 
-	if (srv && srv->state & SRV_BIND_SRC) {
-		switch (srv->state & SRV_TPROXY_MASK) {
-		case SRV_TPROXY_ADDR:
-			s->req->cons->conn->addr.from = srv->tproxy_addr;
-			break;
-		case SRV_TPROXY_CLI:
-		case SRV_TPROXY_CIP:
-			/* FIXME: what can we do if the client connects in IPv6 or unix socket ? */
-			s->req->cons->conn->addr.from = s->req->prod->conn->addr.from;
-			break;
-		case SRV_TPROXY_DYN:
-			if (srv->bind_hdr_occ) {
-				char *vptr;
-				int vlen;
-				int rewind;
+	if (srv && srv->conn_src.opts & CO_SRC_BIND)
+		src = &srv->conn_src;
+	else if (s->be->conn_src.opts & CO_SRC_BIND)
+		src = &s->be->conn_src;
+	else
+		return;
 
-				/* bind to the IP in a header */
-				((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_family = AF_INET;
-				((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_port = 0;
-				((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_addr.s_addr = 0;
+	switch (src->opts & CO_SRC_TPROXY_MASK) {
+	case CO_SRC_TPROXY_ADDR:
+		s->req->cons->conn->addr.from = src->tproxy_addr;
+		break;
+	case CO_SRC_TPROXY_CLI:
+	case CO_SRC_TPROXY_CIP:
+		/* FIXME: what can we do if the client connects in IPv6 or unix socket ? */
+		s->req->cons->conn->addr.from = s->req->prod->conn->addr.from;
+		break;
+	case CO_SRC_TPROXY_DYN:
+		if (src->bind_hdr_occ) {
+			char *vptr;
+			int vlen;
+			int rewind;
 
-				b_rew(s->req->buf, rewind = s->req->buf->o);
-				if (http_get_hdr(&s->txn.req, srv->bind_hdr_name, srv->bind_hdr_len,
-						 &s->txn.hdr_idx, srv->bind_hdr_occ, NULL, &vptr, &vlen)) {
-					((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_addr.s_addr =
-						htonl(inetaddr_host_lim(vptr, vptr + vlen));
-				}
-				b_adv(s->req->buf, rewind);
+			/* bind to the IP in a header */
+			((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_family = AF_INET;
+			((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_port = 0;
+			((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_addr.s_addr = 0;
+
+			b_rew(s->req->buf, rewind = s->req->buf->o);
+			if (http_get_hdr(&s->txn.req, src->bind_hdr_name, src->bind_hdr_len,
+					 &s->txn.hdr_idx, src->bind_hdr_occ, NULL, &vptr, &vlen)) {
+				((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_addr.s_addr =
+					htonl(inetaddr_host_lim(vptr, vptr + vlen));
 			}
-			break;
-		default:
-			memset(&s->req->cons->conn->addr.from, 0, sizeof(s->req->cons->conn->addr.from));
+			b_adv(s->req->buf, rewind);
 		}
-	}
-	else if (s->be->options & PR_O_BIND_SRC) {
-		switch (s->be->options & PR_O_TPXY_MASK) {
-		case PR_O_TPXY_ADDR:
-			s->req->cons->conn->addr.from = s->be->tproxy_addr;
-			break;
-		case PR_O_TPXY_CLI:
-		case PR_O_TPXY_CIP:
-			/* FIXME: what can we do if the client connects in IPv6 or socket unix? */
-			s->req->cons->conn->addr.from = s->req->prod->conn->addr.from;
-			break;
-		case PR_O_TPXY_DYN:
-			if (s->be->bind_hdr_occ) {
-				char *vptr;
-				int vlen;
-				int rewind;
-
-				/* bind to the IP in a header */
-				((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_family = AF_INET;
-				((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_port = 0;
-				((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_addr.s_addr = 0;
-
-				b_rew(s->req->buf, rewind = s->req->buf->o);
-				if (http_get_hdr(&s->txn.req, s->be->bind_hdr_name, s->be->bind_hdr_len,
-						 &s->txn.hdr_idx, s->be->bind_hdr_occ, NULL, &vptr, &vlen)) {
-					((struct sockaddr_in *)&s->req->cons->conn->addr.from)->sin_addr.s_addr =
-						htonl(inetaddr_host_lim(vptr, vptr + vlen));
-				}
-				b_adv(s->req->buf, rewind);
-			}
-			break;
-		default:
-			memset(&s->req->cons->conn->addr.from, 0, sizeof(s->req->cons->conn->addr.from));
-		}
+		break;
+	default:
+		memset(&s->req->cons->conn->addr.from, 0, sizeof(s->req->cons->conn->addr.from));
 	}
 #endif
 }
@@ -1587,6 +1559,20 @@ acl_fetch_srv_conn(struct proxy *px, struct session *l4, void *l7, unsigned int 
 	return 1;
 }
 
+/* set temp integer to the number of enabled servers on the proxy.
+ * Accepts exactly 1 argument. Argument is a server, other types will lead to
+ * undefined behaviour.
+ */
+static int
+acl_fetch_srv_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                        const struct arg *args, struct sample *smp)
+{
+	smp->flags = SMP_F_VOL_TEST;
+	smp->type = SMP_T_UINT;
+	smp->data.uint = read_freq_ctr(&args->data.srv->sess_per_sec);
+	return 1;
+}
+
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
@@ -1601,6 +1587,7 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "srv_conn",     acl_parse_int,     acl_fetch_srv_conn,       acl_match_int,     ACL_USE_NOTHING, ARG1(1,SRV) },
 	{ "srv_id",       acl_parse_int,     acl_fetch_srv_id,         acl_match_int,     ACL_USE_RTR_INTERNAL, 0 },
 	{ "srv_is_up",    acl_parse_nothing, acl_fetch_srv_is_up,      acl_match_nothing, ACL_USE_NOTHING, ARG1(1,SRV) },
+	{ "srv_sess_rate", acl_parse_int,    acl_fetch_srv_sess_rate,  acl_match_int,     ACL_USE_NOTHING, ARG1(1,SRV) },
 	{ NULL, NULL, NULL, NULL },
 }};
 

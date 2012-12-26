@@ -2927,13 +2927,150 @@ int http_process_req_stat_post(struct stream_interface *si, struct http_txn *txn
 	return 1;
 }
 
-/* returns a pointer to the first rule which forbids access (deny or http_auth),
- * or NULL if everything's OK.
+/* This function checks whether we need to enable a POST analyser to parse a
+ * stats request, and also registers the stats I/O handler. It returns zero
+ * if it needs to come back again, otherwise non-zero if it finishes.
  */
-static inline struct http_req_rule *
+int http_handle_stats(struct session *s, struct channel *req)
+{
+	struct stats_admin_rule *stats_admin_rule;
+	struct stream_interface *si = s->rep->prod;
+	struct http_txn *txn = &s->txn;
+	struct http_msg *msg = &txn->req;
+	struct uri_auth *uri = s->be->uri_auth;
+
+	/* now check whether we have some admin rules for this request */
+	list_for_each_entry(stats_admin_rule, &s->be->uri_auth->admin_rules, list) {
+		int ret = 1;
+
+		if (stats_admin_rule->cond) {
+			ret = acl_exec_cond(stats_admin_rule->cond, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
+			ret = acl_pass(ret);
+			if (stats_admin_rule->cond->pol == ACL_COND_UNLESS)
+				ret = !ret;
+		}
+
+		if (ret) {
+			/* no rule, or the rule matches */
+			s->rep->prod->applet.ctx.stats.flags |= STAT_ADMIN;
+			break;
+		}
+	}
+
+	/* Was the status page requested with a POST ? */
+	if (unlikely(txn->meth == HTTP_METH_POST)) {
+		if (si->applet.ctx.stats.flags & STAT_ADMIN) {
+			if (msg->msg_state < HTTP_MSG_100_SENT) {
+				/* If we have HTTP/1.1 and Expect: 100-continue, then we must
+				 * send an HTTP/1.1 100 Continue intermediate response.
+				 */
+				if (msg->flags & HTTP_MSGF_VER_11) {
+					struct hdr_ctx ctx;
+					ctx.idx = 0;
+					/* Expect is allowed in 1.1, look for it */
+					if (http_find_header2("Expect", 6, req->buf->p, &txn->hdr_idx, &ctx) &&
+					    unlikely(ctx.vlen == 12 && strncasecmp(ctx.line+ctx.val, "100-continue", 12) == 0)) {
+						bo_inject(s->rep, http_100_chunk.str, http_100_chunk.len);
+					}
+				}
+				msg->msg_state = HTTP_MSG_100_SENT;
+				s->logs.tv_request = now;  /* update the request timer to reflect full request */
+			}
+			if (!http_process_req_stat_post(si, txn, req))
+				return 0;   /* we need more data */
+		}
+		else
+			si->applet.ctx.stats.st_code = STAT_STATUS_DENY;
+
+		/* We don't want to land on the posted stats page because a refresh will
+		 * repost the data. We don't want this to happen on accident so we redirect
+		 * the browse to the stats page with a GET.
+		 */
+		chunk_printf(&trash,
+		             "HTTP/1.0 303 See Other\r\n"
+		             "Cache-Control: no-cache\r\n"
+		             "Content-Type: text/plain\r\n"
+		             "Connection: close\r\n"
+		             "Location: %s;st=%s\r\n"
+		             "\r\n",
+		             uri->uri_prefix,
+		             ((si->applet.ctx.stats.st_code > STAT_STATUS_INIT) &&
+		              (si->applet.ctx.stats.st_code < STAT_STATUS_SIZE) &&
+		              stat_status_codes[si->applet.ctx.stats.st_code]) ?
+		             stat_status_codes[si->applet.ctx.stats.st_code] :
+		             stat_status_codes[STAT_STATUS_UNKN]);
+
+		s->txn.status = 303;
+		s->logs.tv_request = now;
+		stream_int_retnclose(req->prod, &trash);
+		s->target = &http_stats_applet.obj_type; /* just for logging the applet name */
+
+		if (s->fe == s->be) /* report it if the request was intercepted by the frontend */
+			s->fe->fe_counters.intercepted_req++;
+
+		if (!(s->flags & SN_ERR_MASK))      // this is not really an error but it is
+			s->flags |= SN_ERR_PRXCOND; // to mark that it comes from the proxy
+		if (!(s->flags & SN_FINST_MASK))
+			s->flags |= SN_FINST_R;
+		return 1;
+	}
+
+	/* OK, let's go on now */
+
+	chunk_printf(&trash,
+	             "HTTP/1.0 200 OK\r\n"
+	             "Cache-Control: no-cache\r\n"
+	             "Connection: close\r\n"
+	             "Content-Type: %s\r\n",
+	             (si->applet.ctx.stats.flags & STAT_FMT_HTML) ? "text/html" : "text/plain");
+
+	if (uri->refresh > 0 && !(si->applet.ctx.stats.flags & STAT_NO_REFRESH))
+		chunk_appendf(&trash, "Refresh: %d\r\n",
+		              uri->refresh);
+
+	chunk_appendf(&trash, "\r\n");
+
+	s->txn.status = 200;
+	s->logs.tv_request = now;
+
+	if (s->fe == s->be) /* report it if the request was intercepted by the frontend */
+		s->fe->fe_counters.intercepted_req++;
+
+	if (!(s->flags & SN_ERR_MASK))      // this is not really an error but it is
+		s->flags |= SN_ERR_PRXCOND; // to mark that it comes from the proxy
+	if (!(s->flags & SN_FINST_MASK))
+		s->flags |= SN_FINST_R;
+
+	if (s->txn.meth == HTTP_METH_HEAD) {
+		/* that's all we return in case of HEAD request, so let's immediately close. */
+		stream_int_retnclose(req->prod, &trash);
+		s->target = &http_stats_applet.obj_type; /* just for logging the applet name */
+		return 1;
+	}
+
+	/* OK, push the response and hand over to the stats I/O handler */
+	bi_putchk(s->rep, &trash);
+
+	s->task->nice = -32; /* small boost for HTTP statistics */
+	stream_int_register_handler(s->rep->prod, &http_stats_applet);
+	s->target = s->rep->prod->conn->target; // for logging only
+	s->rep->prod->conn->xprt_ctx = s;
+	s->rep->prod->applet.st0 = s->rep->prod->applet.st1 = 0;
+	req->analysers = 0;
+
+	return 1;
+}
+
+/* Executes the http-request rules <rules> for session <s>, proxy <px> and
+ * transaction <txn>. Returns NULL if it executed all rules, or a pointer to
+ * the last rule if it had to stop before the end (auth, deny, allow). It may
+ * set the TX_CLDENY on txn->flags if it encounters a deny rule.
+ */
+static struct http_req_rule *
 http_check_access_rule(struct proxy *px, struct list *rules, struct session *s, struct http_txn *txn)
 {
 	struct http_req_rule *rule;
+	struct hdr_ctx ctx;
 
 	list_for_each_entry(rule, rules, list) {
 		int ret = 1;
@@ -2951,10 +3088,33 @@ http_check_access_rule(struct proxy *px, struct list *rules, struct session *s, 
 		}
 
 		if (ret) {
-			if (rule->action == HTTP_REQ_ACT_ALLOW)
-				return NULL; /* no problem */
-			else
-				return rule; /* most likely a deny or auth rule */
+			switch (rule->action) {
+			case HTTP_REQ_ACT_ALLOW:
+				return rule;
+			case HTTP_REQ_ACT_DENY:
+				txn->flags |= TX_CLDENY;
+				return rule;
+			case HTTP_REQ_ACT_AUTH:
+				return rule;
+			case HTTP_REQ_ACT_SET_HDR:
+				ctx.idx = 0;
+				/* remove all occurrences of the header */
+				while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
+				                         txn->req.chn->buf->p, &txn->hdr_idx, &ctx)) {
+					http_remove_header2(&txn->req, &txn->hdr_idx, &ctx);
+				}
+				/* now fall through to header addition */
+
+			case HTTP_REQ_ACT_ADD_HDR:
+				chunk_printf(&trash, "%s: ", rule->arg.hdr_add.name);
+				memcpy(trash.str, rule->arg.hdr_add.name, rule->arg.hdr_add.name_len);
+				trash.len = rule->arg.hdr_add.name_len;
+				trash.str[trash.len++] = ':';
+				trash.str[trash.len++] = ' ';
+				trash.len += build_logline(s, trash.str + trash.len, trash.size - trash.len, &rule->arg.hdr_add.fmt);
+				http_header_add_tail2(&txn->req, &txn->hdr_idx, trash.str, trash.len);
+				break;
+			}
 		}
 	}
 	return NULL;
@@ -3013,6 +3173,9 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 		}
 	}
 
+	/* just in case we have some per-backend tracking */
+	session_inc_be_http_req_ctr(s);
+
 	/* evaluate http-request rules */
 	http_req_last_rule = http_check_access_rule(px, &px->http_req_rules, s, txn);
 
@@ -3026,7 +3189,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 		do_stats = 0;
 
 	/* return a 403 if either rule has blocked */
-	if (http_req_last_rule && http_req_last_rule->action == HTTP_REQ_ACT_DENY) {
+	if (txn->flags & TX_CLDENY) {
 			txn->status = 403;
 			s->logs.tv_request = now;
 			stream_int_retnclose(req->prod, http_error_message(s, HTTP_ERR_403));
@@ -3130,8 +3293,8 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 	/* we can be blocked here because the request needs to be authenticated,
 	 * either to pass or to access stats.
 	 */
-	if (http_req_last_rule && http_req_last_rule->action == HTTP_REQ_ACT_HTTP_AUTH) {
-		char *realm = http_req_last_rule->http_auth.realm;
+	if (http_req_last_rule && http_req_last_rule->action == HTTP_REQ_ACT_AUTH) {
+		char *realm = http_req_last_rule->arg.auth.realm;
 
 		if (!realm)
 			realm = do_stats?STATS_DEFAULT_REALM:px->id;
@@ -3162,74 +3325,14 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 			goto return_bad_req;
 	}
 
-	if (do_stats) {
-		struct stats_admin_rule *stats_admin_rule;
-
-		/* We need to provide stats for this request.
-		 * FIXME!!! that one is rather dangerous, we want to
-		 * make it follow standard rules (eg: clear req->analysers).
-		 */
-
-		/* now check whether we have some admin rules for this request */
-		list_for_each_entry(stats_admin_rule, &s->be->uri_auth->admin_rules, list) {
-			int ret = 1;
-
-			if (stats_admin_rule->cond) {
-				ret = acl_exec_cond(stats_admin_rule->cond, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-				ret = acl_pass(ret);
-				if (stats_admin_rule->cond->pol == ACL_COND_UNLESS)
-					ret = !ret;
-			}
-
-			if (ret) {
-				/* no rule, or the rule matches */
-				s->rep->prod->applet.ctx.stats.flags |= STAT_ADMIN;
-				break;
-			}
+	if (unlikely(do_stats)) {
+		/* process the stats request now */
+		if (!http_handle_stats(s, req)) {
+			/* we need more data, let's come back here later */
+			req->analysers |= an_bit;
+			channel_dont_connect(req);
 		}
-
-		/* Was the status page requested with a POST ? */
-		if (txn->meth == HTTP_METH_POST) {
-			if (s->rep->prod->applet.ctx.stats.flags & STAT_ADMIN) {
-				if (msg->msg_state < HTTP_MSG_100_SENT) {
-					/* If we have HTTP/1.1 and Expect: 100-continue, then we must
-					 * send an HTTP/1.1 100 Continue intermediate response.
-					 */
-					if (msg->flags & HTTP_MSGF_VER_11) {
-						struct hdr_ctx ctx;
-						ctx.idx = 0;
-						/* Expect is allowed in 1.1, look for it */
-						if (http_find_header2("Expect", 6, req->buf->p, &txn->hdr_idx, &ctx) &&
-						    unlikely(ctx.vlen == 12 && strncasecmp(ctx.line+ctx.val, "100-continue", 12) == 0)) {
-							bo_inject(s->rep, http_100_chunk.str, http_100_chunk.len);
-						}
-					}
-					msg->msg_state = HTTP_MSG_100_SENT;
-					s->logs.tv_request = now;  /* update the request timer to reflect full request */
-				}
-				if (!http_process_req_stat_post(s->rep->prod, txn, req)) {
-					/* we need more data */
-					req->analysers |= an_bit;
-					channel_dont_connect(req);
-					return 0;
-				}
-			} else {
-				s->rep->prod->applet.ctx.stats.st_code = STAT_STATUS_DENY;
-			}
-		}
-
-		s->logs.tv_request = now;
-		s->task->nice = -32; /* small boost for HTTP statistics */
-		stream_int_register_handler(s->rep->prod, &http_stats_applet);
-		s->target = s->rep->prod->conn->target; // for logging only
-		s->rep->prod->conn->xprt_ctx = s;
-		s->rep->prod->applet.st0 = s->rep->prod->applet.st1 = 0;
-		req->analysers = 0;
-		if (s->fe == s->be) /* report it if the request was intercepted by the frontend */
-			s->fe->fe_counters.intercepted_req++;
-
-		return 0;
-
+		return 1;
 	}
 
 	/* check whether we have some ACLs set to redirect this request */
@@ -3748,7 +3851,8 @@ int http_process_request(struct session *s, struct channel *req, int an_bit)
 	/* if the server closes the connection, we want to immediately react
 	 * and close the socket to save packets and syscalls.
 	 */
-	req->cons->flags |= SI_FL_NOHALF;
+	if (!(req->analysers & AN_REQ_HTTP_XFER_BODY))
+		req->cons->flags |= SI_FL_NOHALF;
 
 	s->logs.tv_request = now;
 	/* OK let's go on with the BODY now */
@@ -4179,6 +4283,11 @@ int http_sync_req_state(struct session *s)
 		if (!(s->be->options & PR_O_ABRT_CLOSE) && txn->meth != HTTP_METH_POST)
 			channel_dont_read(chn);
 
+		/* if the server closes the connection, we want to immediately react
+		 * and close the socket to save packets and syscalls.
+		 */
+		chn->cons->flags |= SI_FL_NOHALF;
+
 		if (txn->rsp.msg_state == HTTP_MSG_ERROR)
 			goto wait_other_side;
 
@@ -4450,10 +4559,10 @@ int http_resync_states(struct session *s)
 		channel_auto_close(s->rep);
 		channel_auto_read(s->rep);
 	}
-	else if (txn->rsp.msg_state == HTTP_MSG_CLOSED ||
+	else if ((txn->req.msg_state >= HTTP_MSG_DONE &&
+		  (txn->rsp.msg_state == HTTP_MSG_CLOSED || (s->rep->flags & CF_SHUTW))) ||
 		 txn->rsp.msg_state == HTTP_MSG_ERROR ||
-		 txn->req.msg_state == HTTP_MSG_ERROR ||
-		 (s->rep->flags & CF_SHUTW)) {
+		 txn->req.msg_state == HTTP_MSG_ERROR) {
 		s->rep->analysers = 0;
 		channel_auto_close(s->rep);
 		channel_auto_read(s->rep);
@@ -7568,6 +7677,7 @@ int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct pr
 
 	memset(&si->applet.ctx.stats, 0, sizeof(si->applet.ctx.stats));
 	si->applet.ctx.stats.st_code = STAT_STATUS_INIT;
+	si->applet.ctx.stats.flags |= STAT_FMT_HTML; /* assume HTML mode by default */
 
 	/* check URI size */
 	if (uri_auth->uri_len > msg->sl.rq.u_l)
@@ -7600,7 +7710,7 @@ int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct pr
 	h = uri + uri_auth->uri_len;
 	while (h <= uri + msg->sl.rq.u_l - 4) {
 		if (memcmp(h, ";csv", 4) == 0) {
-			si->applet.ctx.stats.flags |= STAT_FMT_CSV;
+			si->applet.ctx.stats.flags &= ~STAT_FMT_HTML;
 			break;
 		}
 		h++;
@@ -7622,9 +7732,6 @@ int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct pr
 		}
 		h++;
 	}
-
-	si->applet.ctx.stats.flags |= STAT_SHOW_STAT | STAT_SHOW_INFO;
-
 	return 1;
 }
 
@@ -7889,8 +7996,8 @@ void free_http_req_rules(struct list *r) {
 
 	list_for_each_entry_safe(pr, tr, r, list) {
 		LIST_DEL(&pr->list);
-		if (pr->action == HTTP_REQ_ACT_HTTP_AUTH)
-			free(pr->http_auth.realm);
+		if (pr->action == HTTP_REQ_ACT_AUTH)
+			free(pr->arg.auth.realm);
 
 		free(pr);
 	}
@@ -7907,30 +8014,42 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		return NULL;
 	}
 
-	if (!*args[0]) {
-		goto req_error_parsing;
-	} else if (!strcmp(args[0], "allow")) {
+	if (!strcmp(args[0], "allow")) {
 		rule->action = HTTP_REQ_ACT_ALLOW;
 		cur_arg = 1;
 	} else if (!strcmp(args[0], "deny")) {
 		rule->action = HTTP_REQ_ACT_DENY;
 		cur_arg = 1;
 	} else if (!strcmp(args[0], "auth")) {
-		rule->action = HTTP_REQ_ACT_HTTP_AUTH;
+		rule->action = HTTP_REQ_ACT_AUTH;
 		cur_arg = 1;
 
 		while(*args[cur_arg]) {
 			if (!strcmp(args[cur_arg], "realm")) {
-				rule->http_auth.realm = strdup(args[cur_arg + 1]);
+				rule->arg.auth.realm = strdup(args[cur_arg + 1]);
 				cur_arg+=2;
 				continue;
 			} else
 				break;
 		}
+	} else if (strcmp(args[0], "add-header") == 0 || strcmp(args[0], "set-header") == 0) {
+		rule->action = *args[0] == 'a' ? HTTP_REQ_ACT_ADD_HDR : HTTP_REQ_ACT_SET_HDR;
+		cur_arg = 1;
+
+		if (!*args[cur_arg] || !*args[cur_arg+1] || *args[cur_arg+2]) {
+			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 2 arguments.\n",
+			      file, linenum, args[0]);
+			return NULL;
+		}
+
+		rule->arg.hdr_add.name = strdup(args[cur_arg]);
+		rule->arg.hdr_add.name_len = strlen(rule->arg.hdr_add.name);
+		LIST_INIT(&rule->arg.hdr_add.fmt);
+		parse_logformat_string(args[cur_arg + 1], proxy, &rule->arg.hdr_add.fmt, PR_MODE_HTTP);
+		cur_arg += 2;
 	} else {
-req_error_parsing:
-		Alert("parsing [%s:%d]: %s '%s', expects 'allow', 'deny', 'auth'.\n",
-			file, linenum, *args[1]?"unknown parameter":"missing keyword in", args[*args[1]?1:0]);
+		Alert("parsing [%s:%d]: 'http-request' expects 'allow', 'deny', 'auth', 'add-header', 'set-header', but got '%s'%s.\n",
+		      file, linenum, args[0], *args[0] ? "" : " (missing argument)");
 		return NULL;
 	}
 
@@ -8184,6 +8303,9 @@ acl_fetch_stver(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 
 	CHECK_HTTP_MESSAGE_FIRST();
 
+	if (txn->rsp.msg_state < HTTP_MSG_BODY)
+		return 0;
+
 	len = txn->rsp.sl.st.v_l;
 	ptr = txn->rsp.chn->buf->p;
 
@@ -8209,6 +8331,9 @@ acl_fetch_stcode(struct proxy *px, struct session *l4, void *l7, unsigned int op
 	int len;
 
 	CHECK_HTTP_MESSAGE_FIRST();
+
+	if (txn->rsp.msg_state < HTTP_MSG_BODY)
+		return 0;
 
 	len = txn->rsp.sl.st.c_l;
 	ptr = txn->rsp.chn->buf->p + txn->rsp.sl.st.c;
@@ -8395,7 +8520,7 @@ smp_fetch_hdr_ip(struct proxy *px, struct session *l4, void *l7, unsigned int op
 			smp->type = SMP_T_IPV4;
 			break;
 		} else {
-			struct chunk *temp = sample_get_trash_chunk();
+			struct chunk *temp = get_trash_chunk();
 			if (smp->data.str.len < temp->size - 1) {
 				memcpy(temp->str, smp->data.str.str, smp->data.str.len);
 				temp->str[smp->data.str.len] = '\0';
@@ -8483,6 +8608,93 @@ smp_fetch_base(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 	}
 
 	smp->flags = SMP_F_VOL_1ST;
+	return 1;
+}
+
+/* This produces a 32-bit hash of the concatenation of the first occurrence of
+ * the Host header followed by the path component if it begins with a slash ('/').
+ * This means that '*' will not be added, resulting in exactly the first Host
+ * entry. If no Host header is found, then the path is used. The resulting value
+ * is hashed using the url hash followed by a full avalanche hash and provides a
+ * 32-bit integer value. This fetch is useful for tracking per-URL activity on
+ * high-traffic sites without having to store whole paths.
+ */
+static int
+smp_fetch_base32(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                 const struct arg *args, struct sample *smp)
+{
+	struct http_txn *txn = l7;
+	struct hdr_ctx ctx;
+	unsigned int hash = 0;
+	char *ptr, *beg, *end;
+	int len;
+
+	CHECK_HTTP_MESSAGE_FIRST();
+
+	ctx.idx = 0;
+	if (http_find_header2("Host", 4, txn->req.chn->buf->p + txn->req.sol, &txn->hdr_idx, &ctx)) {
+		/* OK we have the header value in ctx.line+ctx.val for ctx.vlen bytes */
+		ptr = ctx.line + ctx.val;
+		len = ctx.vlen;
+		while (len--)
+			hash = *(ptr++) + (hash << 6) + (hash << 16) - hash;
+	}
+
+	/* now retrieve the path */
+	end = txn->req.chn->buf->p + txn->req.sol + txn->req.sl.rq.u + txn->req.sl.rq.u_l;
+	beg = http_get_path(txn);
+	if (!beg)
+		beg = end;
+
+	for (ptr = beg; ptr < end && *ptr != '?'; ptr++);
+
+	if (beg < ptr && *beg == '/') {
+		while (beg < ptr)
+			hash = *(beg++) + (hash << 6) + (hash << 16) - hash;
+	}
+	hash = full_hash(hash);
+
+	smp->type = SMP_T_UINT;
+	smp->data.uint = hash;
+	smp->flags = SMP_F_VOL_1ST;
+	return 1;
+}
+
+/* This concatenates the source address with the 32-bit hash of the Host and
+ * URL as returned by smp_fetch_base32(). The idea is to have per-source and
+ * per-url counters. The result is a binary block from 8 to 20 bytes depending
+ * on the source address length. The URL hash is stored before the address so
+ * that in environments where IPv6 is insignificant, truncating the output to
+ * 8 bytes would still work.
+ */
+static int
+smp_fetch_base32_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                     const struct arg *args, struct sample *smp)
+{
+	struct chunk *temp;
+
+	if (!smp_fetch_base32(px, l4, l7, opt, args, smp))
+		return 0;
+
+	temp = get_trash_chunk();
+	memcpy(temp->str + temp->len, &smp->data.uint, sizeof(smp->data.uint));
+	temp->len += sizeof(smp->data.uint);
+
+	switch (l4->si[0].conn->addr.from.ss_family) {
+	case AF_INET:
+		memcpy(temp->str + temp->len, &((struct sockaddr_in *)&l4->si[0].conn->addr.from)->sin_addr, 4);
+		temp->len += 4;
+		break;
+	case AF_INET6:
+		memcpy(temp->str + temp->len, &((struct sockaddr_in6 *)(&l4->si[0].conn->addr.from))->sin6_addr, 16);
+		temp->len += 16;
+		break;
+	default:
+		return 0;
+	}
+
+	smp->data.str = *temp;
+	smp->type = SMP_T_BIN;
 	return 1;
 }
 
@@ -9107,6 +9319,8 @@ static struct acl_kw_list acl_kws = {{ },{
 static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
 	{ "hdr",        smp_fetch_hdr,            ARG2(1,STR,SINT), val_hdr, SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
 	{ "base",       smp_fetch_base,           0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
+	{ "base32",     smp_fetch_base32,         0,                NULL,    SMP_T_UINT, SMP_CAP_L7|SMP_CAP_REQ },
+	{ "base32+src", smp_fetch_base32_src,     0,                NULL,    SMP_T_BIN,  SMP_CAP_L7|SMP_CAP_REQ },
 	{ "path",       smp_fetch_path,           0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
 	{ "url",        smp_fetch_url,            0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
 	{ "url_ip",     smp_fetch_url_ip,         0,                NULL,    SMP_T_IPV4, SMP_CAP_L7|SMP_CAP_REQ },
