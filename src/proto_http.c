@@ -749,13 +749,13 @@ http_get_path(struct http_txn *txn)
 	return ptr;
 }
 
-/* Returns a 302 for a redirectable request. This may only be called just after
- * the stream interface has moved to SI_ST_ASS. Unprocessable requests are
- * left unchanged and will follow normal proxy processing.
- * NOTE: this function is designed to support being called once data are scheduled
- * for forwarding.
+/* Returns a 302 for a redirectable request that reaches a server working in
+ * in redirect mode. This may only be called just after the stream interface
+ * has moved to SI_ST_ASS. Unprocessable requests are left unchanged and will
+ * follow normal proxy processing. NOTE: this function is designed to support
+ * being called once data are scheduled for forwarding.
  */
-void perform_http_redirect(struct session *s, struct stream_interface *si)
+void http_perform_server_redirect(struct session *s, struct stream_interface *si)
 {
 	struct http_txn *txn;
 	struct server *srv;
@@ -2545,16 +2545,15 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 			memcpy(txn->uri, req->buf->p, urilen);
 			txn->uri[urilen] = 0;
 
-			if (!(s->logs.logwait &= ~LW_REQ))
+			if (!(s->logs.logwait &= ~(LW_REQ|LW_INIT)))
 				s->do_log(s);
 		} else {
 			Alert("HTTP logging : out of memory.\n");
 		}
 	}
 
-		if (!LIST_ISEMPTY(&s->fe->format_unique_id)) {
-			s->unique_id = pool_alloc2(pool2_uniqueid);
-		}
+	if (!LIST_ISEMPTY(&s->fe->format_unique_id))
+		s->unique_id = pool_alloc2(pool2_uniqueid);
 
 	/* 4. We may have to convert HTTP/0.9 requests to HTTP/1.0 */
 	if (unlikely(msg->sl.rq.v_l == 0) && !http_upgrade_v09_to_v10(txn))
@@ -2929,7 +2928,8 @@ int http_process_req_stat_post(struct stream_interface *si, struct http_txn *txn
 
 /* This function checks whether we need to enable a POST analyser to parse a
  * stats request, and also registers the stats I/O handler. It returns zero
- * if it needs to come back again, otherwise non-zero if it finishes.
+ * if it needs to come back again, otherwise non-zero if it finishes. In the
+ * latter case, it also clears the request analysers.
  */
 int http_handle_stats(struct session *s, struct channel *req)
 {
@@ -3012,6 +3012,7 @@ int http_handle_stats(struct session *s, struct channel *req)
 			s->flags |= SN_ERR_PRXCOND; // to mark that it comes from the proxy
 		if (!(s->flags & SN_FINST_MASK))
 			s->flags |= SN_FINST_R;
+		req->analysers = 0;
 		return 1;
 	}
 
@@ -3045,6 +3046,7 @@ int http_handle_stats(struct session *s, struct channel *req)
 		/* that's all we return in case of HEAD request, so let's immediately close. */
 		stream_int_retnclose(req->prod, &trash);
 		s->target = &http_stats_applet.obj_type; /* just for logging the applet name */
+		req->analysers = 0;
 		return 1;
 	}
 
@@ -3057,67 +3059,299 @@ int http_handle_stats(struct session *s, struct channel *req)
 	s->rep->prod->conn->xprt_ctx = s;
 	s->rep->prod->applet.st0 = s->rep->prod->applet.st1 = 0;
 	req->analysers = 0;
-
 	return 1;
 }
 
 /* Executes the http-request rules <rules> for session <s>, proxy <px> and
- * transaction <txn>. Returns NULL if it executed all rules, or a pointer to
- * the last rule if it had to stop before the end (auth, deny, allow). It may
- * set the TX_CLDENY on txn->flags if it encounters a deny rule.
+ * transaction <txn>. Returns the first rule that prevents further processing
+ * of the request (auth, deny, ...) or NULL if it executed all rules or stopped
+ * on an allow. It may set the TX_CLDENY on txn->flags if it encounters a deny
+ * rule.
  */
 static struct http_req_rule *
-http_check_access_rule(struct proxy *px, struct list *rules, struct session *s, struct http_txn *txn)
+http_req_get_intercept_rule(struct proxy *px, struct list *rules, struct session *s, struct http_txn *txn)
 {
 	struct http_req_rule *rule;
 	struct hdr_ctx ctx;
 
 	list_for_each_entry(rule, rules, list) {
-		int ret = 1;
-
 		if (rule->action >= HTTP_REQ_ACT_MAX)
 			continue;
 
-		/* check condition, but only if attached */
+		/* check optional condition */
 		if (rule->cond) {
+			int ret;
+
 			ret = acl_exec_cond(rule->cond, px, s, txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
 			ret = acl_pass(ret);
 
 			if (rule->cond->pol == ACL_COND_UNLESS)
 				ret = !ret;
+
+			if (!ret) /* condition not matched */
+				continue;
 		}
 
-		if (ret) {
-			switch (rule->action) {
-			case HTTP_REQ_ACT_ALLOW:
-				return rule;
-			case HTTP_REQ_ACT_DENY:
-				txn->flags |= TX_CLDENY;
-				return rule;
-			case HTTP_REQ_ACT_AUTH:
-				return rule;
-			case HTTP_REQ_ACT_SET_HDR:
-				ctx.idx = 0;
-				/* remove all occurrences of the header */
-				while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
-				                         txn->req.chn->buf->p, &txn->hdr_idx, &ctx)) {
-					http_remove_header2(&txn->req, &txn->hdr_idx, &ctx);
-				}
-				/* now fall through to header addition */
 
-			case HTTP_REQ_ACT_ADD_HDR:
-				chunk_printf(&trash, "%s: ", rule->arg.hdr_add.name);
-				memcpy(trash.str, rule->arg.hdr_add.name, rule->arg.hdr_add.name_len);
-				trash.len = rule->arg.hdr_add.name_len;
-				trash.str[trash.len++] = ':';
-				trash.str[trash.len++] = ' ';
-				trash.len += build_logline(s, trash.str + trash.len, trash.size - trash.len, &rule->arg.hdr_add.fmt);
-				http_header_add_tail2(&txn->req, &txn->hdr_idx, trash.str, trash.len);
-				break;
+		switch (rule->action) {
+		case HTTP_REQ_ACT_ALLOW:
+			return NULL; /* "allow" rules are OK */
+
+		case HTTP_REQ_ACT_DENY:
+			txn->flags |= TX_CLDENY;
+			return rule;
+
+		case HTTP_REQ_ACT_TARPIT:
+			txn->flags |= TX_CLTARPIT;
+			return rule;
+
+		case HTTP_REQ_ACT_AUTH:
+			return rule;
+
+		case HTTP_REQ_ACT_REDIR:
+			return rule;
+
+		case HTTP_REQ_ACT_SET_HDR:
+			ctx.idx = 0;
+			/* remove all occurrences of the header */
+			while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
+						 txn->req.chn->buf->p, &txn->hdr_idx, &ctx)) {
+				http_remove_header2(&txn->req, &txn->hdr_idx, &ctx);
 			}
+			/* now fall through to header addition */
+
+		case HTTP_REQ_ACT_ADD_HDR:
+			chunk_printf(&trash, "%s: ", rule->arg.hdr_add.name);
+			memcpy(trash.str, rule->arg.hdr_add.name, rule->arg.hdr_add.name_len);
+			trash.len = rule->arg.hdr_add.name_len;
+			trash.str[trash.len++] = ':';
+			trash.str[trash.len++] = ' ';
+			trash.len += build_logline(s, trash.str + trash.len, trash.size - trash.len, &rule->arg.hdr_add.fmt);
+			http_header_add_tail2(&txn->req, &txn->hdr_idx, trash.str, trash.len);
+			break;
 		}
 	}
+
+	/* we reached the end of the rules, nothing to report */
 	return NULL;
+}
+
+
+/* Perform an HTTP redirect based on the information in <rule>. The function
+ * returns non-zero on success, or zero in case of a, irrecoverable error such
+ * as too large a request to build a valid response.
+ */
+static int http_apply_redirect_rule(struct redirect_rule *rule, struct session *s, struct http_txn *txn)
+{
+	struct http_msg *msg = &txn->req;
+	const char *msg_fmt;
+
+	/* build redirect message */
+	switch(rule->code) {
+	case 303:
+		msg_fmt = HTTP_303;
+		break;
+	case 301:
+		msg_fmt = HTTP_301;
+		break;
+	case 302:
+	default:
+		msg_fmt = HTTP_302;
+		break;
+	}
+
+	if (unlikely(!chunk_strcpy(&trash, msg_fmt)))
+		return 0;
+
+	switch(rule->type) {
+	case REDIRECT_TYPE_SCHEME: {
+		const char *path;
+		const char *host;
+		struct hdr_ctx ctx;
+		int pathlen;
+		int hostlen;
+
+		host = "";
+		hostlen = 0;
+		ctx.idx = 0;
+		if (http_find_header2("Host", 4, txn->req.chn->buf->p + txn->req.sol, &txn->hdr_idx, &ctx)) {
+			host = ctx.line + ctx.val;
+			hostlen = ctx.vlen;
+		}
+
+		path = http_get_path(txn);
+		/* build message using path */
+		if (path) {
+			pathlen = txn->req.sl.rq.u_l + (txn->req.chn->buf->p + txn->req.sl.rq.u) - path;
+			if (rule->flags & REDIRECT_FLAG_DROP_QS) {
+				int qs = 0;
+				while (qs < pathlen) {
+					if (path[qs] == '?') {
+						pathlen = qs;
+						break;
+					}
+					qs++;
+				}
+			}
+		} else {
+			path = "/";
+			pathlen = 1;
+		}
+
+		/* check if we can add scheme + "://" + host + path */
+		if (trash.len + rule->rdr_len + 3 + hostlen + pathlen > trash.size - 4)
+			return 0;
+
+		/* add scheme */
+		memcpy(trash.str + trash.len, rule->rdr_str, rule->rdr_len);
+		trash.len += rule->rdr_len;
+
+		/* add "://" */
+		memcpy(trash.str + trash.len, "://", 3);
+		trash.len += 3;
+
+		/* add host */
+		memcpy(trash.str + trash.len, host, hostlen);
+		trash.len += hostlen;
+
+		/* add path */
+		memcpy(trash.str + trash.len, path, pathlen);
+		trash.len += pathlen;
+
+		/* append a slash at the end of the location is needed and missing */
+		if (trash.len && trash.str[trash.len - 1] != '/' &&
+		    (rule->flags & REDIRECT_FLAG_APPEND_SLASH)) {
+			if (trash.len > trash.size - 5)
+				return 0;
+			trash.str[trash.len] = '/';
+			trash.len++;
+		}
+
+		break;
+	}
+	case REDIRECT_TYPE_PREFIX: {
+		const char *path;
+		int pathlen;
+
+		path = http_get_path(txn);
+		/* build message using path */
+		if (path) {
+			pathlen = txn->req.sl.rq.u_l + (txn->req.chn->buf->p + txn->req.sl.rq.u) - path;
+			if (rule->flags & REDIRECT_FLAG_DROP_QS) {
+				int qs = 0;
+				while (qs < pathlen) {
+					if (path[qs] == '?') {
+						pathlen = qs;
+						break;
+					}
+					qs++;
+				}
+			}
+		} else {
+			path = "/";
+			pathlen = 1;
+		}
+
+		if (trash.len + rule->rdr_len + pathlen > trash.size - 4)
+			return 0;
+
+		/* add prefix. Note that if prefix == "/", we don't want to
+		 * add anything, otherwise it makes it hard for the user to
+		 * configure a self-redirection.
+		 */
+		if (rule->rdr_len != 1 || *rule->rdr_str != '/') {
+			memcpy(trash.str + trash.len, rule->rdr_str, rule->rdr_len);
+			trash.len += rule->rdr_len;
+		}
+
+		/* add path */
+		memcpy(trash.str + trash.len, path, pathlen);
+		trash.len += pathlen;
+
+		/* append a slash at the end of the location is needed and missing */
+		if (trash.len && trash.str[trash.len - 1] != '/' &&
+		    (rule->flags & REDIRECT_FLAG_APPEND_SLASH)) {
+			if (trash.len > trash.size - 5)
+				return 0;
+			trash.str[trash.len] = '/';
+			trash.len++;
+		}
+
+		break;
+	}
+	case REDIRECT_TYPE_LOCATION:
+	default:
+		if (trash.len + rule->rdr_len > trash.size - 4)
+			return 0;
+
+		/* add location */
+		memcpy(trash.str + trash.len, rule->rdr_str, rule->rdr_len);
+		trash.len += rule->rdr_len;
+		break;
+	}
+
+	if (rule->cookie_len) {
+		memcpy(trash.str + trash.len, "\r\nSet-Cookie: ", 14);
+		trash.len += 14;
+		memcpy(trash.str + trash.len, rule->cookie_str, rule->cookie_len);
+		trash.len += rule->cookie_len;
+		memcpy(trash.str + trash.len, "\r\n", 2);
+		trash.len += 2;
+	}
+
+	/* add end of headers and the keep-alive/close status.
+	 * We may choose to set keep-alive if the Location begins
+	 * with a slash, because the client will come back to the
+	 * same server.
+	 */
+	txn->status = rule->code;
+	/* let's log the request time */
+	s->logs.tv_request = now;
+
+	if (rule->rdr_len >= 1 && *rule->rdr_str == '/' &&
+	    (msg->flags & HTTP_MSGF_XFER_LEN) &&
+	    !(msg->flags & HTTP_MSGF_TE_CHNK) && !txn->req.body_len &&
+	    ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL ||
+	     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL)) {
+		/* keep-alive possible */
+		if (!(msg->flags & HTTP_MSGF_VER_11)) {
+			if (unlikely(txn->flags & TX_USE_PX_CONN)) {
+				memcpy(trash.str + trash.len, "\r\nProxy-Connection: keep-alive", 30);
+				trash.len += 30;
+			} else {
+				memcpy(trash.str + trash.len, "\r\nConnection: keep-alive", 24);
+				trash.len += 24;
+			}
+		}
+		memcpy(trash.str + trash.len, "\r\n\r\n", 4);
+		trash.len += 4;
+		bo_inject(txn->rsp.chn, trash.str, trash.len);
+		/* "eat" the request */
+		bi_fast_delete(txn->req.chn->buf, msg->sov);
+		msg->sov = 0;
+		txn->req.chn->analysers = AN_REQ_HTTP_XFER_BODY;
+		s->rep->analysers = AN_RES_HTTP_XFER_BODY;
+		txn->req.msg_state = HTTP_MSG_CLOSED;
+		txn->rsp.msg_state = HTTP_MSG_DONE;
+	} else {
+		/* keep-alive not possible */
+		if (unlikely(txn->flags & TX_USE_PX_CONN)) {
+			memcpy(trash.str + trash.len, "\r\nProxy-Connection: close\r\n\r\n", 29);
+			trash.len += 29;
+		} else {
+			memcpy(trash.str + trash.len, "\r\nConnection: close\r\n\r\n", 23);
+			trash.len += 23;
+		}
+		stream_int_retnclose(txn->req.chn->prod, &trash);
+		txn->req.chn->analysers = 0;
+	}
+
+	if (!(s->flags & SN_ERR_MASK))
+		s->flags |= SN_ERR_PRXCOND;
+	if (!(s->flags & SN_FINST_MASK))
+		s->flags |= SN_FINST_R;
+
+	return 1;
 }
 
 /* This stream analyser runs all HTTP request processing which is common to
@@ -3177,19 +3411,20 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 	session_inc_be_http_req_ctr(s);
 
 	/* evaluate http-request rules */
-	http_req_last_rule = http_check_access_rule(px, &px->http_req_rules, s, txn);
+	http_req_last_rule = http_req_get_intercept_rule(px, &px->http_req_rules, s, txn);
 
 	/* evaluate stats http-request rules only if http-request is OK */
 	if (!http_req_last_rule) {
 		do_stats = stats_check_uri(s->rep->prod, txn, px);
 		if (do_stats)
-			http_req_last_rule = http_check_access_rule(px, &px->uri_auth->http_req_rules, s, txn);
+			http_req_last_rule = http_req_get_intercept_rule(px, &px->uri_auth->http_req_rules, s, txn);
 	}
 	else
 		do_stats = 0;
 
 	/* return a 403 if either rule has blocked */
-	if (txn->flags & TX_CLDENY) {
+	if (txn->flags & (TX_CLDENY|TX_CLTARPIT)) {
+		if (txn->flags & TX_CLDENY) {
 			txn->status = 403;
 			s->logs.tv_request = now;
 			stream_int_retnclose(req->prod, http_error_message(s, HTTP_ERR_403));
@@ -3200,6 +3435,31 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 			if (s->listener->counters)
 				s->listener->counters->denied_req++;
 			goto return_prx_cond;
+		}
+		/* When a connection is tarpitted, we use the tarpit timeout,
+		 * which may be the same as the connect timeout if unspecified.
+		 * If unset, then set it to zero because we really want it to
+		 * eventually expire. We build the tarpit as an analyser.
+		 */
+		if (txn->flags & TX_CLTARPIT) {
+			channel_erase(s->req);
+			/* wipe the request out so that we can drop the connection early
+			 * if the client closes first.
+			 */
+			channel_dont_connect(req);
+			req->analysers = 0; /* remove switching rules etc... */
+			req->analysers |= AN_REQ_HTTP_TARPIT;
+			req->analyse_exp = tick_add_ifset(now_ms,  s->be->timeout.tarpit);
+			if (!req->analyse_exp)
+				req->analyse_exp = tick_add(now_ms, 0);
+			session_inc_http_err_ctr(s);
+			s->fe->fe_counters.denied_req++;
+			if (s->fe != s->be)
+				s->be->be_counters.denied_req++;
+			if (s->listener->counters)
+				s->listener->counters->denied_req++;
+			return 1;
+		}
 	}
 
 	/* try headers filters */
@@ -3325,6 +3585,13 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 			goto return_bad_req;
 	}
 
+	if (http_req_last_rule && http_req_last_rule->action == HTTP_REQ_ACT_REDIR) {
+		if (!http_apply_redirect_rule(http_req_last_rule->arg.redir, s, txn))
+			goto return_bad_req;
+		req->analyse_exp = TICK_ETERNITY;
+		return 1;
+	}
+
 	if (unlikely(do_stats)) {
 		/* process the stats request now */
 		if (!http_handle_stats(s, req)) {
@@ -3337,219 +3604,21 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 
 	/* check whether we have some ACLs set to redirect this request */
 	list_for_each_entry(rule, &px->redirect_rules, list) {
-		int ret = ACL_PAT_PASS;
-
 		if (rule->cond) {
+			int ret;
+
 			ret = acl_exec_cond(rule->cond, px, s, txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
 			ret = acl_pass(ret);
 			if (rule->cond->pol == ACL_COND_UNLESS)
 				ret = !ret;
+			if (!ret)
+				continue;
 		}
+		if (!http_apply_redirect_rule(rule, s, txn))
+			goto return_bad_req;
 
-		if (ret) {
-			const char *msg_fmt;
-
-			/* build redirect message */
-			switch(rule->code) {
-			case 303:
-				msg_fmt = HTTP_303;
-				break;
-			case 301:
-				msg_fmt = HTTP_301;
-				break;
-			case 302:
-			default:
-				msg_fmt = HTTP_302;
-				break;
-			}
-
-			if (unlikely(!chunk_strcpy(&trash, msg_fmt)))
-				goto return_bad_req;
-
-			switch(rule->type) {
-			case REDIRECT_TYPE_SCHEME: {
-				const char *path;
-				const char *host;
-				struct hdr_ctx ctx;
-				int pathlen;
-				int hostlen;
-
-				host = "";
-				hostlen = 0;
-				ctx.idx = 0;
-				if (http_find_header2("Host", 4, txn->req.chn->buf->p + txn->req.sol, &txn->hdr_idx, &ctx)) {
-					host = ctx.line + ctx.val;
-					hostlen = ctx.vlen;
-				}
-
-				path = http_get_path(txn);
-				/* build message using path */
-				if (path) {
-					pathlen = txn->req.sl.rq.u_l + (req->buf->p + txn->req.sl.rq.u) - path;
-					if (rule->flags & REDIRECT_FLAG_DROP_QS) {
-						int qs = 0;
-						while (qs < pathlen) {
-							if (path[qs] == '?') {
-								pathlen = qs;
-								break;
-							}
-							qs++;
-						}
-					}
-				} else {
-					path = "/";
-					pathlen = 1;
-				}
-
-				/* check if we can add scheme + "://" + host + path */
-				if (trash.len + rule->rdr_len + 3 + hostlen + pathlen > trash.size - 4)
-					goto return_bad_req;
-
-				/* add scheme */
-				memcpy(trash.str + trash.len, rule->rdr_str, rule->rdr_len);
-				trash.len += rule->rdr_len;
-
-				/* add "://" */
-				memcpy(trash.str + trash.len, "://", 3);
-				trash.len += 3;
-
-				/* add host */
-				memcpy(trash.str + trash.len, host, hostlen);
-				trash.len += hostlen;
-
-				/* add path */
-				memcpy(trash.str + trash.len, path, pathlen);
-				trash.len += pathlen;
-
-				/* append a slash at the end of the location is needed and missing */
-				if (trash.len && trash.str[trash.len - 1] != '/' &&
-				    (rule->flags & REDIRECT_FLAG_APPEND_SLASH)) {
-					if (trash.len > trash.size - 5)
-						goto return_bad_req;
-					trash.str[trash.len] = '/';
-					trash.len++;
-				}
-
-				break;
-			}
-			case REDIRECT_TYPE_PREFIX: {
-				const char *path;
-				int pathlen;
-
-				path = http_get_path(txn);
-				/* build message using path */
-				if (path) {
-					pathlen = txn->req.sl.rq.u_l + (req->buf->p + txn->req.sl.rq.u) - path;
-					if (rule->flags & REDIRECT_FLAG_DROP_QS) {
-						int qs = 0;
-						while (qs < pathlen) {
-							if (path[qs] == '?') {
-								pathlen = qs;
-								break;
-							}
-							qs++;
-						}
-					}
-				} else {
-					path = "/";
-					pathlen = 1;
-				}
-
-				if (trash.len + rule->rdr_len + pathlen > trash.size - 4)
-					goto return_bad_req;
-
-				/* add prefix. Note that if prefix == "/", we don't want to
-				 * add anything, otherwise it makes it hard for the user to
-				 * configure a self-redirection.
-				 */
-				if (rule->rdr_len != 1 || *rule->rdr_str != '/') {
-					memcpy(trash.str + trash.len, rule->rdr_str, rule->rdr_len);
-					trash.len += rule->rdr_len;
-				}
-
-				/* add path */
-				memcpy(trash.str + trash.len, path, pathlen);
-				trash.len += pathlen;
-
-				/* append a slash at the end of the location is needed and missing */
-				if (trash.len && trash.str[trash.len - 1] != '/' &&
-				    (rule->flags & REDIRECT_FLAG_APPEND_SLASH)) {
-					if (trash.len > trash.size - 5)
-						goto return_bad_req;
-					trash.str[trash.len] = '/';
-					trash.len++;
-				}
-
-				break;
-			}
-			case REDIRECT_TYPE_LOCATION:
-			default:
-				if (trash.len + rule->rdr_len > trash.size - 4)
-					goto return_bad_req;
-
-				/* add location */
-				memcpy(trash.str + trash.len, rule->rdr_str, rule->rdr_len);
-				trash.len += rule->rdr_len;
-				break;
-			}
-
-			if (rule->cookie_len) {
-				memcpy(trash.str + trash.len, "\r\nSet-Cookie: ", 14);
-				trash.len += 14;
-				memcpy(trash.str + trash.len, rule->cookie_str, rule->cookie_len);
-				trash.len += rule->cookie_len;
-				memcpy(trash.str + trash.len, "\r\n", 2);
-				trash.len += 2;
-			}
-
-			/* add end of headers and the keep-alive/close status.
-			 * We may choose to set keep-alive if the Location begins
-			 * with a slash, because the client will come back to the
-			 * same server.
-			 */
-			txn->status = rule->code;
-			/* let's log the request time */
-			s->logs.tv_request = now;
-
-			if (rule->rdr_len >= 1 && *rule->rdr_str == '/' &&
-			    (msg->flags & HTTP_MSGF_XFER_LEN) &&
-			    !(msg->flags & HTTP_MSGF_TE_CHNK) && !txn->req.body_len &&
-			    ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL ||
-			     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL)) {
-				/* keep-alive possible */
-				if (!(msg->flags & HTTP_MSGF_VER_11)) {
-					if (unlikely(txn->flags & TX_USE_PX_CONN)) {
-						memcpy(trash.str + trash.len, "\r\nProxy-Connection: keep-alive", 30);
-						trash.len += 30;
-					} else {
-						memcpy(trash.str + trash.len, "\r\nConnection: keep-alive", 24);
-						trash.len += 24;
-					}
-				}
-				memcpy(trash.str + trash.len, "\r\n\r\n", 4);
-				trash.len += 4;
-				bo_inject(req->prod->ob, trash.str, trash.len);
-				/* "eat" the request */
-				bi_fast_delete(req->buf, msg->sov);
-				msg->sov = 0;
-				req->analysers = AN_REQ_HTTP_XFER_BODY;
-				s->rep->analysers = AN_RES_HTTP_XFER_BODY;
-				txn->req.msg_state = HTTP_MSG_CLOSED;
-				txn->rsp.msg_state = HTTP_MSG_DONE;
-				break;
-			} else {
-				/* keep-alive not possible */
-				if (unlikely(txn->flags & TX_USE_PX_CONN)) {
-					memcpy(trash.str + trash.len, "\r\nProxy-Connection: close\r\n\r\n", 29);
-					trash.len += 29;
-				} else {
-					memcpy(trash.str + trash.len, "\r\nConnection: close\r\n\r\n", 23);
-					trash.len += 23;
-				}
-				stream_int_retnclose(req->prod, &trash);
-				goto return_prx_cond;
-			}
-		}
+		req->analyse_exp = TICK_ETERNITY;
+		return 1;
 	}
 
 	/* POST requests may be accompanied with an "Expect: 100-Continue" header.
@@ -4163,7 +4232,7 @@ void http_end_txn_clean_session(struct session *s)
 	s->logs.bytes_out -= s->rep->buf->i;
 
 	/* let's do a final log if we need it */
-	if (s->logs.logwait &&
+	if (!LIST_ISEMPTY(&s->fe->logformat) && s->logs.logwait &&
 	    !(s->flags & SN_MONITOR) &&
 	    (!(s->fe->options & PR_O_NULLNOLOG) || s->req->total)) {
 		s->do_log(s);
@@ -5666,7 +5735,7 @@ int http_process_res_common(struct session *t, struct channel *rep, int an_bit, 
 		 * bytes from the server, then this is the right moment. We have
 		 * to temporarily assign bytes_out to log what we currently have.
 		 */
-		if (t->fe->to_log && !(t->logs.logwait & LW_BYTES)) {
+		if (!LIST_ISEMPTY(&t->fe->logformat) && !(t->logs.logwait & LW_BYTES)) {
 			t->logs.t_close = t->logs.t_data; /* to get a valid end date */
 			t->logs.bytes_out = txn->rsp.eoh;
 			t->do_log(t);
@@ -8011,7 +8080,7 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 	rule = (struct http_req_rule*)calloc(1, sizeof(struct http_req_rule));
 	if (!rule) {
 		Alert("parsing [%s:%d]: out of memory.\n", file, linenum);
-		return NULL;
+		goto out_err;
 	}
 
 	if (!strcmp(args[0], "allow")) {
@@ -8019,6 +8088,9 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		cur_arg = 1;
 	} else if (!strcmp(args[0], "deny")) {
 		rule->action = HTTP_REQ_ACT_DENY;
+		cur_arg = 1;
+	} else if (!strcmp(args[0], "tarpit")) {
+		rule->action = HTTP_REQ_ACT_TARPIT;
 		cur_arg = 1;
 	} else if (!strcmp(args[0], "auth")) {
 		rule->action = HTTP_REQ_ACT_AUTH;
@@ -8039,7 +8111,7 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		if (!*args[cur_arg] || !*args[cur_arg+1] || *args[cur_arg+2]) {
 			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 2 arguments.\n",
 			      file, linenum, args[0]);
-			return NULL;
+			goto out_err;
 		}
 
 		rule->arg.hdr_add.name = strdup(args[cur_arg]);
@@ -8047,10 +8119,29 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		LIST_INIT(&rule->arg.hdr_add.fmt);
 		parse_logformat_string(args[cur_arg + 1], proxy, &rule->arg.hdr_add.fmt, PR_MODE_HTTP);
 		cur_arg += 2;
+	} else if (strcmp(args[0], "redirect") == 0) {
+		struct redirect_rule *redir;
+		char *errmsg;
+
+		if ((redir = http_parse_redirect_rule(file, linenum, proxy, (const char **)args + 1, &errmsg)) == NULL) {
+			Alert("parsing [%s:%d] : error detected in %s '%s' while parsing 'http-request %s' rule : %s.\n",
+			      file, linenum, proxy_type_str(proxy), proxy->id, args[0], errmsg);
+			goto out_err;
+		}
+
+		/* this redirect rule might already contain a parsed condition which
+		 * we'll pass to the http-request rule.
+		 */
+		rule->action = HTTP_REQ_ACT_REDIR;
+		rule->arg.redir = redir;
+		rule->cond = redir->cond;
+		redir->cond = NULL;
+		cur_arg = 2;
+		return rule;
 	} else {
 		Alert("parsing [%s:%d]: 'http-request' expects 'allow', 'deny', 'auth', 'add-header', 'set-header', but got '%s'%s.\n",
 		      file, linenum, args[0], *args[0] ? "" : " (missing argument)");
-		return NULL;
+		goto out_err;
 	}
 
 	if (strcmp(args[cur_arg], "if") == 0 || strcmp(args[cur_arg], "unless") == 0) {
@@ -8061,7 +8152,7 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 			Alert("parsing [%s:%d] : error detected while parsing an 'http-request %s' condition : %s.\n",
 			      file, linenum, args[0], errmsg);
 			free(errmsg);
-			return NULL;
+			goto out_err;
 		}
 		rule->cond = cond;
 	}
@@ -8069,10 +8160,145 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		Alert("parsing [%s:%d]: 'http-request %s' expects 'realm' for 'auth' or"
 		      " either 'if' or 'unless' followed by a condition but found '%s'.\n",
 		      file, linenum, args[0], args[cur_arg]);
-		return NULL;
+		goto out_err;
 	}
 
 	return rule;
+ out_err:
+	free(rule);
+	return NULL;
+}
+
+/* Parses a redirect rule. Returns the redirect rule on success or NULL on error,
+ * with <err> filled with the error message.
+ */
+struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, struct proxy *curproxy,
+                                               const char **args, char **errmsg)
+{
+	struct redirect_rule *rule;
+	int cur_arg;
+	int type = REDIRECT_TYPE_NONE;
+	int code = 302;
+	const char *destination = NULL;
+	const char *cookie = NULL;
+	int cookie_set = 0;
+	unsigned int flags = REDIRECT_FLAG_NONE;
+	struct acl_cond *cond = NULL;
+
+	cur_arg = 0;
+	while (*(args[cur_arg])) {
+		if (strcmp(args[cur_arg], "location") == 0) {
+			if (!*args[cur_arg + 1])
+				goto missing_arg;
+
+			type = REDIRECT_TYPE_LOCATION;
+			cur_arg++;
+			destination = args[cur_arg];
+		}
+		else if (strcmp(args[cur_arg], "prefix") == 0) {
+			if (!*args[cur_arg + 1])
+				goto missing_arg;
+
+			type = REDIRECT_TYPE_PREFIX;
+			cur_arg++;
+			destination = args[cur_arg];
+		}
+		else if (strcmp(args[cur_arg], "scheme") == 0) {
+			if (!*args[cur_arg + 1])
+				goto missing_arg;
+
+			type = REDIRECT_TYPE_SCHEME;
+			cur_arg++;
+			destination = args[cur_arg];
+		}
+		else if (strcmp(args[cur_arg], "set-cookie") == 0) {
+			if (!*args[cur_arg + 1])
+				goto missing_arg;
+
+			cur_arg++;
+			cookie = args[cur_arg];
+			cookie_set = 1;
+		}
+		else if (strcmp(args[cur_arg], "clear-cookie") == 0) {
+			if (!*args[cur_arg + 1])
+				goto missing_arg;
+
+			cur_arg++;
+			cookie = args[cur_arg];
+			cookie_set = 0;
+		}
+		else if (strcmp(args[cur_arg], "code") == 0) {
+			if (!*args[cur_arg + 1])
+				goto missing_arg;
+
+			cur_arg++;
+			code = atol(args[cur_arg]);
+			if (code < 301 || code > 303) {
+				memprintf(errmsg,
+				          "'%s': unsupported HTTP code '%s' (must be a number between 301 and 303)",
+				          args[cur_arg - 1], args[cur_arg]);
+				return NULL;
+			}
+		}
+		else if (!strcmp(args[cur_arg],"drop-query")) {
+			flags |= REDIRECT_FLAG_DROP_QS;
+		}
+		else if (!strcmp(args[cur_arg],"append-slash")) {
+			flags |= REDIRECT_FLAG_APPEND_SLASH;
+		}
+		else if (strcmp(args[cur_arg], "if") == 0 ||
+			 strcmp(args[cur_arg], "unless") == 0) {
+			cond = build_acl_cond(file, linenum, curproxy, (const char **)args + cur_arg, errmsg);
+			if (!cond) {
+				memprintf(errmsg, "error in condition: %s", *errmsg);
+				return NULL;
+			}
+			break;
+		}
+		else {
+			memprintf(errmsg,
+			          "expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'clear-cookie', 'drop-query' or 'append-slash' (was '%s')",
+			          args[cur_arg]);
+			return NULL;
+		}
+		cur_arg++;
+	}
+
+	if (type == REDIRECT_TYPE_NONE) {
+		memprintf(errmsg, "redirection type expected ('prefix', 'location', or 'scheme')");
+		return NULL;
+	}
+
+	rule = (struct redirect_rule *)calloc(1, sizeof(*rule));
+	rule->cond = cond;
+	rule->rdr_str = strdup(destination);
+	rule->rdr_len = strlen(destination);
+	if (cookie) {
+		/* depending on cookie_set, either we want to set the cookie, or to clear it.
+		 * a clear consists in appending "; path=/; Max-Age=0;" at the end.
+		 */
+		rule->cookie_len = strlen(cookie);
+		if (cookie_set) {
+			rule->cookie_str = malloc(rule->cookie_len + 10);
+			memcpy(rule->cookie_str, cookie, rule->cookie_len);
+			memcpy(rule->cookie_str + rule->cookie_len, "; path=/;", 10);
+			rule->cookie_len += 9;
+		} else {
+			rule->cookie_str = malloc(rule->cookie_len + 21);
+			memcpy(rule->cookie_str, cookie, rule->cookie_len);
+			memcpy(rule->cookie_str + rule->cookie_len, "; path=/; Max-Age=0;", 21);
+			rule->cookie_len += 20;
+		}
+	}
+	rule->type = type;
+	rule->code = code;
+	rule->flags = flags;
+	LIST_INIT(&rule->list);
+	return rule;
+
+ missing_arg:
+	memprintf(errmsg, "missing argument for '%s'", args[cur_arg]);
+	return NULL;
 }
 
 /************************************************************************/

@@ -4,7 +4,7 @@
                          ----------------------
                              version 1.5
                              willy tarreau
-                              2012/12/24
+                              2012/12/28
 
 
 This document covers the configuration language as implemented in the version
@@ -887,7 +887,8 @@ tune.ssl.cachesize <number>
   and reassigned. Higher values reduce the occurrence of such a purge, hence
   the number of CPU-intensive SSL handshakes by ensuring that all users keep
   their session as long as possible. All entries are pre-allocated upon startup
-  and are shared between all processes if "nbproc" is greater than 1.
+  and are shared between all processes if "nbproc" is greater than 1. Setting
+  this value to 0 disables the SSL session cache.
 
 tune.ssl.lifetime <timeout>
   Sets how long a cached SSL session may remain valid. This time is expressed
@@ -2606,7 +2607,7 @@ http-check send-state
 
   See also : "option httpchk", "http-check disable-on-404"
 
-http-request { allow | deny | auth [realm <realm>] |
+http-request { allow | deny | tarpit | auth [realm <realm>] | redirect <rule> |
               add-header <name> <fmt> | set-header <name> <fmt> }
              [ { if | unless } <condition> ]
   Access control for Layer 7 requests
@@ -2628,11 +2629,28 @@ http-request { allow | deny | auth [realm <realm>] |
       the request and emits an HTTP 403 error. No further "http-request" rules
       are evaluated.
 
+    - "tarpit" : this stops the evaluation of the rules and immediately blocks
+      the request without responding for a delay specified by "timeout tarpit"
+      or "timeout connect" if the former is not set. After that delay, if the
+      client is still connected, an HTTP error 500 is returned so that the
+      client does not suspect it has been tarpitted. Logs will report the flags
+      "PT". The goal of the tarpit rule is to slow down robots during an attack
+      when they're limited on the number of concurrent requests. It can be very
+      efficient against very dumb robots, and will significantly reduce the
+      load on firewalls compared to a "deny" rule. But when facing "correctly"
+      developped robots, it can make things worse by forcing haproxy and the
+      front firewall to support insane number of concurrent connections.
+
     - "auth" : this stops the evaluation of the rules and immediately responds
       with an HTTP 401 or 407 error code to invite the user to present a valid
       user name and password. No further "http-request" rules are evaluated. An
       optional "realm" parameter is supported, it sets the authentication realm
       that is returned with the response (typically the application's name).
+
+    - "redirect" : this performs an HTTP redirection based on a redirect rule.
+      This is exactly the same as the "redirect" statement except that it
+      inserts a redirect rule which can be processed in the middle of other
+      "http-request" rules. See the "redirect" keyword for the rule's syntax.
 
     - "add-header" appends an HTTP header field whose name is specified in
       <name> and whose value is defined by <fmt> which follows the log-format

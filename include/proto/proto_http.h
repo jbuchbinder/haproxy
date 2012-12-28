@@ -94,7 +94,7 @@ int http_find_header2(const char *name, int len,
 		      char *sol, struct hdr_idx *idx,
 		      struct hdr_ctx *ctx);
 void http_sess_log(struct session *s);
-void perform_http_redirect(struct session *s, struct stream_interface *si);
+void http_perform_server_redirect(struct session *s, struct stream_interface *si);
 void http_return_srv_error(struct session *s, struct stream_interface *si);
 void http_capture_bad_message(struct error_snapshot *es, struct session *s,
                               struct http_msg *msg,
@@ -110,6 +110,8 @@ void http_reset_txn(struct session *s);
 struct http_req_rule *parse_http_req_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
 void free_http_req_rules(struct list *r);
 struct chunk *http_error_message(struct session *s, int msgnum);
+struct redirect_rule *http_parse_redirect_rule(const char *file, int line, struct proxy *curproxy,
+                                               const char **args, char **errmsg);
 
 /* to be used when contents change in an HTTP message */
 #define http_msg_move_end(msg, bytes) do { \
