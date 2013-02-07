@@ -902,7 +902,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		compress_min_idle = 100 - atoi(args[1]);
-		if (compress_min_idle < 0 || compress_min_idle > 100) {
+		if (compress_min_idle > 100) {
 			Alert("parsing [%s:%d] : '%s' expects an integer argument between 0 and 100.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
@@ -1509,6 +1509,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		if (!realport) {
 			Alert("parsing [%s:%d] : Missing or invalid port in '%s'\n", file, linenum, args[2]);
 			err_code |= ERR_ALERT | ERR_FATAL;
+			free(raddr);
 			goto out;
 		}
 
@@ -1942,7 +1943,11 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[1]);
-		memcpy(&bind_conf->ux, &global.unix_bind.ux, sizeof(global.unix_bind.ux));
+
+		/* use default settings for unix sockets */
+		bind_conf->ux.uid  = global.unix_bind.ux.uid;
+		bind_conf->ux.gid  = global.unix_bind.ux.gid;
+		bind_conf->ux.mode = global.unix_bind.ux.mode;
 
 		/* NOTE: the following line might create several listeners if there
 		 * are comma-separated IPs or port ranges. So all further processing
@@ -4270,12 +4275,6 @@ stats_error_parsing:
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
-				if (val < 0) {
-					Alert("parsing [%s:%d]: invalid value %d for argument '%s' of server %s.\n",
-					      file, linenum, val, args[cur_arg], newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
 				newsrv->slowstart = (val + 999) / 1000;
 				cur_arg += 2;
 			}
@@ -4784,7 +4783,7 @@ stats_error_parsing:
 			logsrv->minlvl = 0; /* limit syslog level to this level (emerg) */
 			if (*(args[4])) {
 				logsrv->minlvl = get_log_level(args[4]);
-				if (logsrv->level < 0) {
+				if (logsrv->minlvl < 0) {
 					Alert("parsing [%s:%d] : unknown optional minimum log level '%s'\n", file, linenum, args[4]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;

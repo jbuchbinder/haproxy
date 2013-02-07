@@ -817,8 +817,7 @@ void http_perform_server_redirect(struct session *s, struct stream_interface *si
 	http_server_error(s, si, SN_ERR_PRXCOND, SN_FINST_C, 302, &trash);
 
 	/* FIXME: we should increase a counter of redirects per server and per backend. */
-	if (srv)
-		srv_inc_sess_ctr(srv);
+	srv_inc_sess_ctr(srv);
 }
 
 /* Return the error message corresponding to si->err_type. It is assumed
@@ -2029,7 +2028,6 @@ int select_compression_request_header(struct session *s, struct buffer *req)
 	}
 
 	s->comp_algo = NULL;
-
 	return 0;
 }
 
@@ -2139,14 +2137,10 @@ int select_compression_response_header(struct session *s, struct buffer *res)
 		trash.str[trash.len] = '\0';
 		http_header_add_tail2(&txn->rsp, &txn->hdr_idx, trash.str, trash.len);
 	}
-
 	return 1;
 
 fail:
-	if (s->flags & SN_COMP_READY)
-		s->comp_algo->end(&s->comp_ctx);
 	s->comp_algo = NULL;
-	s->flags &= ~SN_COMP_READY;
 	return 0;
 }
 
