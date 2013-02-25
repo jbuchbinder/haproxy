@@ -479,6 +479,8 @@ The following keywords are supported in the "global" section :
    - tune.sndbuf.client
    - tune.sndbuf.server
    - tune.ssl.cachesize
+   - tune.ssl.lifetime
+   - tune.ssl.maxrecord
    - tune.zlib.memlevel
    - tune.zlib.windowsize
 
@@ -900,6 +902,19 @@ tune.ssl.lifetime <timeout>
   lifetime. The real usefulness of this setting is to prevent sessions from
   being used for too long.
 
+tune.ssl.maxrecord <number>
+  Sets the maximum amount of bytes passed to SSL_write() at a time. Default
+  value 0 means there is no limit. Over SSL/TLS, the client can decipher the
+  data only once it has received a full record. With large records, it means
+  that clients might have to download up to 16kB of data before starting to
+  process them. Limiting the value can improve page load times on browsers
+  located over high latency or low bandwidth networks. It is suggested to find
+  optimal values which fit into 1 or 2 TCP segments (generally 1448 bytes over
+  Ethernet with TCP timestamps enabled, or 1460 when timestamps are disabled),
+  keeping in mind that SSL/TLS add some overhead. Typical values of 1419 and
+  2859 gave good results during tests. Use "strace -e trace=write" to find the
+  best value.
+
 tune.zlib.memlevel <number>
   Sets the memLevel parameter in zlib initialization for each session. It
   defines how much memory should be allocated for the intenal compression
@@ -1141,6 +1156,7 @@ option httpclose                     (*)  X          X         X         X
 option httplog                            X          X         X         X
 option http_proxy                    (*)  X          X         X         X
 option independent-streams           (*)  X          X         X         X
+option lb-agent-chk                       X          -         X         X
 option ldap-check                         X          -         X         X
 option log-health-checks             (*)  X          -         X         X
 option log-separate-errors           (*)  X          X         X         -
@@ -3592,9 +3608,9 @@ option httpchk <method> <uri> <version>
           option httpchk OPTIONS * HTTP/1.1\r\nHost:\ www
           server apache1 192.168.1.1:443 check port 80
 
-  See also : "option ssl-hello-chk", "option smtpchk", "option mysql-check",
-             "option pgsql-check", "http-check" and the "check", "port" and
-             "inter" server options.
+  See also : "option lb-agent-chk", "option ssl-hello-chk", "option smtpchk",
+             "option mysql-check", "option pgsql-check", "http-check" and
+             the "check", "port" and "inter" server options.
 
 
 option httpclose
@@ -3729,6 +3745,45 @@ no option independent-streams
         deprecated.
 
   See also : "timeout client", "timeout server" and "timeout tunnel"
+
+
+option lb-agent-chk
+  Use a TCP connection to obtain a metric of server health
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |     no   |   yes  |   yes
+  Arguments : none
+
+  This alters health checking behaviour by connecting making a TCP
+  connection and reading an ASCII string. The string should have one of
+  the following forms:
+
+  * An ASCII representation of an positive integer percentage.
+     e.g. "75%"
+
+     Values in this format will set the weight proportional to the initial
+     weight of a server as configured when haproxy starts.
+
+  * The string "drain".
+
+    This will cause the weight of a server to be set to 0, and thus it will
+    not accept any new connections other than those that are accepted via
+    persistence.
+
+  * The string "down", optionally followed by a description string.
+
+    Mark the server as down and log the description string as the reason.
+
+  * The string "stopped", optionally followed by a description string.
+
+    This currently has the same behaviour as down (iii).
+
+  * The string "fail", optionally followed by a description string.
+
+    This currently has the same behaviour as down (iii).
+
+  The use of an alternate check-port, used to obtain agent heath check
+  information described above as opposed to the port of the service, may be
+  useful in conjunction with this option.
 
 
 option ldap-check
@@ -5071,7 +5126,7 @@ source <addr>[:<port>] [interface <name>]
               This is the name of a comma-separated header list which can
               contain multiple IP addresses. By default, the last occurrence is
               used. This is designed to work with the X-Forwarded-For header
-              and to automatically bind to the the client's IP address as seen
+              and to automatically bind to the client's IP address as seen
               by previous proxy, typically Stunnel. In order to use another
               occurrence from the last one, please see the <occ> parameter
               below. When the header (or occurrence) is not found, no binding
@@ -7126,14 +7181,13 @@ id <id>
   option can only be used when defining only a single socket.
 
 interface <interface>
-  Sets the name of the network interface to listen. This is currently only
-  supported on Linux. The interface must be a primary system interface, not an
-  aliased interface. When specified, all addresses on the same line will only
-  be accepted if the incoming packets physically come through the designated
-  interface. It is also possible to bind multiple frontends to the same address
-  if they are bound to different interfaces.  Note that binding to a network
-  interface requires root privileges. This parameter is only compatible with
-  TCPv4/TCPv6 sockets.
+  Restricts the socket to a specific interface. When specified, only packets
+  received from that particular interface are processed by the socket. This is
+  currently only supported on Linux. The interface must be a primary system
+  interface, not an aliased interface. It is also possible to bind multiple
+  frontends to the same address if they are bound to different interfaces. Note
+  that binding to a network interface requires root privileges. This parameter
+  is only compatible with TCPv4/TCPv6 sockets.
 
 level <level>
   This setting is used with the stats sockets only to restrict the nature of
@@ -7248,7 +7302,7 @@ strict-sni
   See the "crt" option for more information.
 
 tfo
-  Is an optional keyword which is supported only on Linux kernels >= 3.6. It
+  Is an optional keyword which is supported only on Linux kernels >= 3.7. It
   enables TCP Fast Open on the listening socket, which means that clients which
   support this feature will be able to send a request and receive a response
   during the 3-way handshake starting from second connection, thus saving one
@@ -7360,9 +7414,10 @@ check
   backend. It is possible to change the address using the "addr" parameter, the
   port using the "port" parameter, the source address using the "source"
   address, and the interval and timers using the "inter", "rise" and "fall"
-  parameters. The request method is define in the backend using the "httpchk",
-  "smtpchk", "mysql-check", "pgsql-check" and "ssl-hello-chk" options. Please
-  refer to those options and parameters for more information.
+  parameters. The request method is define in the backend using the
+  "httpchk", "lb-agent-chk", "smtpchk", "mysql-check", "pgsql-check" and
+  "ssl-hello-chk" options. Please refer to those options and parameters for
+  more information.
 
   Supported in default-server: No
 
@@ -9474,8 +9529,8 @@ The list of currently supported pattern fetch functions is the following :
                If no entry specified, returns the full distinguished name of
                the issuer of the certificate presented by the client when
                the incoming connection was made over an SSL/TLS transport
-               layer. Otherwise returns the the value of the first given entry
-               found from the the beginning of the DN. If a positive/negative
+               layer. Otherwise returns the value of the first given entry
+               found from the beginning of the DN. If a positive/negative
                occurrence number is specified as the optional second argument,
                it returns the value of the nth given entry found from the
                beginning/end of the DN. For instance to retrieve the common
@@ -9501,8 +9556,8 @@ The list of currently supported pattern fetch functions is the following :
                If no entry specified, returns the full distinguished name of
                the subject of the certificate presented by the client when
                the incoming connection was made over an SSL/TLS transport
-               layer. Otherwise returns the the value of the first given entry
-               found from the the beginning of the DN. If a positive/negative
+               layer. Otherwise returns the value of the first given entry
+               found from the beginning of the DN. If a positive/negative
                occurrence number is specified as the optional second argument,
                it returns the value of the nth given entry found from the
                beginning/end of the DN. For instance to retrieve the common
@@ -9535,8 +9590,8 @@ The list of currently supported pattern fetch functions is the following :
                If no entry specified, returns the full distinguished name of
                the issuer of the certificate presented by the frontend when
                the incoming connection was made over an SSL/TLS transport
-               layer. Otherwise returns the the value of the first given entry
-               found from the the beginning of the DN. If a positive/negative
+               layer. Otherwise returns the value of the first given entry
+               found from the beginning of the DN. If a positive/negative
                occurrence number is specified as the optional second argument,
                it returns the value of the nth given entry found from the
                beginning/end of the DN. For instance to retrieve the common
@@ -9562,8 +9617,8 @@ The list of currently supported pattern fetch functions is the following :
                If no entry specified, returns the full distinguished name of
                the subject of the certificate presented by the frontend when
                the incoming connection was made over an SSL/TLS transport
-               layer. Otherwise returns the the value of the first given entry
-               found from the the beginning of the DN. If a positive/negative
+               layer. Otherwise returns the value of the first given entry
+               found from the beginning of the DN. If a positive/negative
                occurrence number is specified as the optional second argument,
                it returns the value of the nth given entry found from the
                beginning/end of the DN. For instance to retrieve the common
@@ -11440,18 +11495,19 @@ set timeout cli <delay>
 set weight <backend>/<server> <weight>[%]
   Change a server's weight to the value passed in argument. If the value ends
   with the '%' sign, then the new weight will be relative to the initially
-  configured weight. Relative weights are only permitted between 0 and 100%,
-  and absolute weights are permitted between 0 and 256. Servers which are part
-  of a farm running a static load-balancing algorithm have stricter limitations
-  because the weight cannot change once set. Thus for these servers, the only
-  accepted values are 0 and 100% (or 0 and the initial weight). Changes take
-  effect immediately, though certain LB algorithms require a certain amount of
-  requests to consider changes. A typical usage of this command is to disable
-  a server during an update by setting its weight to zero, then to enable it
-  again after the update by setting it back to 100%. This command is restricted
-  and can only be issued on sockets configured for level "admin". Both the
-  backend and the server may be specified either by their name or by their
-  numeric ID, prefixed with a sharp ('#').
+  configured weight.  Absolute weights are permitted between 0 and 256.
+  Relative weights must be positive with the resulting absolute weight is
+  capped at 256.  Servers which are part of a farm running a static
+  load-balancing algorithm have stricter limitations because the weight
+  cannot change once set. Thus for these servers, the only accepted values
+  are 0 and 100% (or 0 and the initial weight). Changes take effect
+  immediately, though certain LB algorithms require a certain amount of
+  requests to consider changes. A typical usage of this command is to
+  disable a server during an update by setting its weight to zero, then to
+  enable it again after the update by setting it back to 100%. This command
+  is restricted and can only be issued on sockets configured for level
+  "admin". Both the backend and the server may be specified either by their
+  name or by their numeric ID, prefixed with a sharp ('#').
 
 show errors [<iid>]
   Dump last known request and response errors collected by frontends and

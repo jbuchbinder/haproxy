@@ -157,6 +157,74 @@ static void __listener_init(void)
 }
 
 /*
+ * Parses weight_str and configures sv accordingly.
+ * Returns NULL on success, error message string otherwise.
+ */
+const char *server_parse_weight_change_request(struct server *sv,
+					       const char *weight_str)
+{
+	struct proxy *px;
+	long int w;
+	char *end;
+
+	px = sv->proxy;
+
+	/* if the weight is terminated with '%', it is set relative to
+	 * the initial weight, otherwise it is absolute.
+	 */
+	if (!*weight_str)
+		return "Require <weight> or <weight%>.\n";
+
+	w = strtol(weight_str, &end, 10);
+	if (end == weight_str)
+		return "Empty weight string empty or preceded by garbage";
+	else if (end[0] == '%' && end[1] == '\0') {
+		if (w < 0)
+			return "Relative weight must be positive.\n";
+		/* Avoid integer overflow */
+		if (w > 25600)
+			w = 25600;
+		w = sv->iweight * w / 100;
+		if (w > 256)
+			w = 256;
+	}
+	else if (w < 0 || w > 256)
+		return "Absolute weight can only be between 0 and 256 inclusive.\n";
+	else if (end[0] != '\0')
+		return "Trailing garbage in weight string";
+
+	if (w && w != sv->iweight && !(px->lbprm.algo & BE_LB_PROP_DYN))
+		return "Backend is using a static LB algorithm and only accepts weights '0%' and '100%'.\n";
+
+	sv->uweight = w;
+
+	if (px->lbprm.algo & BE_LB_PROP_DYN) {
+	/* we must take care of not pushing the server to full throttle during slow starts */
+		if ((sv->state & SRV_WARMINGUP))
+			sv->eweight = (BE_WEIGHT_SCALE * (now.tv_sec - sv->last_change) + sv->slowstart - 1) / sv->slowstart;
+		else
+			sv->eweight = BE_WEIGHT_SCALE;
+		sv->eweight *= sv->uweight;
+	} else {
+		sv->eweight = sv->uweight;
+	}
+
+	/* static LB algorithms are a bit harder to update */
+	if (px->lbprm.update_server_eweight)
+		px->lbprm.update_server_eweight(sv);
+	else if (sv->eweight) {
+		if (px->lbprm.set_server_status_up)
+			px->lbprm.set_server_status_up(sv);
+	}
+	else {
+		if (px->lbprm.set_server_status_down)
+			px->lbprm.set_server_status_down(sv);
+	}
+
+	return NULL;
+}
+
+/*
  * Local variables:
  *  c-indent-level: 8
  *  c-basic-offset: 8
