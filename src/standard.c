@@ -443,27 +443,6 @@ const char *limit_r(unsigned long n, char *buffer, int size, const char *alt)
 }
 
 /*
- * converts <str> to a struct sockaddr_un* which is locally allocated.
- * The format is "/path", where "/path" is a path to a UNIX domain socket.
- * NULL is returned if the socket path is invalid (too long).
- */
-struct sockaddr_un *str2sun(const char *str)
-{
-	static struct sockaddr_un su;
-	int strsz;	/* length included null */
-
-	memset(&su, 0, sizeof(su));
-	strsz = strlen(str) + 1;
-	if (strsz > sizeof(su.sun_path)) {
-		return NULL;
-	} else {
-		su.sun_family = AF_UNIX;
-		memcpy(su.sun_path, str, strsz);
-	}
-	return &su;
-}
-
-/*
  * Returns non-zero if character <s> is a hex digit (0-9, a-f, A-F), else zero.
  *
  * It looks like this one would be a good candidate for inlining, but this is
@@ -525,7 +504,11 @@ const char *invalid_domainchar(const char *name) {
 }
 
 /*
- * converts <str> to a struct sockaddr_storage* which is locally allocated. The
+ * converts <str> to a struct sockaddr_storage* provided by the caller. The
+ * caller must have zeroed <sa> first, and may have set sa->ss_family to force
+ * parse a specific address format. If the ss_family is 0 or AF_UNSPEC, then
+ * the function tries to guess the address family from the syntax. If the
+ * family is forced and the format doesn't match, an error is returned. The
  * string is assumed to contain only an address, no port. The address can be a
  * dotted IPv4 address, an IPv6 address, a host name, or empty or "*" to
  * indicate INADDR_ANY. NULL is returned if the host part cannot be resolved.
@@ -533,48 +516,55 @@ const char *invalid_domainchar(const char *name) {
  * all other fields remain zero. The string is not supposed to be modified.
  * The IPv6 '::' address is IN6ADDR_ANY.
  */
-struct sockaddr_storage *str2ip(const char *str)
+static struct sockaddr_storage *str2ip(const char *str, struct sockaddr_storage *sa)
 {
-	static struct sockaddr_storage sa;
 	struct hostent *he;
-
-	memset(&sa, 0, sizeof(sa));
 
 	/* Any IPv6 address */
 	if (str[0] == ':' && str[1] == ':' && !str[2]) {
-		sa.ss_family = AF_INET6;
-		return &sa;
+		if (!sa->ss_family || sa->ss_family == AF_UNSPEC)
+			sa->ss_family = AF_INET6;
+		else if (sa->ss_family != AF_INET6)
+			goto fail;
+		return sa;
 	}
 
-	/* Any IPv4 address */
+	/* Any address for the family, defaults to IPv4 */
 	if (!str[0] || (str[0] == '*' && !str[1])) {
-		sa.ss_family = AF_INET;
-		return &sa;
+		if (!sa->ss_family || sa->ss_family == AF_UNSPEC)
+			sa->ss_family = AF_INET;
+		return sa;
 	}
 
 	/* check for IPv6 first */
-	if (inet_pton(AF_INET6, str, &((struct sockaddr_in6 *)&sa)->sin6_addr)) {
-		sa.ss_family = AF_INET6;
-		return &sa;
+	if ((!sa->ss_family || sa->ss_family == AF_UNSPEC || sa->ss_family == AF_INET6) &&
+	    inet_pton(AF_INET6, str, &((struct sockaddr_in6 *)sa)->sin6_addr)) {
+		sa->ss_family = AF_INET6;
+		return sa;
 	}
 
 	/* then check for IPv4 */
-	if (inet_pton(AF_INET, str, &((struct sockaddr_in *)&sa)->sin_addr)) {
-		sa.ss_family = AF_INET;
-		return &sa;
+	if ((!sa->ss_family || sa->ss_family == AF_UNSPEC || sa->ss_family == AF_INET) &&
+	    inet_pton(AF_INET, str, &((struct sockaddr_in *)sa)->sin_addr)) {
+		sa->ss_family = AF_INET;
+		return sa;
 	}
 
 	/* try to resolve an IPv4/IPv6 hostname */
 	he = gethostbyname(str);
 	if (he) {
-		sa.ss_family = he->h_addrtype;
-		switch (sa.ss_family) {
+		if (!sa->ss_family || sa->ss_family == AF_UNSPEC)
+			sa->ss_family = he->h_addrtype;
+		else if (sa->ss_family != he->h_addrtype)
+			goto fail;
+
+		switch (sa->ss_family) {
 		case AF_INET:
-			((struct sockaddr_in *)&sa)->sin_addr = *(struct in_addr *) *(he->h_addr_list);
-			return &sa;
+			((struct sockaddr_in *)sa)->sin_addr = *(struct in_addr *) *(he->h_addr_list);
+			return sa;
 		case AF_INET6:
-			((struct sockaddr_in6 *)&sa)->sin6_addr = *(struct in6_addr *) *(he->h_addr_list);
-			return &sa;
+			((struct sockaddr_in6 *)sa)->sin6_addr = *(struct in6_addr *) *(he->h_addr_list);
+			return sa;
 		}
 	}
 #ifdef USE_GETADDRINFO
@@ -583,20 +573,24 @@ struct sockaddr_storage *str2ip(const char *str)
 
 		memset(&result, 0, sizeof(result));
 		memset(&hints, 0, sizeof(hints));
-		hints.ai_family = AF_UNSPEC;
+		hints.ai_family = sa->ss_family ? sa->ss_family : AF_UNSPEC;
 		hints.ai_socktype = SOCK_DGRAM;
 		hints.ai_flags = AI_PASSIVE;
 		hints.ai_protocol = 0;
 
 		if (getaddrinfo(str, NULL, &hints, &result) == 0) {
-			sa.ss_family = result->ai_family;
+			if (!sa->ss_family || sa->ss_family == AF_UNSPEC)
+				sa->ss_family = result->ai_family;
+			else if (sa->ss_family != result->ai_family)
+				goto fail;
+
 			switch (result->ai_family) {
 			case AF_INET:
-				memcpy((struct sockaddr_in *)&sa, result->ai_addr, result->ai_addrlen);
-				return &sa;
+				memcpy((struct sockaddr_in *)sa, result->ai_addr, result->ai_addrlen);
+				return sa;
 			case AF_INET6:
-				memcpy((struct sockaddr_in6 *)&sa, result->ai_addr, result->ai_addrlen);
-				return &sa;
+				memcpy((struct sockaddr_in6 *)sa, result->ai_addr, result->ai_addrlen);
+				return sa;
 			}
 		}
 
@@ -605,7 +599,7 @@ struct sockaddr_storage *str2ip(const char *str)
 	}
 #endif
 	/* unsupported address family */
-
+ fail:
 	return NULL;
 }
 
@@ -633,63 +627,142 @@ struct sockaddr_storage *str2ip(const char *str)
  *    - "::"        => family will be AF_INET6 and address will be IN6ADDR_ANY
  *    - a host name => family and address will depend on host name resolving.
  *
+ * A prefix may be passed in before the address above to force the family :
+ *    - "ipv4@"  => force address to resolve as IPv4 and fail if not possible.
+ *    - "ipv6@"  => force address to resolve as IPv6 and fail if not possible.
+ *    - "unix@"  => force address to be a path to a UNIX socket even if the
+ *                  path does not start with a '/'
+ *    - "fd@"    => an integer must follow, and is a file descriptor number.
+ *
  * Also note that in order to avoid any ambiguity with IPv6 addresses, the ':'
  * is mandatory after the IP address even when no port is specified. NULL is
  * returned if the address cannot be parsed. The <low> and <high> ports are
- * always initialized if non-null.
+ * always initialized if non-null, even for non-IP families.
+ *
+ * If <pfx> is non-null, it is used as a string prefix before any path-based
+ * address (typically the path to a unix socket).
+ *
+ * When a file descriptor is passed, its value is put into the s_addr part of
+ * the address when cast to sockaddr_in and the address family is AF_UNSPEC.
  */
-struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high)
+struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx)
 {
+	static struct sockaddr_storage ss;
 	struct sockaddr_storage *ret = NULL;
-	char *str2;
+	char *back, *str2;
 	char *port1, *port2;
 	int portl, porth, porta;
 
 	portl = porth = porta = 0;
 
-	str2 = strdup(str);
-	if (str2 == NULL)
+	str2 = back = env_expand(strdup(str));
+	if (str2 == NULL) {
+		memprintf(err, "out of memory in '%s'\n", __FUNCTION__);
 		goto out;
+	}
 
-	port1 = strrchr(str2, ':');
-	if (port1)
-		*port1++ = '\0';
+	memset(&ss, 0, sizeof(ss));
+
+	if (strncmp(str2, "unix@", 5) == 0) {
+		str2 += 5;
+		ss.ss_family = AF_UNIX;
+	}
+	else if (strncmp(str2, "ipv4@", 5) == 0) {
+		str2 += 5;
+		ss.ss_family = AF_INET;
+	}
+	else if (strncmp(str2, "ipv6@", 5) == 0) {
+		str2 += 5;
+		ss.ss_family = AF_INET6;
+	}
+	else if (*str2 == '/') {
+		ss.ss_family = AF_UNIX;
+	}
 	else
-		port1 = "";
+		ss.ss_family = AF_UNSPEC;
 
-	ret = str2ip(str2);
-	if (!ret)
-		goto out;
+	if (ss.ss_family == AF_UNSPEC && strncmp(str2, "fd@", 3) == 0) {
+		char *endptr;
 
-	if (isdigit(*port1)) {	/* single port or range */
-		port2 = strchr(port1, '-');
-		if (port2)
-			*port2++ = '\0';
+		str2 += 3;
+		((struct sockaddr_in *)&ss)->sin_addr.s_addr = strtol(str2, &endptr, 10);
+
+		if (!*str2 || *endptr) {
+			memprintf(err, "file descriptor '%s' is not a valid integer in '%s'\n", str2, str);
+			goto out;
+		}
+
+		/* we return AF_UNSPEC if we use a file descriptor number */
+		ss.ss_family = AF_UNSPEC;
+	}
+	else if (ss.ss_family == AF_UNIX) {
+		int prefix_path_len;
+		int max_path_len;
+
+		/* complete unix socket path name during startup or soft-restart is
+		 * <unix_bind_prefix><path>.<pid>.<bak|tmp>
+		 */
+		prefix_path_len = pfx ? strlen(pfx) : 0;
+		max_path_len = (sizeof(((struct sockaddr_un *)&ss)->sun_path) - 1) -
+			(prefix_path_len ? prefix_path_len + 1 + 5 + 1 + 3 : 0);
+
+		if (strlen(str2) > max_path_len) {
+			memprintf(err, "socket path '%s' too long (max %d)\n", str, max_path_len);
+			goto out;
+		}
+
+		if (pfx) {
+			memcpy(((struct sockaddr_un *)&ss)->sun_path, pfx, prefix_path_len);
+			strcpy(((struct sockaddr_un *)&ss)->sun_path + prefix_path_len, str2);
+		}
+		else {
+			strcpy(((struct sockaddr_un *)&ss)->sun_path, str2);
+		}
+	}
+	else { /* IPv4 and IPv6 */
+		port1 = strrchr(str2, ':');
+		if (port1)
+			*port1++ = '\0';
 		else
-			port2 = port1;
-		portl = atoi(port1);
-		porth = atoi(port2);
-		porta = portl;
-	}
-	else if (*port1 == '-') { /* negative offset */
-		portl = atoi(port1 + 1);
-		porta = -portl;
-	}
-	else if (*port1 == '+') { /* positive offset */
-		porth = atoi(port1 + 1);
-		porta = porth;
-	}
-	else if (*port1) /* other any unexpected char */
-		ret = NULL;
+			port1 = "";
 
-	set_host_port(ret, porta);
+		if (str2ip(str2, &ss) == NULL) {
+			memprintf(err, "invalid address: '%s' in '%s'\n", str2, str);
+			goto out;
+		}
 
+		if (isdigit(*port1)) {	/* single port or range */
+			port2 = strchr(port1, '-');
+			if (port2)
+				*port2++ = '\0';
+			else
+				port2 = port1;
+			portl = atoi(port1);
+			porth = atoi(port2);
+			porta = portl;
+		}
+		else if (*port1 == '-') { /* negative offset */
+			portl = atoi(port1 + 1);
+			porta = -portl;
+		}
+		else if (*port1 == '+') { /* positive offset */
+			porth = atoi(port1 + 1);
+			porta = porth;
+		}
+		else if (*port1) { /* other any unexpected char */
+			memprintf(err, "invalid character '%c' in port number '%s' in '%s'\n", *port1, port1, str);
+			goto out;
+		}
+		set_host_port(&ss, porta);
+	}
+
+	ret = &ss;
  out:
 	if (low)
 		*low = portl;
 	if (high)
 		*high = porth;
-	free(str2);
+	free(back);
 	return ret;
 }
 
@@ -1921,6 +1994,83 @@ char *indent_msg(char **out, int level)
 	*out = ret;
 
 	return ret;
+}
+
+/* Convert occurrences of environment variables in the input string to their
+ * corresponding value. A variable is identified as a series of alphanumeric
+ * characters or underscores following a '$' sign. The <in> string must be
+ * free()able. NULL returns NULL. The resulting string might be reallocated if
+ * some expansion is made. Variable names may also be enclosed into braces if
+ * needed (eg: to concatenate alphanum characters).
+ */
+char *env_expand(char *in)
+{
+	char *txt_beg;
+	char *out;
+	char *txt_end;
+	char *var_beg;
+	char *var_end;
+	char *value;
+	char *next;
+	int out_len;
+	int val_len;
+
+	if (!in)
+		return in;
+
+	value = out = NULL;
+	out_len = 0;
+
+	txt_beg = in;
+	do {
+		/* look for next '$' sign in <in> */
+		for (txt_end = txt_beg; *txt_end && *txt_end != '$'; txt_end++);
+
+		if (!*txt_end && !out) /* end and no expansion performed */
+			return in;
+
+		val_len = 0;
+		next = txt_end;
+		if (*txt_end == '$') {
+			char save;
+
+			var_beg = txt_end + 1;
+			if (*var_beg == '{')
+				var_beg++;
+
+			var_end = var_beg;
+			while (isalnum((int)(unsigned char)*var_end) || *var_end == '_') {
+				var_end++;
+			}
+
+			next = var_end;
+			if (*var_end == '}' && (var_beg > txt_end + 1))
+				next++;
+
+			/* get value of the variable name at this location */
+			save = *var_end;
+			*var_end = '\0';
+			value = getenv(var_beg);
+			*var_end = save;
+			val_len = value ? strlen(value) : 0;
+		}
+
+		out = realloc(out, out_len + (txt_end - txt_beg) + val_len + 1);
+		if (txt_end > txt_beg) {
+			memcpy(out + out_len, txt_beg, txt_end - txt_beg);
+			out_len += txt_end - txt_beg;
+		}
+		if (val_len) {
+			memcpy(out + out_len, value, val_len);
+			out_len += val_len;
+		}
+		out[out_len] = 0;
+		txt_beg = next;
+	} while (*txt_beg);
+
+	/* here we know that <out> was allocated and that we don't need <in> anymore */
+	free(in);
+	return out;
 }
 
 /*

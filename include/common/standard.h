@@ -212,23 +212,6 @@ extern const char *invalid_char(const char *name);
 extern const char *invalid_domainchar(const char *name);
 
 /*
- * converts <str> to a struct sockaddr_un* which is locally allocated.
- * The format is "/path", where "/path" is a path to a UNIX domain socket.
- */
-struct sockaddr_un *str2sun(const char *str);
-
-/*
- * converts <str> to a struct sockaddr_storage* which is locally allocated. The
- * string is assumed to contain only an address, no port. The address can be a
- * dotted IPv4 address, an IPv6 address, a host name, or empty or "*" to
- * indicate INADDR_ANY. NULL is returned if the host part cannot be resolved.
- * The return address will only have the address family and the address set,
- * all other fields remain zero. The string is not supposed to be modified.
- * The IPv6 '::' address is IN6ADDR_ANY.
- */
-struct sockaddr_storage *str2ip(const char *str);
-
-/*
  * converts <str> to a locally allocated struct sockaddr_storage *, and a
  * port range consisting in two integers. The low and high end are always set
  * even if the port is unspecified, in which case (0,0) is returned. The low
@@ -239,8 +222,10 @@ struct sockaddr_storage *str2ip(const char *str);
  * address wants to ignore port, it must be terminated by a trailing colon (':').
  * The IPv6 '::' address is IN6ADDR_ANY, so in order to bind to a given port on
  * IPv6, use ":::port". NULL is returned if the host part cannot be resolved.
+ * If <pfx> is non-null, it is used as a string prefix before any path-based
+ * address (typically the path to a unix socket).
  */
-struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high);
+struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx);
 
 /* converts <str> to a struct in_addr containing a network mask. It can be
  * passed in dotted form (255.255.255.0) or in CIDR form (24). It returns 1
@@ -746,6 +731,14 @@ char *memprintf(char **out, const char *format, ...)
  *   free(err);
  */
 char *indent_msg(char **out, int level);
+
+/* Convert occurrences of environment variables in the input string to their
+ * corresponding value. A variable is identified as a series of alphanumeric
+ * characters or underscores following a '$' sign. The <in> string must be
+ * free()able. NULL returns NULL. The resulting string might be reallocated if
+ * some expansion is made.
+ */
+char *env_expand(char *in);
 
 /* debugging macro to emit messages using write() on fd #-1 so that strace sees
  * them.

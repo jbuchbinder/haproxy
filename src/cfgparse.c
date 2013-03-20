@@ -206,7 +206,8 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 	next = dupstr = strdup(str);
 
 	while (next && *next) {
-		struct sockaddr_storage ss;
+		struct sockaddr_storage ss, *ss2;
+		int fd = -1;
 
 		str = next;
 		/* 1) look for the end of the first address */
@@ -214,37 +215,12 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 			*next++ = 0;
 		}
 
-		if (*str == '/') {
-			/* sun_path during a soft_stop rename is <unix_bind_prefix><path>.<pid>.<bak|tmp> */
-			/* so compute max path */
-			int prefix_path_len = global.unix_bind.prefix ? strlen(global.unix_bind.prefix) : 0;
-			int max_path_len = (sizeof(((struct sockaddr_un *)&ss)->sun_path) - 1) - (prefix_path_len + 1 + 5 + 1 + 3);
+		ss2 = str2sa_range(str, &port, &end, err,
+		                   curproxy == global.stats_fe ? NULL : global.unix_bind.prefix);
+		if (!ss2)
+			goto fail;
 
-			if (strlen(str) > max_path_len) {
-				memprintf(err, "socket path '%s' too long (max %d)\n", str, max_path_len);
-				goto fail;
-			}
-
-			memset(&ss, 0, sizeof(ss));
-			ss.ss_family = AF_UNIX;
-			if (global.unix_bind.prefix) {
-				memcpy(((struct sockaddr_un *)&ss)->sun_path, global.unix_bind.prefix, prefix_path_len);
-				strcpy(((struct sockaddr_un *)&ss)->sun_path+prefix_path_len, str);
-			}
-			else {
-				strcpy(((struct sockaddr_un *)&ss)->sun_path, str);
-			}
-			port = end = 0;
-		}
-		else {
-			struct sockaddr_storage *ss2;
-
-			ss2 = str2sa_range(str, &port, &end);
-			if (!ss2) {
-				memprintf(err, "invalid listening address: '%s'\n", str);
-				goto fail;
-			}
-
+		if (ss2->ss_family == AF_INET || ss2->ss_family == AF_INET6) {
 			if (!port && !end) {
 				memprintf(err, "missing port number: '%s'\n", str);
 				goto fail;
@@ -254,9 +230,6 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 				memprintf(err, "port offsets are not allowed in 'bind': '%s'\n", str);
 				goto fail;
 			}
-
-			/* OK the address looks correct */
-			ss = *ss2;
 
 			if (port < 1 || port > 65535) {
 				memprintf(err, "invalid port '%d' specified for address '%s'.\n", port, str);
@@ -268,6 +241,27 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 				goto fail;
 			}
 		}
+		else if (ss2->ss_family == AF_UNSPEC) {
+			socklen_t addr_len;
+
+			/* We want to attach to an already bound fd whose number
+			 * is in the addr part of ss2 when cast to sockaddr_in.
+			 * Note that by definition there is a single listener.
+			 * We still have to determine the address family to
+			 * register the correct protocol.
+			 */
+			fd = ((struct sockaddr_in *)ss2)->sin_addr.s_addr;
+			addr_len = sizeof(*ss2);
+			if (getsockname(fd, (struct sockaddr *)ss2, &addr_len) == -1) {
+				memprintf(err, "cannot use file descriptor '%d' : %s.\n", fd, strerror(errno));
+				goto fail;
+			}
+
+			port = end = get_host_port(ss2);
+		}
+
+		/* OK the address looks correct */
+		ss = *ss2;
 
 		for (; port <= end; port++) {
 			l = (struct listener *)calloc(1, sizeof(struct listener));
@@ -277,7 +271,7 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 			l->frontend = curproxy;
 			l->bind_conf = bind_conf;
 
-			l->fd = -1;
+			l->fd = fd;
 			l->addr = ss;
 			l->xprt = &raw_sock;
 			l->state = LI_INIT;
@@ -1105,6 +1099,8 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 	}
 	else if (!strcmp(args[0], "log")) {  /* syslog server address */
+		struct sockaddr_storage *sk;
+		int port1, port2;
 		struct logsrv *logsrv;
 
 		if (*(args[1]) == 0 || *(args[2]) == 0) {
@@ -1142,28 +1138,16 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			}
 		}
 
-		if (args[1][0] == '/') {
-			struct sockaddr_storage *sk = (struct sockaddr_storage *)str2sun(args[1]);
-			if (!sk) {
-				Alert("parsing [%s:%d] : Socket path '%s' too long (max %d)\n", file, linenum,
-				      args[1], (int)sizeof(((struct sockaddr_un *)&sk)->sun_path) - 1);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				free(logsrv);
-				goto out;
-			}
-			logsrv->addr = *sk;
-		} else {
-			struct sockaddr_storage *sk;
-			int port1, port2;
+		sk = str2sa_range(args[1], &port1, &port2, &errmsg, NULL);
+		if (!sk) {
+			Alert("parsing [%s:%d] : '%s': %s\n", file, linenum, args[0], errmsg);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			free(logsrv);
+			goto out;
+		}
+		logsrv->addr = *sk;
 
-			sk = str2sa_range(args[1], &port1, &port2);
-			if (!sk) {
-				Alert("parsing [%s:%d] : '%s' : unknown host in '%s'\n", file, linenum, args[0], args[1]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				free(logsrv);
-				goto out;
-			}
-
+		if (sk->ss_family == AF_INET || sk->ss_family == AF_INET6) {
 			if (port1 != port2) {
 				Alert("parsing [%s:%d] : '%s' : port ranges and offsets are not allowed in '%s'\n",
 				      file, linenum, args[0], args[1]);
@@ -1452,14 +1436,21 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	struct bind_conf *bind_conf;
 	struct listener *l;
 	int err_code = 0;
+	char *errmsg = NULL;
 
 	if (strcmp(args[0], "peers") == 0) { /* new peers section */
+		if (!*args[1]) {
+			Alert("parsing [%s:%d] : missing name for peers section.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 
 		err = invalid_char(args[1]);
 		if (err) {
 			Alert("parsing [%s:%d] : character '%c' is not permitted in '%s' name '%s'.\n",
 			      file, linenum, *err, args[0], args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 
 		for (curpeers = peers; curpeers != NULL; curpeers = curpeers->next) {
@@ -1490,7 +1481,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	else if (strcmp(args[0], "peer") == 0) { /* peer definition */
 		struct sockaddr_storage *sk;
 		int port1, port2;
-		char *err_msg = NULL;
+		struct protocol *proto;
 
 		if (!*args[2]) {
 			Alert("parsing [%s:%d] : '%s' expects <name> and <addr>[:<port>] as arguments.\n",
@@ -1524,9 +1515,17 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		newpeer->last_change = now.tv_sec;
 		newpeer->id = strdup(args[1]);
 
-		sk = str2sa_range(args[2], &port1, &port2);
+		sk = str2sa_range(args[2], &port1, &port2, &errmsg, NULL);
 		if (!sk) {
-			Alert("parsing [%s:%d] : '%s %s' : unknown host in '%s'\n", file, linenum, args[0], args[1], args[2]);
+			Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		proto = protocol_by_family(sk->ss_family);
+		if (!proto || !proto->connect) {
+			Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
+			      file, linenum, args[0], args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -1546,16 +1545,9 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		}
 
 		newpeer->addr = *sk;
-		newpeer->proto = protocol_by_family(newpeer->addr.ss_family);
+		newpeer->proto = proto;
 		newpeer->xprt  = &raw_sock;
 		newpeer->sock_init_arg = NULL;
-
-		if (!newpeer->proto) {
-			Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
-			      file, linenum, newpeer->addr.ss_family, args[2]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
 
 		if (strcmp(newpeer->id, localpeer) == 0) {
 			/* Current is local peer, it define a frontend */
@@ -1584,15 +1576,14 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 
 				bind_conf = bind_conf_alloc(&curpeers->peers_fe->conf.bind, file, linenum, args[2]);
 
-				if (!str2listener(args[2], curpeers->peers_fe, bind_conf, file, linenum, &err_msg)) {
-					if (err_msg && *err_msg) {
-						indent_msg(&err_msg, 2);
-						Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err_msg);
+				if (!str2listener(args[2], curpeers->peers_fe, bind_conf, file, linenum, &errmsg)) {
+					if (errmsg && *errmsg) {
+						indent_msg(&errmsg, 2);
+						Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
 					}
 					else
 						Alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
 						      file, linenum, args[0], args[1], args[2]);
-					free(err_msg);
 					err_code |= ERR_FATAL;
 					goto out;
 				}
@@ -1624,6 +1615,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	}
 
 out:
+	free(errmsg);
 	return err_code;
 }
 
@@ -1708,19 +1700,17 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		/* parse the listener address if any */
 		if ((curproxy->cap & PR_CAP_FE) && *args[2]) {
 			struct listener *l;
-			char *err_msg = NULL;
 
 			bind_conf = bind_conf_alloc(&curproxy->conf.bind, file, linenum, args[2]);
 
-			if (!str2listener(args[2], curproxy, bind_conf, file, linenum, &err_msg)) {
-				if (err_msg && *err_msg) {
-					indent_msg(&err_msg, 2);
-					Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err_msg);
+			if (!str2listener(args[2], curproxy, bind_conf, file, linenum, &errmsg)) {
+				if (errmsg && *errmsg) {
+					indent_msg(&errmsg, 2);
+					Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
 				}
 				else
 					Alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address '%s'.\n",
 					      file, linenum, args[0], args[1], args[2]);
-				free(err_msg);
 				err_code |= ERR_FATAL;
 				goto out;
 			}
@@ -1948,7 +1938,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	if (!strcmp(args[0], "bind")) {  /* new listen addresses */
 		struct listener *l;
 		int cur_arg;
-		char *err_msg = NULL;
 
 		if (curproxy == &defproxy) {
 			Alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
@@ -1958,7 +1947,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		if (warnifnotcap(curproxy, PR_CAP_FE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
-		if ( *(args[1]) != '/' && strchr(args[1], ':') == NULL) {
+		if (!*(args[1])) {
 			Alert("parsing [%s:%d] : '%s' expects {<path>|[addr1]:port1[-end1]}{,[addr]:port[-end]}... as arguments.\n",
 			      file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -1976,15 +1965,14 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		 * are comma-separated IPs or port ranges. So all further processing
 		 * will have to be applied to all listeners created after last_listen.
 		 */
-		if (!str2listener(args[1], curproxy, bind_conf, file, linenum, &err_msg)) {
-			if (err_msg && *err_msg) {
-				indent_msg(&err_msg, 2);
-				Alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], err_msg);
+		if (!str2listener(args[1], curproxy, bind_conf, file, linenum, &errmsg)) {
+			if (errmsg && *errmsg) {
+				indent_msg(&errmsg, 2);
+				Alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], errmsg);
 			}
 			else
 				Alert("parsing [%s:%d] : '%s' : error encountered while parsing listening address '%s'.\n",
 				      file, linenum, args[0], args[1]);
-			free(err_msg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -3971,6 +3959,7 @@ stats_error_parsing:
 	else if (!strcmp(args[0], "dispatch")) {  /* dispatch address */
 		struct sockaddr_storage *sk;
 		int port1, port2;
+		struct protocol *proto;
 
 		if (curproxy == &defproxy) {
 			Alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
@@ -3980,9 +3969,17 @@ stats_error_parsing:
 		else if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
-		sk = str2sa_range(args[1], &port1, &port2);
+		sk = str2sa_range(args[1], &port1, &port2, &errmsg, NULL);
 		if (!sk) {
-			Alert("parsing [%s:%d] : '%s' : unknown host in '%s'\n", file, linenum, args[0], args[1]);
+			Alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], errmsg);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		proto = protocol_by_family(sk->ss_family);
+		if (!proto || !proto->connect) {
+			Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
+			      file, linenum, args[0], args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -4057,7 +4054,7 @@ stats_error_parsing:
 		}
 
 		err = invalid_char(args[1]);
-		if (err) {
+		if (err && !defsrv) {
 			Alert("parsing [%s:%d] : character '%c' is not permitted in server name '%s'.\n",
 			      file, linenum, *err, args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -4067,6 +4064,7 @@ stats_error_parsing:
 		if (!defsrv) {
 			struct sockaddr_storage *sk;
 			int port1, port2;
+			struct protocol *proto;
 
 			if ((newsrv = (struct server *)calloc(1, sizeof(struct server))) == NULL) {
 				Alert("parsing [%s:%d] : out of memory.\n", file, linenum);
@@ -4096,9 +4094,17 @@ stats_error_parsing:
 			 *  - IP:+N => port=+N, relative
 			 *  - IP:-N => port=-N, relative
 			 */
-			sk = str2sa_range(args[2], &port1, &port2);
+			sk = str2sa_range(args[2], &port1, &port2, &errmsg, NULL);
 			if (!sk) {
-				Alert("parsing [%s:%d] : Unknown host in '%s'\n", file, linenum, args[2]);
+				Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			proto = protocol_by_family(sk->ss_family);
+			if (!proto || !proto->connect) {
+				Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
+				      file, linenum, args[0], args[1]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
@@ -4262,14 +4268,24 @@ stats_error_parsing:
 			else if (!defsrv && !strcmp(args[cur_arg], "addr")) {
 				struct sockaddr_storage *sk;
 				int port1, port2;
+				struct protocol *proto;
 
-				sk = str2sa_range(args[cur_arg + 1], &port1, &port2);
+				sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL);
 				if (!sk) {
-					Alert("parsing [%s:%d] : '%s' : unknown host in '%s'\n",
+					Alert("parsing [%s:%d] : '%s' : %s\n",
+					      file, linenum, args[cur_arg], errmsg);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				proto = protocol_by_family(sk->ss_family);
+				if (!proto || !proto->connect) {
+					Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
 					      file, linenum, args[cur_arg], args[cur_arg + 1]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
+
 				if (port1 != port2) {
 					Alert("parsing [%s:%d] : '%s' : port ranges and offsets are not allowed in '%s'\n",
 					      file, linenum, args[cur_arg], args[cur_arg + 1]);
@@ -4447,6 +4463,7 @@ stats_error_parsing:
 			else if (!defsrv && !strcmp(args[cur_arg], "source")) {  /* address to which we bind when connecting */
 				int port_low, port_high;
 				struct sockaddr_storage *sk;
+				struct protocol *proto;
 
 				if (!*args[cur_arg + 1]) {
 					Alert("parsing [%s:%d] : '%s' expects <addr>[:<port>[-<port>]], and optionally '%s' <addr>, and '%s' <name> as argument.\n",
@@ -4454,13 +4471,24 @@ stats_error_parsing:
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
+
 				newsrv->conn_src.opts |= CO_SRC_BIND;
-				sk = str2sa_range(args[cur_arg + 1], &port_low, &port_high);
+				sk = str2sa_range(args[cur_arg + 1], &port_low, &port_high, &errmsg, NULL);
 				if (!sk) {
-					Alert("parsing [%s:%d] : Unknown host in '%s'\n", file, linenum, args[cur_arg + 1]);
+					Alert("parsing [%s:%d] : '%s %s' : %s\n",
+					      file, linenum, args[cur_arg], args[cur_arg+1], errmsg);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
+
+				proto = protocol_by_family(sk->ss_family);
+				if (!proto || !proto->connect) {
+					Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
+					      file, linenum, args[cur_arg], args[cur_arg+1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
 				newsrv->conn_src.source_addr = *sk;
 
 				if (port_low != port_high) {
@@ -4553,13 +4581,22 @@ stats_error_parsing:
 							struct sockaddr_storage *sk;
 							int port1, port2;
 
-							sk = str2sa_range(args[cur_arg + 1], &port1, &port2);
+							sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL);
 							if (!sk) {
-								Alert("parsing [%s:%d] : '%s' : unknown host in '%s'\n",
-								      file, linenum, args[cur_arg], args[cur_arg + 1]);
+								Alert("parsing [%s:%d] : '%s %s' : %s\n",
+								      file, linenum, args[cur_arg], args[cur_arg+1], errmsg);
 								err_code |= ERR_ALERT | ERR_FATAL;
 								goto out;
 							}
+
+							proto = protocol_by_family(sk->ss_family);
+							if (!proto || !proto->connect) {
+								Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
+								      file, linenum, args[cur_arg], args[cur_arg+1]);
+								err_code |= ERR_ALERT | ERR_FATAL;
+								goto out;
+							}
+
 							if (port1 != port2) {
 								Alert("parsing [%s:%d] : '%s' : port ranges and offsets are not allowed in '%s'\n",
 								      file, linenum, args[cur_arg], args[cur_arg + 1]);
@@ -4835,6 +4872,8 @@ stats_error_parsing:
 			}
 		}
 		else if (*(args[1]) && *(args[2])) {
+			struct sockaddr_storage *sk;
+			int port1, port2;
 
 			logsrv = calloc(1, sizeof(struct logsrv));
 
@@ -4868,27 +4907,16 @@ stats_error_parsing:
 				}
 			}
 
-			if (args[1][0] == '/') {
-				struct sockaddr_storage *sk = (struct sockaddr_storage *)str2sun(args[1]);
-				if (!sk) {
-					Alert("parsing [%s:%d] : Socket path '%s' too long (max %d)\n", file, linenum,
-					      args[1], (int)sizeof(((struct sockaddr_un *)sk)->sun_path) - 1);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				logsrv->addr = *sk;
-			} else {
-				struct sockaddr_storage *sk;
-				int port1, port2;
+			sk = str2sa_range(args[1], &port1, &port2, &errmsg, NULL);
+			if (!sk) {
+				Alert("parsing [%s:%d] : '%s': %s\n", file, linenum, args[0], errmsg);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
 
-				sk = str2sa_range(args[1], &port1, &port2);
-				if (!sk) {
-					Alert("parsing [%s:%d] : '%s' : unknown host in '%s'\n",
-					      file, linenum, args[0], args[1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
+			logsrv->addr = *sk;
 
+			if (sk->ss_family == AF_INET || sk->ss_family == AF_INET6) {
 				if (port1 != port2) {
 					Alert("parsing [%s:%d] : '%s' : port ranges and offsets are not allowed in '%s'\n",
 					      file, linenum, args[0], args[1]);
@@ -4896,7 +4924,6 @@ stats_error_parsing:
 					goto out;
 				}
 
-				logsrv->addr = *sk;
 				if (!port1)
 					set_host_port(&logsrv->addr, SYSLOG_PORT);
 			}
@@ -4914,6 +4941,7 @@ stats_error_parsing:
 		int cur_arg;
 		int port1, port2;
 		struct sockaddr_storage *sk;
+		struct protocol *proto;
 
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
@@ -4931,9 +4959,17 @@ stats_error_parsing:
 		curproxy->conn_src.iface_name = NULL;
 		curproxy->conn_src.iface_len = 0;
 
-		sk = str2sa_range(args[1], &port1, &port2);
+		sk = str2sa_range(args[1], &port1, &port2, &errmsg, NULL);
 		if (!sk) {
-			Alert("parsing [%s:%d] : '%s' : unknown host in '%s'\n",
+			Alert("parsing [%s:%d] : '%s %s' : %s\n",
+			      file, linenum, args[0], args[1], errmsg);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		proto = protocol_by_family(sk->ss_family);
+		if (!proto || !proto->connect) {
+			Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
 			      file, linenum, args[0], args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
@@ -5014,14 +5050,24 @@ stats_error_parsing:
 						goto out;
 					}
 				} else {
-					struct sockaddr_storage *sk = str2sa_range(args[cur_arg + 1], &port1, &port2);
+					struct sockaddr_storage *sk;
 
+					sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL);
 					if (!sk) {
-						Alert("parsing [%s:%d] : '%s' : unknown host in '%s'\n",
-						      file, linenum, args[cur_arg], args[cur_arg + 1]);
+						Alert("parsing [%s:%d] : '%s %s' : %s\n",
+						      file, linenum, args[cur_arg], args[cur_arg+1], errmsg);
 						err_code |= ERR_ALERT | ERR_FATAL;
 						goto out;
 					}
+
+					proto = protocol_by_family(sk->ss_family);
+					if (!proto || !proto->connect) {
+						Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
+						      file, linenum, args[cur_arg], args[cur_arg+1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+
 					if (port1 != port2) {
 						Alert("parsing [%s:%d] : '%s' : port ranges and offsets are not allowed in '%s'\n",
 						      file, linenum, args[cur_arg], args[cur_arg + 1]);
