@@ -2,7 +2,7 @@
  * include/proto/acl.h
  * This file provides interface definitions for ACL manipulation.
  *
- * Copyright (C) 2000-2011 Willy Tarreau - w@1wt.eu
+ * Copyright (C) 2000-2013 Willy Tarreau - w@1wt.eu
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -59,7 +59,7 @@ struct acl_keyword *find_acl_kw(const char *kw);
  * Right now, the only accepted syntax is :
  * <subject> [<value>...]
  */
-struct acl_expr *parse_acl_expr(const char **args, char **err);
+struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *al);
 
 /* Purge everything in the acl <acl>, then return <acl>. */
 struct acl *prune_acl(struct acl *acl);
@@ -70,7 +70,7 @@ struct acl *prune_acl(struct acl *acl);
  *
  * args syntax: <aclname> <acl_expr>
  */
-struct acl *parse_acl(const char **args, struct list *known_acl, char **err);
+struct acl *parse_acl(const char **args, struct list *known_acl, char **err, struct arg_list *al);
 
 /* Purge everything in the acl_cond <cond>, then return <cond>. */
 struct acl_cond *prune_acl_cond(struct acl_cond *cond);
@@ -79,13 +79,13 @@ struct acl_cond *prune_acl_cond(struct acl_cond *cond);
  * known ACLs passed in <known_acl>. The new condition is returned (or NULL in
  * case of low memory). Supports multiple conditions separated by "or".
  */
-struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int pol, char **err);
+struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl, int pol, char **err, struct arg_list *al);
 
 /* Builds an ACL condition starting at the if/unless keyword. The complete
  * condition is returned. NULL is returned in case of error or if the first
  * word is neither "if" nor "unless". It automatically sets the file name and
- * the line number in the condition for better error reporting, and adds the
- * ACL requirements to the proxy's acl_requires. If <err> is not NULL, it will
+ * the line number in the condition for better error reporting, and sets the
+ * HTTP initialization requirements in the proxy. If <err> is not NULL, it will
  * be set to an error message upon errors, that the caller will have to free.
  */
 struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, const char **args, char **err);
@@ -97,10 +97,20 @@ struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, co
  */
 int acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct session *l4, void *l7, unsigned int opt);
 
-/* Reports a pointer to the first ACL used in condition <cond> which requires
- * at least one of the USE_FLAGS in <require>. Returns NULL if none matches.
+/* Returns a pointer to the first ACL conflicting with usage at place <where>
+ * which is one of the SMP_VAL_* bits indicating a check place, or NULL if
+ * no conflict is found. Only full conflicts are detected (ACL is not usable).
+ * Use the next function to check for useless keywords.
  */
-struct acl *cond_find_require(const struct acl_cond *cond, unsigned int require);
+const struct acl *acl_cond_conflicts(const struct acl_cond *cond, unsigned int where);
+
+/* Returns a pointer to the first ACL and its first keyword to conflict with
+ * usage at place <where> which is one of the SMP_VAL_* bits indicating a check
+ * place. Returns true if a conflict is found, with <acl> and <kw> set (if non
+ * null), or false if not conflict is found. The first useless keyword is
+ * returned.
+ */
+int acl_cond_kw_conflicts(const struct acl_cond *cond, unsigned int where, struct acl const **acl, char const **kw);
 
 /*
  * Find targets for userlist and groups in acl. Function returns the number
@@ -123,6 +133,11 @@ void acl_register_keywords(struct acl_kw_list *kwl);
  * Unregisters the ACL keyword list <kwl> from the list of valid keywords.
  */
 void acl_unregister_keywords(struct acl_kw_list *kwl);
+
+/* initializes ACLs by resolving the sample fetch names they rely upon.
+ * Returns 0 on success, otherwise an error.
+ */
+int init_acl();
 
 
 /*
@@ -176,10 +191,6 @@ int acl_parse_reg(const char **text, struct acl_pattern *pattern, int *opaque, c
  * otherwise 0.
  */
 int acl_parse_ip(const char **text, struct acl_pattern *pattern, int *opaque, char **err);
-
-/* always fake a data retrieval */
-int acl_fetch_nothing(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                      const struct arg *args, struct sample *smp);
 
 /* always return false */
 int acl_match_nothing(struct sample *smp, struct acl_pattern *pattern);

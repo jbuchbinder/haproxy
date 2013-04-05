@@ -75,7 +75,6 @@ const struct chunk http_100_chunk = {
 /* Warning: no "connection" header is provided with the 3xx messages below */
 const char *HTTP_301 =
 	"HTTP/1.1 301 Moved Permanently\r\n"
-	"Cache-Control: no-cache\r\n"
 	"Content-length: 0\r\n"
 	"Location: "; /* not terminated since it will be concatenated with the URL */
 
@@ -89,6 +88,20 @@ const char *HTTP_302 =
 const char *HTTP_303 =
 	"HTTP/1.1 303 See Other\r\n"
 	"Cache-Control: no-cache\r\n"
+	"Content-length: 0\r\n"
+	"Location: "; /* not terminated since it will be concatenated with the URL */
+
+
+/* same as 302 except that the browser MUST retry with the same method */
+const char *HTTP_307 =
+	"HTTP/1.1 307 Temporary Redirect\r\n"
+	"Cache-Control: no-cache\r\n"
+	"Content-length: 0\r\n"
+	"Location: "; /* not terminated since it will be concatenated with the URL */
+
+/* same as 301 except that the browser MUST retry with the same method */
+const char *HTTP_308 =
+	"HTTP/1.1 308 Permanent Redirect\r\n"
 	"Content-length: 0\r\n"
 	"Location: "; /* not terminated since it will be concatenated with the URL */
 
@@ -206,6 +219,9 @@ const char *stat_status_codes[STAT_STATUS_SIZE] = {
  * on strlen().
  */
 struct chunk http_err_chunks[HTTP_ERR_SIZE];
+
+/* this struct is used between calls to smp_fetch_hdr() or smp_fetch_cookie() */
+static struct hdr_ctx static_hdr_ctx;
 
 #define FD_SETS_ARE_BITFIELDS
 #ifdef FD_SETS_ARE_BITFIELDS
@@ -1763,7 +1779,7 @@ static inline int http_parse_chunk_size(struct http_msg *msg)
 		c = hex2i(*ptr);
 		if (c < 0) /* not a hex digit anymore */
 			break;
-		if (++ptr >= end)
+		if (unlikely(++ptr >= end))
 			ptr = buf->data;
 		if (chunk & 0xF8000000) /* integer overflow will occur if result >= 2GB */
 			goto error;
@@ -1771,13 +1787,13 @@ static inline int http_parse_chunk_size(struct http_msg *msg)
 	}
 
 	/* empty size not allowed */
-	if (ptr == ptr_old)
+	if (unlikely(ptr == ptr_old))
 		goto error;
 
 	while (http_is_spht[(unsigned char)*ptr]) {
 		if (++ptr >= end)
 			ptr = buf->data;
-		if (ptr == stop)
+		if (unlikely(ptr == stop))
 			return 0;
 	}
 
@@ -1825,7 +1841,7 @@ static inline int http_parse_chunk_size(struct http_msg *msg)
 	 * which may or may not be present. We save that into ->next and
 	 * ->sov.
 	 */
-	if (ptr < ptr_old)
+	if (unlikely(ptr < ptr_old))
 		msg->sov += buf->size;
 	msg->sov += ptr - ptr_old;
 	msg->next = buffer_count(buf, buf->p, ptr);
@@ -1955,7 +1971,7 @@ static inline int http_skip_chunk_crlf(struct http_msg *msg)
 	}
 
 	ptr++;
-	if (ptr >= buf->data + buf->size)
+	if (unlikely(ptr >= buf->data + buf->size))
 		ptr = buf->data;
 	/* prepare the CRLF to be forwarded (between ->sol and ->sov) */
 	msg->sol = 0;
@@ -2979,7 +2995,7 @@ int http_handle_stats(struct session *s, struct channel *req)
 		 * the browse to the stats page with a GET.
 		 */
 		chunk_printf(&trash,
-		             "HTTP/1.0 303 See Other\r\n"
+		             "HTTP/1.1 303 See Other\r\n"
 		             "Cache-Control: no-cache\r\n"
 		             "Content-Type: text/plain\r\n"
 		             "Connection: close\r\n"
@@ -3140,6 +3156,12 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct session *
 
 	/* build redirect message */
 	switch(rule->code) {
+	case 308:
+		msg_fmt = HTTP_308;
+		break;
+	case 307:
+		msg_fmt = HTTP_307;
+		break;
 	case 303:
 		msg_fmt = HTTP_303;
 		break;
@@ -4162,8 +4184,11 @@ int http_send_name_header(struct http_txn *txn, struct proxy* be, const char* sr
 	if (old_o) {
 		/* If this was a forwarded request, we must readjust the amount of
 		 * data to be forwarded in order to take into account the size
-		 * variations.
+		 * variations. Note that if the request was already scheduled for
+		 * forwarding, it had its req->sol pointing to the body, which
+		 * must then be updated too.
 		 */
+		txn->req.sol += chn->buf->i - old_i;
 		b_adv(chn->buf, old_o + chn->buf->i - old_i);
 	}
 
@@ -5762,6 +5787,7 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 	static struct buffer *tmpbuf = NULL;
 	int compressing = 0;
 	int consumed_data = 0;
+	int ret;
 
 	if (unlikely(msg->msg_state < HTTP_MSG_BODY))
 		return 0;
@@ -5802,7 +5828,7 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 	}
 
 	if (s->comp_algo != NULL) {
-		int ret = http_compression_buffer_init(s, res->buf, tmpbuf); /* init a buffer with headers */
+		ret = http_compression_buffer_init(s, res->buf, tmpbuf); /* init a buffer with headers */
 		if (ret < 0)
 			goto missing_data; /* not enough spaces in buffers */
 		compressing = 1;
@@ -5821,10 +5847,8 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 			}
 		}
 
-		if (msg->msg_state == HTTP_MSG_DATA) {
-			int ret;
-
-			/* must still forward */
+		switch (msg->msg_state - HTTP_MSG_DATA) {
+		case HTTP_MSG_DATA - HTTP_MSG_DATA:	/* must still forward */
 			if (compressing) {
 				consumed_data += ret = http_compression_buffer_add_data(s, res->buf, tmpbuf);
 				if (ret < 0)
@@ -5843,15 +5867,37 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 					http_compression_buffer_end(s, &res->buf, &tmpbuf, 1);
 					compressing = 0;
 				}
+				break;
 			}
-		}
-		else if (msg->msg_state == HTTP_MSG_CHUNK_SIZE) {
+			/* fall through for HTTP_MSG_CHUNK_CRLF */
+
+		case HTTP_MSG_CHUNK_CRLF - HTTP_MSG_DATA:
+			/* we want the CRLF after the data */
+
+			ret = http_skip_chunk_crlf(msg);
+			if (ret == 0)
+				goto missing_data;
+			else if (ret < 0) {
+				if (msg->err_pos >= 0)
+					http_capture_bad_message(&s->be->invalid_rep, s, msg, HTTP_MSG_CHUNK_CRLF, s->fe);
+				goto return_bad_res;
+			}
+			/* skipping data in buffer for compression */
+			if (compressing) {
+				b_adv(res->buf, msg->next);
+				msg->next = 0;
+				msg->sov = 0;
+				msg->sol = 0;
+			}
+			/* we're in MSG_CHUNK_SIZE now, fall through */
+
+		case HTTP_MSG_CHUNK_SIZE - HTTP_MSG_DATA:
 			/* read the chunk size and assign it to ->chunk_len, then
 			 * set ->sov and ->next to point to the body and switch to DATA or
 			 * TRAILERS state.
 			 */
-			int ret = http_parse_chunk_size(msg);
 
+			ret = http_parse_chunk_size(msg);
 			if (ret == 0)
 				goto missing_data;
 			else if (ret < 0) {
@@ -5873,31 +5919,11 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 					}
 				}
 			}
-		/* otherwise we're in HTTP_MSG_DATA or HTTP_MSG_TRAILERS state */
-		}
-		else if (msg->msg_state == HTTP_MSG_CHUNK_CRLF) {
-			/* we want the CRLF after the data */
-			int ret = http_skip_chunk_crlf(msg);
+			/* otherwise we're in HTTP_MSG_DATA or HTTP_MSG_TRAILERS state */
+			break;
 
-			if (ret == 0)
-				goto missing_data;
-			else if (ret < 0) {
-				if (msg->err_pos >= 0)
-					http_capture_bad_message(&s->be->invalid_rep, s, msg, HTTP_MSG_CHUNK_CRLF, s->fe);
-				goto return_bad_res;
-			}
-			/* skipping data in buffer for compression */
-			if (compressing) {
-				b_adv(res->buf, msg->next);
-				msg->next = 0;
-				msg->sov = 0;
-				msg->sol = 0;
-			}
-			/* we're in MSG_CHUNK_SIZE now */
-		}
-		else if (msg->msg_state == HTTP_MSG_TRAILERS) {
-			int ret = http_forward_trailers(msg);
-
+		case HTTP_MSG_TRAILERS - HTTP_MSG_DATA:
+			ret = http_forward_trailers(msg);
 			if (ret == 0)
 				goto missing_data;
 			else if (ret < 0) {
@@ -5910,11 +5936,15 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 				channel_forward(res, msg->next);
 				msg->next = 0;
 			}
-			/* we're in HTTP_MSG_DONE now */
-		}
-		else {
-			int old_state = msg->msg_state;
+			/* we're in HTTP_MSG_DONE now, but we might still have
+			 * some data pending, so let's loop over once.
+			 */
+			break;
+
+		default:
 			/* other states, DONE...TUNNEL */
+
+			ret = msg->msg_state;
 			/* for keep-alive we don't want to forward closes on DONE */
 			if ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL ||
 			    (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL)
@@ -5932,7 +5962,7 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 						goto aborted_xfer;
 					}
 					if (msg->err_pos >= 0)
-						http_capture_bad_message(&s->be->invalid_rep, s, msg, old_state, s->fe);
+						http_capture_bad_message(&s->be->invalid_rep, s, msg, ret, s->fe);
 					goto return_bad_res;
 				}
 				return 1;
@@ -8100,7 +8130,8 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		rule->action = *args[0] == 'a' ? HTTP_REQ_ACT_ADD_HDR : HTTP_REQ_ACT_SET_HDR;
 		cur_arg = 1;
 
-		if (!*args[cur_arg] || !*args[cur_arg+1] || *args[cur_arg+2]) {
+		if (!*args[cur_arg] || !*args[cur_arg+1] ||
+		    (*args[cur_arg+2] && strcmp(args[cur_arg+2], "if") != 0 && strcmp(args[cur_arg+2], "unless") != 0)) {
 			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 2 arguments.\n",
 			      file, linenum, args[0]);
 			goto out_err;
@@ -8109,7 +8140,10 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		rule->arg.hdr_add.name = strdup(args[cur_arg]);
 		rule->arg.hdr_add.name_len = strlen(rule->arg.hdr_add.name);
 		LIST_INIT(&rule->arg.hdr_add.fmt);
-		parse_logformat_string(args[cur_arg + 1], proxy, &rule->arg.hdr_add.fmt, LOG_OPT_MANDATORY);
+
+		proxy->conf.args.ctx = ARGC_HDR;
+		parse_logformat_string(args[cur_arg + 1], proxy, &rule->arg.hdr_add.fmt, 0,
+				       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR);
 		cur_arg += 2;
 	} else if (strcmp(args[0], "redirect") == 0) {
 		struct redirect_rule *redir;
@@ -8225,9 +8259,9 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 
 			cur_arg++;
 			code = atol(args[cur_arg]);
-			if (code < 301 || code > 303) {
+			if (code < 301 || code > 308 || (code > 303 && code < 307)) {
 				memprintf(errmsg,
-				          "'%s': unsupported HTTP code '%s' (must be a number between 301 and 303)",
+				          "'%s': unsupported HTTP code '%s' (must be one of 301, 302, 303, 307 or 308)",
 				          args[cur_arg - 1], args[cur_arg]);
 				return NULL;
 			}
@@ -8330,6 +8364,13 @@ acl_prefetch_http(struct proxy *px, struct session *s, void *l7, unsigned int op
 		if (unlikely(!s->req))
 			return 0;
 
+		/* If the buffer does not leave enough free space at the end,
+		 * we must first realign it.
+		 */
+		if (s->req->buf->p > s->req->buf->data &&
+		    s->req->buf->i + s->req->buf->p > s->req->buf->data + s->req->buf->size - global.tune.maxrewrite)
+			buffer_slow_realign(s->req->buf);
+
 		if (unlikely(txn->req.msg_state < HTTP_MSG_BODY)) {
 			if ((msg->msg_state == HTTP_MSG_ERROR) ||
 			    buffer_full(s->req->buf, global.tune.maxrewrite)) {
@@ -8357,6 +8398,18 @@ acl_prefetch_http(struct proxy *px, struct session *s, void *l7, unsigned int op
 			 * preparation to perform so that further checks can rely
 			 * on HTTP tests.
 			 */
+
+			/* If the request was parsed but was too large, we must absolutely
+			 * return an error so that it is not processed. At the moment this
+			 * cannot happen, but if the parsers are to change in the future,
+			 * we want this check to be maintained.
+			 */
+			if (unlikely(s->req->buf->i + s->req->buf->p >
+				     s->req->buf->data + s->req->buf->size - global.tune.maxrewrite)) {
+				msg->msg_state = HTTP_MSG_ERROR;
+				return 1;
+			}
+
 			txn->meth = find_http_meth(msg->chn->buf->p, msg->sl.rq.m_l);
 			if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 				s->flags |= SN_REDIRECTABLE;
@@ -8421,7 +8474,7 @@ static int acl_parse_meth(const char **text, struct acl_pattern *pattern, int *o
  * This is intended to be used with acl_match_meth() only.
  */
 static int
-acl_fetch_meth(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_meth(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                const struct arg *args, struct sample *smp)
 {
 	int meth;
@@ -8472,22 +8525,8 @@ static int acl_match_meth(struct sample *smp, struct acl_pattern *pattern)
 	return ACL_PAT_PASS;
 }
 
-/* 2. Check on Request/Status Version
- * We simply compare strings here.
- */
-static int acl_parse_ver(const char **text, struct acl_pattern *pattern, int *opaque, char **err)
-{
-	pattern->ptr.str = strdup(*text);
-	if (!pattern->ptr.str) {
-		memprintf(err, "out of memory while loading pattern");
-		return 0;
-	}
-	pattern->len = strlen(*text);
-	return 1;
-}
-
 static int
-acl_fetch_rqver(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_rqver(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                 const struct arg *args, struct sample *smp)
 {
 	struct http_txn *txn = l7;
@@ -8512,7 +8551,7 @@ acl_fetch_rqver(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 }
 
 static int
-acl_fetch_stver(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_stver(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                 const struct arg *args, struct sample *smp)
 {
 	struct http_txn *txn = l7;
@@ -8541,7 +8580,7 @@ acl_fetch_stver(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 
 /* 3. Check on Status Code. We manipulate integers here. */
 static int
-acl_fetch_stcode(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_stcode(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                  const struct arg *args, struct sample *smp)
 {
 	struct http_txn *txn = l7;
@@ -8636,11 +8675,18 @@ smp_fetch_hdr(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 {
 	struct http_txn *txn = l7;
 	struct hdr_idx *idx = &txn->hdr_idx;
-	struct hdr_ctx *ctx = (struct hdr_ctx *)smp->ctx.a;
+	struct hdr_ctx *ctx = smp->ctx.a[0];
 	const struct http_msg *msg = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_REQ) ? &txn->req : &txn->rsp;
 	int occ = 0;
 	const char *name_str = NULL;
 	int name_len = 0;
+
+	if (!ctx) {
+		/* first call */
+		ctx = &static_hdr_ctx;
+		ctx->idx = 0;
+		smp->ctx.a[0] = ctx;
+	}
 
 	if (args) {
 		if (args[0].type != ARGT_STR)
@@ -8917,7 +8963,7 @@ smp_fetch_base32_src(struct proxy *px, struct session *l4, void *l7, unsigned in
 }
 
 static int
-acl_fetch_proto_http(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_proto_http(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                      const struct arg *args, struct sample *smp)
 {
 	/* Note: hdr_idx.v cannot be NULL in this ACL because the ACL is tagged
@@ -8933,7 +8979,7 @@ acl_fetch_proto_http(struct proxy *px, struct session *l4, void *l7, unsigned in
 
 /* return a valid test if the current request is the first one on the connection */
 static int
-acl_fetch_http_first_req(struct proxy *px, struct session *s, void *l7, unsigned int opt,
+smp_fetch_http_first_req(struct proxy *px, struct session *s, void *l7, unsigned int opt,
                          const struct arg *args, struct sample *smp)
 {
 	if (!s)
@@ -8946,7 +8992,7 @@ acl_fetch_http_first_req(struct proxy *px, struct session *s, void *l7, unsigned
 
 /* Accepts exactly 1 argument of type userlist */
 static int
-acl_fetch_http_auth(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_http_auth(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                     const struct arg *args, struct sample *smp)
 {
 
@@ -8965,7 +9011,7 @@ acl_fetch_http_auth(struct proxy *px, struct session *l4, void *l7, unsigned int
 
 /* Accepts exactly 1 argument of type userlist */
 static int
-acl_fetch_http_auth_grp(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_http_auth_grp(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                         const struct arg *args, struct sample *smp)
 {
 
@@ -9092,7 +9138,7 @@ extract_cookie_value(char *hdr, const char *hdr_end,
 
 /* Iterate over all cookies present in a message. The context is stored in
  * smp->ctx.a[0] for the in-header position, smp->ctx.a[1] for the
- * end-of-header-value, and smp->ctx.a[2] for the hdr_idx. Depending on
+ * end-of-header-value, and smp->ctx.a[2] for the hdr_ctx. Depending on
  * the direction, multiple cookies may be parsed on the same line or not.
  * The cookie name is in args and the name length in args->data.str.len.
  * Accepts exactly 1 argument of type string. If the input options indicate
@@ -9104,7 +9150,7 @@ smp_fetch_cookie(struct proxy *px, struct session *l4, void *l7, unsigned int op
 {
 	struct http_txn *txn = l7;
 	struct hdr_idx *idx = &txn->hdr_idx;
-	struct hdr_ctx *ctx = (struct hdr_ctx *)&smp->ctx.a[2];
+	struct hdr_ctx *ctx = smp->ctx.a[2];
 	const struct http_msg *msg;
 	const char *hdr_name;
 	int hdr_name_len;
@@ -9114,6 +9160,13 @@ smp_fetch_cookie(struct proxy *px, struct session *l4, void *l7, unsigned int op
 
 	if (!args || args->type != ARGT_STR)
 		return 0;
+
+	if (!ctx) {
+		/* first call */
+		ctx = &static_hdr_ctx;
+		ctx->idx = 0;
+		smp->ctx.a[2] = ctx;
+	}
 
 	CHECK_HTTP_MESSAGE_FIRST();
 
@@ -9190,7 +9243,7 @@ smp_fetch_cookie(struct proxy *px, struct session *l4, void *l7, unsigned int op
  * Accepts exactly 1 argument of type string.
  */
 static int
-acl_fetch_cookie_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+smp_fetch_cookie_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                      const struct arg *args, struct sample *smp)
 {
 	struct http_txn *txn = l7;
@@ -9429,105 +9482,106 @@ static int val_hdr(struct arg *arg, char **err_msg)
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {{ },{
-	{ "base",            acl_parse_str,     smp_fetch_base,           acl_match_str,     ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, 0 },
-	{ "base_beg",        acl_parse_str,     smp_fetch_base,           acl_match_beg,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "base_dir",        acl_parse_str,     smp_fetch_base,           acl_match_dir,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "base_dom",        acl_parse_str,     smp_fetch_base,           acl_match_dom,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "base_end",        acl_parse_str,     smp_fetch_base,           acl_match_end,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "base_len",        acl_parse_int,     smp_fetch_base,           acl_match_len,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "base_reg",        acl_parse_reg,     smp_fetch_base,           acl_match_reg,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "base_sub",        acl_parse_str,     smp_fetch_base,           acl_match_sub,     ACL_USE_L7REQ_VOLATILE, 0 },
+	{ "base",            "base",          acl_parse_str,     acl_match_str     },
+	{ "base_beg",        "base",          acl_parse_str,     acl_match_beg     },
+	{ "base_dir",        "base",          acl_parse_str,     acl_match_dir     },
+	{ "base_dom",        "base",          acl_parse_str,     acl_match_dom     },
+	{ "base_end",        "base",          acl_parse_str,     acl_match_end     },
+	{ "base_len",        "base",          acl_parse_int,     acl_match_len     },
+	{ "base_reg",        "base",          acl_parse_reg,     acl_match_reg     },
+	{ "base_sub",        "base",          acl_parse_str,     acl_match_sub     },
 
-	{ "cook",            acl_parse_str,     smp_fetch_cookie,         acl_match_str,     ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, ARG1(0,STR) },
-	{ "cook_beg",        acl_parse_str,     smp_fetch_cookie,         acl_match_beg,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_cnt",        acl_parse_int,     acl_fetch_cookie_cnt,     acl_match_int,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_dir",        acl_parse_str,     smp_fetch_cookie,         acl_match_dir,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_dom",        acl_parse_str,     smp_fetch_cookie,         acl_match_dom,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_end",        acl_parse_str,     smp_fetch_cookie,         acl_match_end,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_len",        acl_parse_int,     smp_fetch_cookie,         acl_match_len,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_reg",        acl_parse_reg,     smp_fetch_cookie,         acl_match_reg,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_sub",        acl_parse_str,     smp_fetch_cookie,         acl_match_sub,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "cook_val",        acl_parse_int,     smp_fetch_cookie_val,     acl_match_int,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
+	{ "cook",            "req.cook",      acl_parse_str,     acl_match_str     },
+	{ "cook_beg",        "req.cook",      acl_parse_str,     acl_match_beg     },
+	{ "cook_cnt",        "req.cook_cnt",  acl_parse_int,     acl_match_int     },
+	{ "cook_dir",        "req.cook",      acl_parse_str,     acl_match_dir     },
+	{ "cook_dom",        "req.cook",      acl_parse_str,     acl_match_dom     },
+	{ "cook_end",        "req.cook",      acl_parse_str,     acl_match_end     },
+	{ "cook_len",        "req.cook",      acl_parse_int,     acl_match_len     },
+	{ "cook_reg",        "req.cook",      acl_parse_reg,     acl_match_reg     },
+	{ "cook_sub",        "req.cook",      acl_parse_str,     acl_match_sub     },
+	{ "cook_val",        "req.cook_val",  acl_parse_int,     acl_match_int     },
 
-	{ "hdr",             acl_parse_str,     smp_fetch_hdr,            acl_match_str,     ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_beg",         acl_parse_str,     smp_fetch_hdr,            acl_match_beg,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_cnt",         acl_parse_int,     smp_fetch_hdr_cnt,        acl_match_int,     ACL_USE_L7REQ_VOLATILE, ARG1(0,STR) },
-	{ "hdr_dir",         acl_parse_str,     smp_fetch_hdr,            acl_match_dir,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_dom",         acl_parse_str,     smp_fetch_hdr,            acl_match_dom,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_end",         acl_parse_str,     smp_fetch_hdr,            acl_match_end,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_ip",          acl_parse_ip,      smp_fetch_hdr_ip,         acl_match_ip,      ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_len",         acl_parse_int,     smp_fetch_hdr,            acl_match_len,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_reg",         acl_parse_reg,     smp_fetch_hdr,            acl_match_reg,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_sub",         acl_parse_str,     smp_fetch_hdr,            acl_match_sub,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "hdr_val",         acl_parse_int,     smp_fetch_hdr_val,        acl_match_int,     ACL_USE_L7REQ_VOLATILE, ARG2(0,STR,SINT), val_hdr },
+	{ "hdr",             "req.hdr",       acl_parse_str,     acl_match_str     },
+	{ "hdr_beg",         "req.hdr",       acl_parse_str,     acl_match_beg     },
+	{ "hdr_cnt",         "req.hdr_cnt",   acl_parse_int,     acl_match_int     },
+	{ "hdr_dir",         "req.hdr",       acl_parse_str,     acl_match_dir     },
+	{ "hdr_dom",         "req.hdr",       acl_parse_str,     acl_match_dom     },
+	{ "hdr_end",         "req.hdr",       acl_parse_str,     acl_match_end     },
+	{ "hdr_ip",          "req.hdr_ip",    acl_parse_ip,      acl_match_ip      },
+	{ "hdr_len",         "req.hdr",       acl_parse_int,     acl_match_len     },
+	{ "hdr_reg",         "req.hdr",       acl_parse_reg,     acl_match_reg     },
+	{ "hdr_sub",         "req.hdr",       acl_parse_str,     acl_match_sub     },
+	{ "hdr_val",         "req.hdr_val",   acl_parse_int,     acl_match_int     },
 
-	{ "http_auth",       acl_parse_nothing, acl_fetch_http_auth,      acl_match_nothing, ACL_USE_L7REQ_VOLATILE, ARG1(0,USR) },
-	{ "http_auth_group", acl_parse_strcat,  acl_fetch_http_auth_grp,  acl_match_auth,    ACL_USE_L7REQ_VOLATILE, ARG1(0,USR) },
-	{ "http_first_req",  acl_parse_nothing, acl_fetch_http_first_req, acl_match_nothing, ACL_USE_L7REQ_PERMANENT, 0 },
+	{ "http_auth",       NULL,            acl_parse_nothing, acl_match_nothing },
+	{ "http_auth_group", NULL,            acl_parse_strcat,  acl_match_auth    },
 
-	{ "method",          acl_parse_meth,    acl_fetch_meth,           acl_match_meth,    ACL_USE_L7REQ_PERMANENT, 0 },
+	{ "http_first_req",  NULL,            acl_parse_nothing, acl_match_nothing },
 
-	{ "path",            acl_parse_str,     smp_fetch_path,           acl_match_str,     ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, 0 },
-	{ "path_beg",        acl_parse_str,     smp_fetch_path,           acl_match_beg,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "path_dir",        acl_parse_str,     smp_fetch_path,           acl_match_dir,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "path_dom",        acl_parse_str,     smp_fetch_path,           acl_match_dom,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "path_end",        acl_parse_str,     smp_fetch_path,           acl_match_end,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "path_len",        acl_parse_int,     smp_fetch_path,           acl_match_len,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "path_reg",        acl_parse_reg,     smp_fetch_path,           acl_match_reg,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "path_sub",        acl_parse_str,     smp_fetch_path,           acl_match_sub,     ACL_USE_L7REQ_VOLATILE, 0 },
+	{ "method",          NULL,            acl_parse_meth,    acl_match_meth    },
 
-	{ "req_proto_http",  acl_parse_nothing, acl_fetch_proto_http,     acl_match_nothing, ACL_USE_L7REQ_PERMANENT, 0 },
-	{ "req_ver",         acl_parse_ver,     acl_fetch_rqver,          acl_match_str,     ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, 0 },
-	{ "resp_ver",        acl_parse_ver,     acl_fetch_stver,          acl_match_str,     ACL_USE_L7RTR_VOLATILE|ACL_MAY_LOOKUP, 0 },
+	{ "path",            "path",          acl_parse_str,     acl_match_str     },
+	{ "path_beg",        "path",          acl_parse_str,     acl_match_beg     },
+	{ "path_dir",        "path",          acl_parse_str,     acl_match_dir     },
+	{ "path_dom",        "path",          acl_parse_str,     acl_match_dom     },
+	{ "path_end",        "path",          acl_parse_str,     acl_match_end     },
+	{ "path_len",        "path",          acl_parse_int,     acl_match_len     },
+	{ "path_reg",        "path",          acl_parse_reg,     acl_match_reg     },
+	{ "path_sub",        "path",          acl_parse_str,     acl_match_sub     },
 
-	{ "scook",           acl_parse_str,     smp_fetch_cookie,         acl_match_str,     ACL_USE_L7RTR_VOLATILE|ACL_MAY_LOOKUP, ARG1(0,STR) },
-	{ "scook_beg",       acl_parse_str,     smp_fetch_cookie,         acl_match_beg,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_cnt",       acl_parse_int,     acl_fetch_cookie_cnt,     acl_match_int,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_dir",       acl_parse_str,     smp_fetch_cookie,         acl_match_dir,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_dom",       acl_parse_str,     smp_fetch_cookie,         acl_match_dom,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_end",       acl_parse_str,     smp_fetch_cookie,         acl_match_end,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_len",       acl_parse_int,     smp_fetch_cookie,         acl_match_len,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_reg",       acl_parse_reg,     smp_fetch_cookie,         acl_match_reg,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_sub",       acl_parse_str,     smp_fetch_cookie,         acl_match_sub,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "scook_val",       acl_parse_int,     smp_fetch_cookie_val,     acl_match_int,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
+	{ "req_proto_http",  "req.proto_http",acl_parse_nothing, acl_match_nothing },
+	{ "req_ver",         "req.ver",       acl_parse_str,     acl_match_str     },
+	{ "resp_ver",        "res.ver",       acl_parse_str,     acl_match_str     },
 
-	{ "shdr",            acl_parse_str,     smp_fetch_hdr,            acl_match_str,     ACL_USE_L7RTR_VOLATILE|ACL_MAY_LOOKUP, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_beg",        acl_parse_str,     smp_fetch_hdr,            acl_match_beg,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_cnt",        acl_parse_int,     smp_fetch_hdr_cnt,        acl_match_int,     ACL_USE_L7RTR_VOLATILE, ARG1(0,STR) },
-	{ "shdr_dir",        acl_parse_str,     smp_fetch_hdr,            acl_match_dir,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_dom",        acl_parse_str,     smp_fetch_hdr,            acl_match_dom,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_end",        acl_parse_str,     smp_fetch_hdr,            acl_match_end,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_ip",         acl_parse_ip,      smp_fetch_hdr_ip,         acl_match_ip,      ACL_USE_L7RTR_VOLATILE|ACL_MAY_LOOKUP, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_len",        acl_parse_int,     smp_fetch_hdr,            acl_match_len,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_reg",        acl_parse_reg,     smp_fetch_hdr,            acl_match_reg,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_sub",        acl_parse_str,     smp_fetch_hdr,            acl_match_sub,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
-	{ "shdr_val",        acl_parse_int,     smp_fetch_hdr_val,        acl_match_int,     ACL_USE_L7RTR_VOLATILE, ARG2(0,STR,SINT), val_hdr },
+	{ "scook",           "res.cook",      acl_parse_str,     acl_match_str     },
+	{ "scook_beg",       "res.cook",      acl_parse_str,     acl_match_beg     },
+	{ "scook_cnt",       "res.cook_cnt",  acl_parse_int,     acl_match_int     },
+	{ "scook_dir",       "res.cook",      acl_parse_str,     acl_match_dir     },
+	{ "scook_dom",       "res.cook",      acl_parse_str,     acl_match_dom     },
+	{ "scook_end",       "res.cook",      acl_parse_str,     acl_match_end     },
+	{ "scook_len",       "res.cook",      acl_parse_int,     acl_match_len     },
+	{ "scook_reg",       "res.cook",      acl_parse_reg,     acl_match_reg     },
+	{ "scook_sub",       "res.cook",      acl_parse_str,     acl_match_sub     },
+	{ "scook_val",       "res.cook_val",  acl_parse_int,     acl_match_int     },
 
-	{ "status",          acl_parse_int,     acl_fetch_stcode,         acl_match_int,     ACL_USE_L7RTR_PERMANENT, 0 },
+	{ "shdr",            "res.hdr",       acl_parse_str,     acl_match_str     },
+	{ "shdr_beg",        "res.hdr",       acl_parse_str,     acl_match_beg     },
+	{ "shdr_cnt",        "res.hdr_cnt",   acl_parse_int,     acl_match_int     },
+	{ "shdr_dir",        "res.hdr",       acl_parse_str,     acl_match_dir     },
+	{ "shdr_dom",        "res.hdr",       acl_parse_str,     acl_match_dom     },
+	{ "shdr_end",        "res.hdr",       acl_parse_str,     acl_match_end     },
+	{ "shdr_ip",         "res.hdr_ip",    acl_parse_ip,      acl_match_ip      },
+	{ "shdr_len",        "res.hdr",       acl_parse_int,     acl_match_len     },
+	{ "shdr_reg",        "res.hdr",       acl_parse_reg,     acl_match_reg     },
+	{ "shdr_sub",        "res.hdr",       acl_parse_str,     acl_match_sub     },
+	{ "shdr_val",        "res.hdr_val",   acl_parse_int,     acl_match_int     },
 
-	{ "url",             acl_parse_str,     smp_fetch_url,            acl_match_str,     ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, 0 },
-	{ "url_beg",         acl_parse_str,     smp_fetch_url,            acl_match_beg,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "url_dir",         acl_parse_str,     smp_fetch_url,            acl_match_dir,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "url_dom",         acl_parse_str,     smp_fetch_url,            acl_match_dom,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "url_end",         acl_parse_str,     smp_fetch_url,            acl_match_end,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "url_ip",          acl_parse_ip,      smp_fetch_url_ip,         acl_match_ip,      ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, 0 },
-	{ "url_len",         acl_parse_int,     smp_fetch_url,            acl_match_len,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "url_port",        acl_parse_int,     smp_fetch_url_port,       acl_match_int,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "url_reg",         acl_parse_reg,     smp_fetch_url,            acl_match_reg,     ACL_USE_L7REQ_VOLATILE, 0 },
-	{ "url_sub",         acl_parse_str,     smp_fetch_url,            acl_match_sub,     ACL_USE_L7REQ_VOLATILE, 0 },
+	{ "status",          NULL,            acl_parse_int,     acl_match_int     },
 
-	{ "urlp",            acl_parse_str,     smp_fetch_url_param,      acl_match_str,     ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, ARG1(1,STR) },
-	{ "urlp_beg",        acl_parse_str,     smp_fetch_url_param,      acl_match_beg,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
-	{ "urlp_dir",        acl_parse_str,     smp_fetch_url_param,      acl_match_dir,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
-	{ "urlp_dom",        acl_parse_str,     smp_fetch_url_param,      acl_match_dom,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
-	{ "urlp_end",        acl_parse_str,     smp_fetch_url_param,      acl_match_end,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
-	{ "urlp_ip",         acl_parse_ip,      smp_fetch_url_param,      acl_match_ip,      ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP, ARG1(1,STR) },
-	{ "urlp_len",        acl_parse_int,     smp_fetch_url_param,      acl_match_len,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
-	{ "urlp_reg",        acl_parse_reg,     smp_fetch_url_param,      acl_match_reg,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
-	{ "urlp_sub",        acl_parse_str,     smp_fetch_url_param,      acl_match_sub,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
-	{ "urlp_val",        acl_parse_int,     smp_fetch_url_param_val,  acl_match_int,     ACL_USE_L7REQ_VOLATILE, ARG1(1,STR) },
+	{ "url",             "url",           acl_parse_str,     acl_match_str     },
+	{ "url_beg",         "url",           acl_parse_str,     acl_match_beg     },
+	{ "url_dir",         "url",           acl_parse_str,     acl_match_dir     },
+	{ "url_dom",         "url",           acl_parse_str,     acl_match_dom     },
+	{ "url_end",         "url",           acl_parse_str,     acl_match_end     },
+	{ "url_ip",          "url_ip",        acl_parse_ip,      acl_match_ip      },
+	{ "url_len",         "url",           acl_parse_int,     acl_match_len     },
+	{ "url_port",        "url_port",      acl_parse_int,     acl_match_int     },
+	{ "url_reg",         "url",           acl_parse_reg,     acl_match_reg     },
+	{ "url_sub",         "url",           acl_parse_str,     acl_match_sub     },
 
-	{ NULL, NULL, NULL, NULL },
+	{ "urlp",            "urlp",          acl_parse_str,     acl_match_str     },
+	{ "urlp_beg",        "urlp",          acl_parse_str,     acl_match_beg     },
+	{ "urlp_dir",        "urlp",          acl_parse_str,     acl_match_dir     },
+	{ "urlp_dom",        "urlp",          acl_parse_str,     acl_match_dom     },
+	{ "urlp_end",        "urlp",          acl_parse_str,     acl_match_end     },
+	{ "urlp_ip",         "urlp",          acl_parse_ip,      acl_match_ip      },
+	{ "urlp_len",        "urlp",          acl_parse_int,     acl_match_len     },
+	{ "urlp_reg",        "urlp",          acl_parse_reg,     acl_match_reg     },
+	{ "urlp_sub",        "urlp",          acl_parse_str,     acl_match_sub     },
+	{ "urlp_val",        "urlp_val",      acl_parse_int,     acl_match_int     },
+
+	{ /* END */ },
 }};
 
 /************************************************************************/
@@ -9535,18 +9589,86 @@ static struct acl_kw_list acl_kws = {{ },{
 /************************************************************************/
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
-	{ "hdr",        smp_fetch_hdr,            ARG2(1,STR,SINT), val_hdr, SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "base",       smp_fetch_base,           0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "base32",     smp_fetch_base32,         0,                NULL,    SMP_T_UINT, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "base32+src", smp_fetch_base32_src,     0,                NULL,    SMP_T_BIN,  SMP_CAP_L7|SMP_CAP_REQ },
-	{ "path",       smp_fetch_path,           0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "url",        smp_fetch_url,            0,                NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "url_ip",     smp_fetch_url_ip,         0,                NULL,    SMP_T_IPV4, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "url_port",   smp_fetch_url_port,       0,                NULL,    SMP_T_UINT, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "url_param",  smp_fetch_url_param,      ARG2(1,STR,STR),  NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ },
-	{ "cookie",     smp_fetch_cookie,         ARG1(1,STR),      NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_REQ|SMP_CAP_RES },
-	{ "set-cookie", smp_fetch_cookie,         ARG1(1,STR),      NULL,    SMP_T_CSTR, SMP_CAP_L7|SMP_CAP_RES }, /* deprecated */
-	{ NULL, NULL, 0, 0, 0 },
+	{ "base",            smp_fetch_base,           0,                NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "base32",          smp_fetch_base32,         0,                NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "base32+src",      smp_fetch_base32_src,     0,                NULL,    SMP_T_BIN,  SMP_USE_HRQHV },
+
+	/* cookie is valid in both directions (eg: for "stick ...") but cook*
+	 * are only here to match the ACL's name, are request-only and are used
+	 * for ACL compatibility only.
+	 */
+	{ "cook",            smp_fetch_cookie,         ARG1(0,STR),      NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "cookie",          smp_fetch_cookie,         ARG1(0,STR),      NULL,    SMP_T_CSTR, SMP_USE_HRQHV|SMP_USE_HRSHV },
+	{ "cook_cnt",        smp_fetch_cookie_cnt,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "cook_val",        smp_fetch_cookie_val,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+
+	/* hdr is valid in both directions (eg: for "stick ...") but hdr_* are
+	 * only here to match the ACL's name, are request-only and are used for
+	 * ACL compatibility only.
+	 */
+	{ "hdr",             smp_fetch_hdr,            ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRQHV|SMP_USE_HRSHV },
+	{ "hdr_cnt",         smp_fetch_hdr_cnt,        ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "hdr_ip",          smp_fetch_hdr_ip,         ARG2(0,STR,SINT), val_hdr, SMP_T_IPV4, SMP_USE_HRQHV },
+	{ "hdr_val",         smp_fetch_hdr_val,        ARG2(0,STR,SINT), val_hdr, SMP_T_UINT, SMP_USE_HRQHV },
+
+	{ "http_auth",       smp_fetch_http_auth,      ARG1(1,USR),      NULL,    SMP_T_BOOL, SMP_USE_HRQHV },
+	{ "http_auth_group", smp_fetch_http_auth_grp,  ARG1(1,USR),      NULL,    SMP_T_BOOL, SMP_USE_HRQHV },
+	{ "http_first_req",  smp_fetch_http_first_req, 0,                NULL,    SMP_T_BOOL, SMP_USE_HRQHP },
+	{ "method",          smp_fetch_meth,           0,                NULL,    SMP_T_UINT, SMP_USE_HRQHP },
+	{ "path",            smp_fetch_path,           0,                NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+
+	/* HTTP protocol on the request path */
+	{ "req.proto_http",  smp_fetch_proto_http,     0,                NULL,    SMP_T_BOOL, SMP_USE_HRQHP },
+	{ "req_proto_http",  smp_fetch_proto_http,     0,                NULL,    SMP_T_BOOL, SMP_USE_HRQHP },
+
+	/* HTTP version on the request path */
+	{ "req.ver",         smp_fetch_rqver,          0,                NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "req_ver",         smp_fetch_rqver,          0,                NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+
+	/* HTTP version on the response path */
+	{ "res.ver",         smp_fetch_stver,          0,                NULL,    SMP_T_CSTR, SMP_USE_HRSHV },
+	{ "resp_ver",        smp_fetch_stver,          0,                NULL,    SMP_T_CSTR, SMP_USE_HRSHV },
+
+	/* explicit req.{cook,hdr} are used to force the fetch direction to be request-only */
+	{ "req.cook",        smp_fetch_cookie,         ARG1(0,STR),      NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "req.cook_cnt",    smp_fetch_cookie_cnt,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "req.cook_val",    smp_fetch_cookie_val,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+
+	{ "req.hdr",         smp_fetch_hdr,            ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "req.hdr_cnt",     smp_fetch_hdr_cnt,        ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "req.hdr_ip",      smp_fetch_hdr_ip,         ARG2(0,STR,SINT), val_hdr, SMP_T_IPV4, SMP_USE_HRQHV },
+	{ "req.hdr_val",     smp_fetch_hdr_val,        ARG2(0,STR,SINT), val_hdr, SMP_T_UINT, SMP_USE_HRQHV },
+
+	/* explicit req.{cook,hdr} are used to force the fetch direction to be response-only */
+	{ "res.cook",        smp_fetch_cookie,         ARG1(0,STR),      NULL,    SMP_T_CSTR, SMP_USE_HRSHV },
+	{ "res.cook_cnt",    smp_fetch_cookie_cnt,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
+	{ "res.cook_val",    smp_fetch_cookie_val,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
+
+	{ "res.hdr",         smp_fetch_hdr,            ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRSHV },
+	{ "res.hdr_cnt",     smp_fetch_hdr_cnt,        ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
+	{ "res.hdr_ip",      smp_fetch_hdr_ip,         ARG2(0,STR,SINT), val_hdr, SMP_T_IPV4, SMP_USE_HRSHV },
+	{ "res.hdr_val",     smp_fetch_hdr_val,        ARG2(0,STR,SINT), val_hdr, SMP_T_UINT, SMP_USE_HRSHV },
+
+	/* scook is valid only on the response and is used for ACL compatibility */
+	{ "scook",           smp_fetch_cookie,         ARG1(0,STR),      NULL,    SMP_T_CSTR, SMP_USE_HRSHV },
+	{ "scook_cnt",       smp_fetch_cookie_cnt,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
+	{ "scook_val",       smp_fetch_cookie_val,     ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
+	{ "set-cookie",      smp_fetch_cookie,         ARG1(0,STR),      NULL,    SMP_T_CSTR, SMP_USE_HRSHV }, /* deprecated */
+
+	/* shdr is valid only on the response and is used for ACL compatibility */
+	{ "shdr",            smp_fetch_hdr,            ARG2(0,STR,SINT), val_hdr, SMP_T_CSTR, SMP_USE_HRSHV },
+	{ "shdr_cnt",        smp_fetch_hdr_cnt,        ARG1(0,STR),      NULL,    SMP_T_UINT, SMP_USE_HRSHV },
+	{ "shdr_ip",         smp_fetch_hdr_ip,         ARG2(0,STR,SINT), val_hdr, SMP_T_IPV4, SMP_USE_HRSHV },
+	{ "shdr_val",        smp_fetch_hdr_val,        ARG2(0,STR,SINT), val_hdr, SMP_T_UINT, SMP_USE_HRSHV },
+
+	{ "status",          smp_fetch_stcode,         0,                NULL,    SMP_T_UINT, SMP_USE_HRSHP },
+	{ "url",             smp_fetch_url,            0,                NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "url_ip",          smp_fetch_url_ip,         0,                NULL,    SMP_T_IPV4, SMP_USE_HRQHV },
+	{ "url_port",        smp_fetch_url_port,       0,                NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "url_param",       smp_fetch_url_param,      ARG2(1,STR,STR),  NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "urlp"     ,       smp_fetch_url_param,      ARG2(1,STR,STR),  NULL,    SMP_T_CSTR, SMP_USE_HRQHV },
+	{ "urlp_val",        smp_fetch_url_param_val,  ARG2(1,STR,STR),  NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ /* END */ },
 }};
 
 

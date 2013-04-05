@@ -449,6 +449,7 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->format_unique_id);
 	LIST_INIT(&p->conf.bind);
 	LIST_INIT(&p->conf.listeners);
+	LIST_INIT(&p->conf.args.list);
 
 	/* Timeouts are defined as -1 */
 	proxy_reset_timeouts(p);
@@ -828,7 +829,7 @@ int session_set_backend(struct session *s, struct proxy *be)
 	/* If the target backend requires HTTP processing, we have to allocate
 	 * a struct hdr_idx for it if we did not have one.
 	 */
-	if (unlikely(!s->txn.hdr_idx.v && (be->acl_requires & ACL_USE_L7_ANY))) {
+	if (unlikely(!s->txn.hdr_idx.v && be->http_needed)) {
 		if ((s->txn.hdr_idx.v = pool_alloc2(pool2_hdr_idx)) == NULL)
 			return 0; /* not enough memory */
 

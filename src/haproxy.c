@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2012  Willy Tarreau <w@1wt.eu>.
+ * Copyright 2000-2013  Willy Tarreau <w@1wt.eu>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -205,7 +205,7 @@ static struct task *manage_global_listener_queue(struct task *t);
 void display_version()
 {
 	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2012 Willy Tarreau <w@1wt.eu>\n\n");
+	printf("Copyright 2000-2013 Willy Tarreau <w@1wt.eu>\n\n");
 }
 
 void display_build_opts()
@@ -289,6 +289,20 @@ void display_build_opts()
 #else /* USE_OPENSSL */
 	printf("Built without OpenSSL support (USE_OPENSSL not set)\n");
 #endif
+
+#ifdef USE_PCRE
+	printf("Built with PCRE version : %s", pcre_version());
+	printf("\nPCRE library supports JIT : "
+#ifndef USE_PCRE_JIT
+	       "no (USE_PCRE_JIT not set)"
+#else
+	       "yes"
+#endif
+	       "\n");
+#else
+	printf("Built without PCRE support (using libc's regex instead)\n");
+#endif
+
 	putchar('\n');
 
 	list_pollers(stdout);
@@ -471,6 +485,8 @@ void init(int argc, char **argv)
 	strftime(localtimezone, 6, "%z", &curtime);
 
 	signal_init();
+	if (init_acl() != 0)
+		exit(1);
 	init_task();
 	init_session();
 	init_connection();
@@ -795,7 +811,16 @@ void init(int argc, char **argv)
 		list_pollers(stderr);
 
 	if (!init_pollers()) {
-		Alert("No polling mechanism available.\n");
+		Alert("No polling mechanism available.\n"
+		      "  It is likely that haproxy was built with TARGET=generic and that FD_SETSIZE\n"
+		      "  is too low on this platform to support maxconn and the number of listeners\n"
+		      "  and servers. You should rebuild haproxy specifying your system using TARGET=\n"
+		      "  in order to support other polling systems (poll, epoll, kqueue) or reduce the\n"
+		      "  global maxconn setting to accomodate the system's limitation. For reference,\n"
+		      "  FD_SETSIZE=%d on this system, global.maxconn=%d resulting in a maximum of\n"
+		      "  %d file descriptors. You should thus reduce global.maxconn by %d. Also,\n"
+		      "  check build settings using 'haproxy -vv'.\n\n",
+		      FD_SETSIZE, global.maxconn, global.maxsock, (global.maxsock + 1 - FD_SETSIZE) / 2);
 		exit(1);
 	}
 	if (global.mode & (MODE_VERBOSE|MODE_DEBUG)) {

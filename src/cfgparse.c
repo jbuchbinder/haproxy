@@ -414,40 +414,40 @@ int warnif_misplaced_reqadd(struct proxy *proxy, const char *file, int line, con
 		warnif_rule_after_use_backend(proxy, file, line, arg);
 }
 
-/* Report it if a request ACL condition uses some response-only parameters. It
- * returns either 0 or ERR_WARN so that its result can be or'ed with err_code.
- * Note that <cond> may be NULL and then will be ignored.
+/* Report it if a request ACL condition uses some keywords that are incompatible
+ * with the place where the ACL is used. It returns either 0 or ERR_WARN so that
+ * its result can be or'ed with err_code. Note that <cond> may be NULL and then
+ * will be ignored.
  */
-static int warnif_cond_requires_resp(const struct acl_cond *cond, const char *file, int line)
+static int warnif_cond_conflicts(const struct acl_cond *cond, unsigned int where, const char *file, int line)
 {
-	struct acl *acl;
+	const struct acl *acl;
+	const char *kw;
 
-	if (!cond || !(cond->requires & ACL_USE_RTR_ANY))
+	if (!cond)
 		return 0;
 
-	acl = cond_find_require(cond, ACL_USE_RTR_ANY);
-	Warning("parsing [%s:%d] : acl '%s' involves some response-only criteria which will be ignored.\n",
-		file, line, acl ? acl->name : "(unknown)");
-	return ERR_WARN;
-}
-
-/* Report it if a request ACL condition uses some request-only volatile parameters.
- * It returns either 0 or ERR_WARN so that its result can be or'ed with err_code.
- * Note that <cond> may be NULL and then will be ignored.
- */
-static int warnif_cond_requires_req(const struct acl_cond *cond, const char *file, int line)
-{
-	struct acl *acl;
-
-	if (!cond || !(cond->requires & ACL_USE_REQ_VOLATILE))
+	acl = acl_cond_conflicts(cond, where);
+	if (acl) {
+		if (acl->name && *acl->name)
+			Warning("parsing [%s:%d] : acl '%s' will never match because it only involves keywords that are incompatible with '%s'\n",
+			        file, line, acl->name, sample_ckp_names(where));
+		else
+			Warning("parsing [%s:%d] : anonymous acl will never match because it uses keyword '%s' which is incompatible with '%s'\n",
+			        file, line, LIST_ELEM(acl->expr.n, struct acl_expr *, list)->kw, sample_ckp_names(where));
+		return ERR_WARN;
+	}
+	if (!acl_cond_kw_conflicts(cond, where, &acl, &kw))
 		return 0;
 
-	acl = cond_find_require(cond, ACL_USE_REQ_VOLATILE);
-	Warning("parsing [%s:%d] : acl '%s' involves some volatile request-only criteria which will be ignored.\n",
-		file, line, acl ? acl->name : "(unknown)");
+	if (acl->name && *acl->name)
+		Warning("parsing [%s:%d] : acl '%s' involves keywords '%s' which is incompatible with '%s'\n",
+		        file, line, acl->name, kw, sample_ckp_names(where));
+	else
+		Warning("parsing [%s:%d] : anonymous acl involves keyword '%s' which is incompatible with '%s'\n",
+		        file, line, kw, sample_ckp_names(where));
 	return ERR_WARN;
 }
-
 
 /*
  * parse a line in a <global> section. Returns the error code, 0 if OK, or
@@ -1380,10 +1380,11 @@ static int create_cond_regex_rule(const char *file, int line,
 		goto err;
 	}
 
-	if (dir == SMP_OPT_DIR_REQ)
-		err_code |= warnif_cond_requires_resp(cond, file, line);
-	else
-		err_code |= warnif_cond_requires_req(cond, file, line);
+	err_code |= warnif_cond_conflicts(cond,
+	                                  (dir == SMP_OPT_DIR_REQ) ?
+	                                  ((px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR) :
+	                                  ((px->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR),
+	                                  file, line);
 
 	preg = calloc(1, sizeof(regex_t));
 	if (!preg) {
@@ -1571,8 +1572,8 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				curpeers->peers_fe->timeout.connect = 5000;
 				curpeers->peers_fe->accept = peer_accept;
 				curpeers->peers_fe->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON | PR_O2_SMARTACC;
-				curpeers->peers_fe->conf.file = strdup(file);
-				curpeers->peers_fe->conf.line = linenum;
+				curpeers->peers_fe->conf.args.file = curpeers->peers_fe->conf.file = strdup(file);
+				curpeers->peers_fe->conf.args.line = curpeers->peers_fe->conf.line = linenum;
 
 				bind_conf = bind_conf_alloc(&curpeers->peers_fe->conf.bind, file, linenum, args[2]);
 
@@ -1691,8 +1692,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		init_new_proxy(curproxy);
 		curproxy->next = proxy;
 		proxy = curproxy;
-		curproxy->conf.file = strdup(file);
-		curproxy->conf.line = linenum;
+		curproxy->conf.args.file = curproxy->conf.file = strdup(file);
+		curproxy->conf.args.line = curproxy->conf.line = linenum;
 		curproxy->last_change = now.tv_sec;
 		curproxy->id = strdup(args[1]);
 		curproxy->cap = rc;
@@ -1924,6 +1925,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		/* we cannot free uri_auth because it might already be used */
 		init_default_instance();
 		curproxy = &defproxy;
+		curproxy->conf.args.file = curproxy->conf.file = strdup(file);
+		curproxy->conf.args.line = curproxy->conf.line = linenum;
 		defproxy.cap = PR_CAP_LISTEN; /* all caps for now */
 		goto out;
 	}
@@ -1932,7 +1935,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto out;
 	}
-    
+
+	/* update the current file and line being parsed */
+	curproxy->conf.args.file = curproxy->conf.file;
+	curproxy->conf.args.line = linenum;
 
 	/* Now let's parse the proxy-specific keywords */
 	if (!strcmp(args[0], "bind")) {  /* new listen addresses */
@@ -2224,7 +2230,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 
-		if (parse_acl((const char **)args + 1, &curproxy->acl, &errmsg) == NULL) {
+		if (parse_acl((const char **)args + 1, &curproxy->acl, &errmsg, &curproxy->conf.args) == NULL) {
 			Alert("parsing [%s:%d] : error detected while parsing ACL '%s' : %s.\n",
 			      file, linenum, args[1], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -2627,7 +2633,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		err_code |= warnif_cond_requires_resp(rule->cond, file, linenum);
+		err_code |= warnif_cond_conflicts(rule->cond,
+	                                          (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+	                                          file, linenum);
+
 		LIST_ADDQ(&curproxy->http_req_rules, &rule->list);
 	}
 	else if (!strcmp(args[0], "http-send-name-header")) { /* send server name in request header */
@@ -2689,7 +2698,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		LIST_ADDQ(&curproxy->redirect_rules, &rule->list);
 		err_code |= warnif_rule_after_use_backend(curproxy, file, linenum, args[0]);
-		err_code |= warnif_cond_requires_resp(cond, file, linenum);
+		err_code |= warnif_cond_conflicts(rule->cond,
+	                                          (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+	                                          file, linenum);
 	}
 	else if (!strcmp(args[0], "use_backend")) {
 		struct switching_rule *rule;
@@ -2723,7 +2734,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		err_code |= warnif_cond_requires_resp(cond, file, linenum);
+		err_code |= warnif_cond_conflicts(cond, SMP_VAL_FE_SET_BCK, file, linenum);
 
 		rule = (struct switching_rule *)calloc(1, sizeof(*rule));
 		rule->cond = cond;
@@ -2763,7 +2774,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		err_code |= warnif_cond_requires_resp(cond, file, linenum);
+		err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_SET_SRV, file, linenum);
 
 		rule = (struct server_rule *)calloc(1, sizeof(*rule));
 		rule->cond = cond;
@@ -2799,7 +2810,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		err_code |= warnif_cond_requires_resp(cond, file, linenum);
+		/* note: BE_REQ_CNT is the first one after FE_SET_BCK, which is
+		 * where force-persist is applied.
+		 */
+		err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_REQ_CNT, file, linenum);
 
 		rule = (struct persist_rule *)calloc(1, sizeof(*rule));
 		rule->cond = cond;
@@ -3014,7 +3028,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		expr = sample_parse_expr(args, &myidx, trash.str, trash.size);
+		curproxy->conf.args.ctx = ARGC_STK;
+		expr = sample_parse_expr(args, &myidx, trash.str, trash.size, &curproxy->conf.args);
 		if (!expr) {
 			Alert("parsing [%s:%d] : '%s': %s\n", file, linenum, args[0], trash.str);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -3022,17 +3037,17 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		if (flags & STK_ON_RSP) {
-			if (!(expr->fetch->cap & SMP_CAP_RES)) {
-				Alert("parsing [%s:%d] : '%s': fetch method '%s' can not be used on response.\n",
-				      file, linenum, args[0], expr->fetch->kw);
+			if (!(expr->fetch->val & SMP_VAL_BE_STO_RUL)) {
+				Alert("parsing [%s:%d] : '%s': fetch method '%s' extracts information from '%s', none of which is available for 'store-response'.\n",
+				      file, linenum, args[0], expr->fetch->kw, sample_src_names(expr->fetch->use));
 		                err_code |= ERR_ALERT | ERR_FATAL;
 				free(expr);
 			        goto out;
 			}
 		} else {
-			if (!(expr->fetch->cap & SMP_CAP_REQ)) {
-				Alert("parsing [%s:%d] : '%s': fetch method '%s' can not be used on request.\n",
-				      file, linenum, args[0], expr->fetch->kw);
+			if (!(expr->fetch->val & SMP_VAL_BE_SET_SRV)) {
+				Alert("parsing [%s:%d] : '%s': fetch method '%s' extracts information from '%s', none of which is available during request.\n",
+				      file, linenum, args[0], expr->fetch->kw, sample_src_names(expr->fetch->use));
 				err_code |= ERR_ALERT | ERR_FATAL;
 				free(expr);
 				goto out;
@@ -3040,8 +3055,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		/* check if we need to allocate an hdr_idx struct for HTTP parsing */
-		if (expr->fetch->cap & SMP_CAP_L7)
-			curproxy->acl_requires |= ACL_USE_L7_ANY;
+		curproxy->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
 
 		if (strcmp(args[myidx], "table") == 0) {
 			myidx++;
@@ -3065,9 +3079,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		if (flags & STK_ON_RSP)
-			err_code |= warnif_cond_requires_req(cond, file, linenum);
+			err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_STO_RUL, file, linenum);
 		else
-			err_code |= warnif_cond_requires_resp(cond, file, linenum);
+			err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_SET_SRV, file, linenum);
 
 		rule = (struct sticking_rule *)calloc(1, sizeof(*rule));
 		rule->cond = cond;
@@ -3117,7 +3131,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 
-			err_code |= warnif_cond_requires_resp(cond, file, linenum);
+			err_code |= warnif_cond_conflicts(cond,
+			                                  (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+			                                  file, linenum);
 
 			rule = (struct stats_admin_rule *)calloc(1, sizeof(*rule));
 			rule->cond = cond;
@@ -3186,7 +3202,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 
-			err_code |= warnif_cond_requires_resp(rule->cond, file, linenum);
+			err_code |= warnif_cond_conflicts(rule->cond,
+			                                  (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+			                                  file, linenum);
 			LIST_ADDQ(&curproxy->uri_auth->http_req_rules, &rule->list);
 
 		} else if (!strcmp(args[1], "auth")) {
@@ -4813,6 +4831,18 @@ stats_error_parsing:
 		}
 		free(curproxy->uniqueid_format_string);
 		curproxy->uniqueid_format_string = strdup(args[1]);
+
+		/* get a chance to improve log-format error reporting by
+		 * reporting the correct line-number when possible.
+		 */
+		if (curproxy != &defproxy) {
+			curproxy->conf.args.ctx = ARGC_UIF;
+			if (curproxy->uniqueid_format_string)
+				parse_logformat_string(curproxy->uniqueid_format_string, curproxy, &curproxy->format_unique_id, 0,
+						       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR);
+			free(curproxy->uniqueid_format_string);
+			curproxy->uniqueid_format_string = NULL;
+		}
 	}
 
 	else if (strcmp(args[0], "unique-id-header") == 0) {
@@ -4842,6 +4872,23 @@ stats_error_parsing:
 		    curproxy->logformat_string != clf_http_log_format)
 			free(curproxy->logformat_string);
 		curproxy->logformat_string = strdup(args[1]);
+
+		/* get a chance to improve log-format error reporting by
+		 * reporting the correct line-number when possible.
+		 */
+		if (curproxy != &defproxy && !(curproxy->cap & PR_CAP_FE)) {
+			Warning("parsing [%s:%d] : backend '%s' : 'log-format' directive is ignored in backends.\n",
+				file, linenum, curproxy->id);
+			err_code |= ERR_WARN;
+		}
+		else if (curproxy->cap & PR_CAP_FE) {
+			curproxy->conf.args.ctx = ARGC_LOG;
+			if (curproxy->logformat_string)
+				parse_logformat_string(curproxy->logformat_string, curproxy, &curproxy->logformat, LOG_OPT_MANDATORY,
+						       SMP_VAL_FE_LOG_END);
+			free(curproxy->logformat_string);
+			curproxy->logformat_string = NULL;
+		}
 	}
 
 	else if (!strcmp(args[0], "log") && kwm == KWM_NO) {
@@ -5260,7 +5307,9 @@ stats_error_parsing:
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
-			err_code |= warnif_cond_requires_resp(cond, file, linenum);
+			err_code |= warnif_cond_conflicts(cond,
+			                                  (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+			                                  file, linenum);
 		}
 		else if (*args[2]) {
 			Alert("parsing [%s:%d] : '%s' : Expecting nothing, 'if', or 'unless', got '%s'.\n",
@@ -5355,7 +5404,9 @@ stats_error_parsing:
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
-			err_code |= warnif_cond_requires_req(cond, file, linenum);
+			err_code |= warnif_cond_conflicts(cond,
+			                                  (curproxy->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR,
+			                                  file, linenum);
 		}
 		else if (*args[2]) {
 			Alert("parsing [%s:%d] : '%s' : Expecting nothing, 'if', or 'unless', got '%s'.\n",
@@ -6044,7 +6095,7 @@ int check_config_validity()
 			break;
 
 		case PR_MODE_HTTP:
-			curproxy->acl_requires |= ACL_USE_L7_ANY;
+			curproxy->http_needed = 1;
 			break;
 		}
 
@@ -6418,7 +6469,29 @@ int check_config_validity()
 		}
 out_uri_auth_compat:
 
-		cfgerr += acl_find_targets(curproxy);
+		/* compile the log format */
+		if (!(curproxy->cap & PR_CAP_FE)) {
+			if (curproxy->logformat_string != default_http_log_format &&
+			    curproxy->logformat_string != default_tcp_log_format &&
+			    curproxy->logformat_string != clf_http_log_format)
+				free(curproxy->logformat_string);
+			curproxy->logformat_string = NULL;
+		}
+
+		curproxy->conf.args.ctx = ARGC_LOG;
+		if (curproxy->logformat_string)
+			parse_logformat_string(curproxy->logformat_string, curproxy, &curproxy->logformat, LOG_OPT_MANDATORY,
+					       SMP_VAL_FE_LOG_END);
+
+		curproxy->conf.args.ctx = ARGC_UIF;
+		if (curproxy->uniqueid_format_string)
+			parse_logformat_string(curproxy->uniqueid_format_string, curproxy, &curproxy->format_unique_id, 0,
+					       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR);
+
+		/* only now we can check if some args remain unresolved */
+		cfgerr += smp_resolve_args(curproxy);
+		if (!cfgerr)
+			cfgerr += acl_find_targets(curproxy);
 
 		if ((curproxy->mode == PR_MODE_TCP || curproxy->mode == PR_MODE_HTTP) &&
 		    (((curproxy->cap & PR_CAP_FE) && !curproxy->timeout.client) ||
@@ -6507,21 +6580,6 @@ out_uri_auth_compat:
 				curproxy->nb_rsp_cap = 0;
 			}
 		}
-
-		/* compile the log format */
-		if (!(curproxy->cap & PR_CAP_FE)) {
-			if (curproxy->logformat_string != default_http_log_format &&
-			    curproxy->logformat_string != default_tcp_log_format &&
-			    curproxy->logformat_string != clf_http_log_format)
-				free(curproxy->logformat_string);
-			curproxy->logformat_string = NULL;
-		}
-
-		if (curproxy->logformat_string)
-			parse_logformat_string(curproxy->logformat_string, curproxy, &curproxy->logformat, LOG_OPT_MANDATORY);
-
-		if (curproxy->uniqueid_format_string)
-			parse_logformat_string(curproxy->uniqueid_format_string, curproxy, &curproxy->format_unique_id, 0);
 
 		/* first, we will invert the servers list order */
 		newsrv = NULL;

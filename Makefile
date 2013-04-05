@@ -14,6 +14,7 @@
 #   USE_MY_SPLICE        : redefine the splice syscall if build fails without.
 #   USE_NETFILTER        : enable netfilter on Linux. Automatic.
 #   USE_PCRE             : enable use of libpcre for regex. Recommended.
+#   USE_PCRE_JIT         : enable use of libpcre jit for regex. Recommended.
 #   USE_POLL             : enable poll(). Automatic.
 #   USE_PRIVATE_CACHE    : disable shared memory cache of ssl sessions.
 #   USE_REGPARM          : enable regparm optimization. Recommended on x86.
@@ -31,6 +32,7 @@
 #   USE_MY_ACCEPT4       : use own implemention of accept4() if glibc < 2.10.
 #   USE_ZLIB             : enable zlib library support.
 #   USE_CPU_AFFINITY     : enable pinning processes to CPU on Linux. Automatic.
+#   USE_TFO              : enable TCP fast open. Supported on Linux >= 3.7.
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -191,7 +193,10 @@ LDFLAGS = $(ARCH_FLAGS) -g
 # Depending on the target platform, some options are set, as well as some
 # CFLAGS and LDFLAGS. The USE_* values are set to "implicit" so that they are
 # not reported in the build options string. You should not have to change
-# anything there.
+# anything there. poll() is always supported, unless explicitly disabled by
+# passing USE_POLL="" on the make command line.
+USE_POLL   = default
+
 ifeq ($(TARGET),generic)
   # generic system target has nothing specific
   USE_POLL   = implicit
@@ -265,6 +270,13 @@ ifeq ($(TARGET),freebsd)
   USE_TPROXY     = implicit
   USE_LIBCRYPT   = implicit
 else
+ifeq ($(TARGET),osx)
+  # This is for Mac OS/X
+  USE_POLL       = implicit
+  USE_KQUEUE     = implicit
+  USE_TPROXY     = implicit
+  USE_LIBCRYPT   = implicit
+else
 ifeq ($(TARGET),openbsd)
   # This is for OpenBSD >= 3.0
   USE_POLL       = implicit
@@ -287,6 +299,7 @@ ifeq ($(TARGET),cygwin)
 endif # cygwin
 endif # aix52
 endif # openbsd
+endif # osx
 endif # freebsd
 endif # solaris
 endif # linux2628
@@ -521,7 +534,7 @@ endif
 endif
 endif
 
-ifneq ($(USE_PCRE)$(USE_STATIC_PCRE),)
+ifneq ($(USE_PCRE)$(USE_STATIC_PCRE)$(USE_PCRE_JIT),)
 # PCREDIR is used to automatically construct the PCRE_INC and PCRE_LIB paths,
 # by appending /include and /lib respectively. If your system does not use the
 # same sub-directories, simply force these variables instead of PCREDIR. It is
@@ -546,6 +559,17 @@ OPTIONS_CFLAGS  += -DUSE_PCRE $(if $(PCRE_INC),-I$(PCRE_INC))
 OPTIONS_LDFLAGS += $(if $(PCRE_LIB),-L$(PCRE_LIB)) -Wl,-Bstatic -lpcreposix -lpcre -Wl,-Bdynamic
 BUILD_OPTIONS   += $(call ignore_implicit,USE_STATIC_PCRE)
 endif
+# JIT PCRE
+ifneq ($(USE_PCRE_JIT),)
+OPTIONS_CFLAGS  += -DUSE_PCRE_JIT
+BUILD_OPTIONS   += $(call ignore_implicit,USE_PCRE_JIT)
+endif
+endif
+
+# TCP Fast Open
+ifneq ($(USE_TFO),)
+OPTIONS_CFLAGS  += -DUSE_TFO
+BUILD_OPTIONS   += $(call ignore_implicit,USE_TFO)
 endif
 
 # This one can be changed to look for ebtree files in an external directory
@@ -611,7 +635,7 @@ OBJS = src/haproxy.o src/sessionhash.o src/base64.o src/protocol.o \
        src/stream_interface.o src/dumpstats.o src/proto_tcp.o \
        src/session.o src/hdr_idx.o src/ev_select.o src/signal.o \
        src/acl.o src/sample.o src/memory.o src/freq_ctr.o src/auth.o \
-       src/compression.o
+       src/compression.o src/payload.o
 
 EBTREE_OBJS = $(EBTREE_DIR)/ebtree.o \
               $(EBTREE_DIR)/eb32tree.o $(EBTREE_DIR)/eb64tree.o \

@@ -731,7 +731,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
 			goto out;
 		}
 
-		if (isdigit(*port1)) {	/* single port or range */
+		if (isdigit((int)(unsigned char)*port1)) {	/* single port or range */
 			port2 = strchr(port1, '-');
 			if (port2)
 				*port2++ = '\0';
@@ -1900,13 +1900,21 @@ char *memprintf(char **out, const char *format, ...)
 		 * intermediate evaluations get wrong.
 		 */
 		va_start(args, format);
-		needed = vsnprintf(ret, allocated, format, args) + 1;
+		needed = vsnprintf(ret, allocated, format, args);
 		va_end(args);
 
-		if (needed <= allocated)
-			break;
+		if (needed < allocated) {
+			/* Note: on Solaris 8, the first iteration always
+			 * returns -1 if allocated is zero, so we force a
+			 * retry.
+			 */
+			if (!allocated)
+				needed = 0;
+			else
+				break;
+		}
 
-		allocated = needed;
+		allocated = needed + 1;
 		ret = realloc(ret, allocated);
 	} while (ret);
 

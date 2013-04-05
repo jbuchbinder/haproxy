@@ -79,99 +79,23 @@ enum {
 	ACL_PAT_F_TREE        = 1 << 3,       /* some patterns are arranged in a tree */
 };
 
-/* what capabilities an ACL uses. These flags are set during parsing, which
- * allows for flexible ACLs typed by their contents.
- */
+/* ACL match methods */
 enum {
-	ACL_USE_NOTHING         = 0,            /* no need for anything beyond internal information */
-	ACL_USE_TCP4_PERMANENT  = 1 <<  0,      /* unchanged TCPv4 data (eg: source IP) */
-	ACL_USE_TCP4_CACHEABLE  = 1 <<  1,      /* cacheable TCPv4 data (eg: src conns) */
-	ACL_USE_TCP4_VOLATILE   = 1 <<  2,      /* volatile  TCPv4 data (eg: RTT) */
-	ACL_USE_TCP4_ANY        = (ACL_USE_TCP4_PERMANENT | ACL_USE_TCP4_CACHEABLE | ACL_USE_TCP4_VOLATILE),
-
-	ACL_USE_TCP6_PERMANENT  = 1 <<  3,      /* unchanged TCPv6 data (eg: source IP) */
-	ACL_USE_TCP6_CACHEABLE  = 1 <<  4,      /* cacheable TCPv6 data (eg: src conns) */
-	ACL_USE_TCP6_VOLATILE   = 1 <<  5,      /* volatile  TCPv6 data (eg: RTT) */
-	ACL_USE_TCP6_ANY        = (ACL_USE_TCP6_PERMANENT | ACL_USE_TCP6_CACHEABLE | ACL_USE_TCP6_VOLATILE),
-
-	ACL_USE_TCP_PERMANENT   = 1 <<  6,      /* unchanged TCPv4/v6 data (eg: source IP) */
-	ACL_USE_TCP_CACHEABLE   = 1 <<  7,      /* cacheable TCPv4/v6 data (eg: src conns) */
-	ACL_USE_TCP_VOLATILE    = 1 <<  8,      /* volatile  TCPv4/v6 data (eg: RTT) */
-	ACL_USE_TCP_ANY         = (ACL_USE_TCP_PERMANENT | ACL_USE_TCP_CACHEABLE | ACL_USE_TCP_VOLATILE),
-
-	ACL_USE_L6REQ_PERMANENT = 1 <<  9,      /* unchanged layer6 request data */
-	ACL_USE_L6REQ_CACHEABLE = 1 << 10,      /* cacheable layer6 request data (eg: length) */
-	ACL_USE_L6REQ_VOLATILE  = 1 << 11,      /* volatile  layer6 request data (eg: contents) */
-	ACL_USE_L6REQ_ANY       = (ACL_USE_L6REQ_PERMANENT | ACL_USE_L6REQ_CACHEABLE | ACL_USE_L6REQ_VOLATILE),
-
-	ACL_USE_L6RTR_PERMANENT = 1 << 12,      /* unchanged layer6 response data */
-	ACL_USE_L6RTR_CACHEABLE = 1 << 13,      /* cacheable layer6 response data (eg: length) */
-	ACL_USE_L6RTR_VOLATILE  = 1 << 14,      /* volatile  layer6 response data (eg: contents) */
-	ACL_USE_L6RTR_ANY       = (ACL_USE_L6RTR_PERMANENT | ACL_USE_L6RTR_CACHEABLE | ACL_USE_L6RTR_VOLATILE),
-
-	ACL_USE_L7REQ_PERMANENT = 1 << 15,      /* unchanged layer7 request data (eg: method) */
-	ACL_USE_L7REQ_CACHEABLE = 1 << 16,      /* cacheable layer7 request data (eg: content-length) */
-	ACL_USE_L7REQ_VOLATILE  = 1 << 17,      /* volatile  layer7 request data (eg: cookie) */
-	ACL_USE_L7REQ_ANY       = (ACL_USE_L7REQ_PERMANENT | ACL_USE_L7REQ_CACHEABLE | ACL_USE_L7REQ_VOLATILE),
-
-	ACL_USE_L7RTR_PERMANENT = 1 << 18,      /* unchanged layer7 response data (eg: status) */
-	ACL_USE_L7RTR_CACHEABLE = 1 << 19,      /* cacheable layer7 response data (eg: content-length) */
-	ACL_USE_L7RTR_VOLATILE  = 1 << 20,      /* volatile  layer7 response data (eg: cookie) */
-	ACL_USE_L7RTR_ANY       = (ACL_USE_L7RTR_PERMANENT | ACL_USE_L7RTR_CACHEABLE | ACL_USE_L7RTR_VOLATILE),
-
-	/* those ones are used for ambiguous "hdr_xxx" verbs */
-	ACL_USE_HDR_CACHEABLE   = 1 << 21,      /* cacheable request or response header (eg: content-length) */
-	ACL_USE_HDR_VOLATILE    = 1 << 22,      /* volatile  request or response header (eg: cookie) */
-	ACL_USE_HDR_ANY = (ACL_USE_HDR_CACHEABLE | ACL_USE_HDR_VOLATILE),
-
-	/* This one indicates that we need an internal parameter known in the response only */
-	ACL_USE_RTR_INTERNAL    = 1 << 23,      /* volatile response information */
-
-	/* information which remains during response */
-	ACL_USE_REQ_PERMANENT   = (ACL_USE_TCP4_PERMANENT | ACL_USE_TCP6_PERMANENT | ACL_USE_TCP_PERMANENT |
-				   ACL_USE_L6REQ_PERMANENT | ACL_USE_L7REQ_PERMANENT),
-	ACL_USE_REQ_CACHEABLE   = (ACL_USE_TCP4_CACHEABLE | ACL_USE_TCP6_CACHEABLE | ACL_USE_TCP_CACHEABLE |
-				   ACL_USE_L6REQ_CACHEABLE | ACL_USE_L7REQ_CACHEABLE | ACL_USE_HDR_CACHEABLE),
-
-	/* information which does not remain during response */
-	ACL_USE_REQ_VOLATILE    = (ACL_USE_TCP4_VOLATILE | ACL_USE_TCP6_VOLATILE | ACL_USE_TCP_VOLATILE |
-				   ACL_USE_L6REQ_VOLATILE | ACL_USE_L7REQ_VOLATILE),
-
-	/* any type of layer 6 contents information (random data available in a buffer) */
-	ACL_USE_L6_ANY          = (ACL_USE_L6REQ_ANY | ACL_USE_L6RTR_ANY),
-
-	/* any type of layer 7 information */
-	ACL_USE_L7_ANY          = (ACL_USE_L7REQ_ANY | ACL_USE_L7RTR_ANY | ACL_USE_HDR_ANY),
-
-	/* any type of response information */
-	ACL_USE_RTR_ANY         = (ACL_USE_L6RTR_ANY | ACL_USE_L7RTR_ANY | ACL_USE_RTR_INTERNAL),
-
-	/* some flags indicating if a keyword supports exact pattern matching,
-	 * so that patterns may be arranged in lookup trees. Let's put those
-	 * flags at the end to leave some space for the other ones above.
-	 */
-	ACL_MAY_LOOKUP          =  1 << 31,  /* exact pattern lookup */
-};
-
-/* filtering hooks */
-enum {
-	/* hooks on the request path */
-	ACL_HOOK_REQ_FE_TCP = 0,
-	ACL_HOOK_REQ_FE_TCP_CONTENT,
-	ACL_HOOK_REQ_FE_HTTP_IN,
-	ACL_HOOK_REQ_FE_SWITCH,
-	ACL_HOOK_REQ_BE_TCP_CONTENT,
-	ACL_HOOK_REQ_BE_HTTP_IN,
-	ACL_HOOK_REQ_BE_SWITCH,
-	ACL_HOOK_REQ_FE_HTTP_OUT,
-	ACL_HOOK_REQ_BE_HTTP_OUT,
-	/* hooks on the response path */
-	ACL_HOOK_RTR_BE_TCP_CONTENT,
-	ACL_HOOK_RTR_BE_HTTP_IN,
-	ACL_HOOK_RTR_FE_TCP_CONTENT,
-	ACL_HOOK_RTR_FE_HTTP_IN,
-	ACL_HOOK_RTR_BE_HTTP_OUT,
-	ACL_HOOK_RTR_FE_HTTP_OUT,
+	ACL_MATCH_FOUND, /* just ensure that fetch found the sample */
+	ACL_MATCH_BOOL,  /* match fetch's integer value as boolean */
+	ACL_MATCH_INT,   /* unsigned integer (int) */
+	ACL_MATCH_IP,    /* IPv4/IPv6 address (IP) */
+	ACL_MATCH_BIN,   /* hex string (bin) */
+	ACL_MATCH_LEN,   /* string length (str -> int) */
+	ACL_MATCH_STR,   /* exact string match (str) */
+	ACL_MATCH_BEG,   /* beginning of string (str) */
+	ACL_MATCH_SUB,   /* substring (str) */
+	ACL_MATCH_DIR,   /* directory-like sub-string (str) */
+	ACL_MATCH_DOM,   /* domain-like sub-string (str) */
+	ACL_MATCH_END,   /* end of string (str) */
+	ACL_MATCH_REG,   /* regex (str -> reg) */
+	/* keep this one last */
+	ACL_MATCH_NUM
 };
 
 /* How to store a time range and the valid days in 29 bits */
@@ -213,7 +137,7 @@ struct acl_pattern {
 	union {
 		void *ptr;              /* any data */
 		char *str;              /* any string  */
-		regex_t *reg;           /* a compiled regex */
+		regex *reg;             /* a compiled regex */
 	} ptr;                          /* indirect values, allocated */
 	void(*freeptrbuf)(void *ptr);	/* a destructor able to free objects from the ptr */
 	int len;                        /* data length when required  */
@@ -239,15 +163,11 @@ struct session;
 struct acl_expr;
 struct acl_keyword {
 	const char *kw;
+	char *fetch_kw;
 	int (*parse)(const char **text, struct acl_pattern *pattern, int *opaque, char **err);
-	int (*fetch)(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-	             const struct arg *args, struct sample *smp);
 	int (*match)(struct sample *smp, struct acl_pattern *pattern);
-	unsigned int requires;   /* bit mask of all ACL_USE_* required to evaluate this keyword */
-	int arg_mask; /* mask describing up to 7 arg types */
-	int (*val_args)(struct arg *arg_p, char **err_msg);  /* argument validation function */
 	/* must be after the config params */
-	int use_cnt;
+	struct sample_fetch *smp; /* the sample fetch we depend on */
 };
 
 /*
@@ -263,19 +183,21 @@ struct acl_kw_list {
 
 /*
  * Description of an ACL expression.
- * It contains a subject and a set of patterns to test against it.
- *  - the function get() is called to retrieve the subject from the
- *    current session or transaction and build a test.
- *  - the function test() is called to evaluate the test based on the
- *    available patterns and return ACL_PAT_*
- * Both of those functions are available through the keyword.
+ * The expression is part of a list. It contains pointers to the keyword, the
+ * parse and match functions which default to the keyword's, the sample fetch
+ * descriptor which also defaults to the keyword's, and a list or tree of
+ * patterns to test against. The structure is organized so that the hot parts
+ * are grouped together in order to optimize caching.
  */
 struct acl_expr {
-	struct list list;           /* chaining */
-	struct acl_keyword *kw;     /* back-reference to the keyword */
-	struct arg *args;           /* optional argument list (eg: header or cookie name) */
-	struct list patterns;       /* list of acl_patterns */
+	int (*parse)(const char **text, struct acl_pattern *pattern, int *opaque, char **err);
+	int (*match)(struct sample *smp, struct acl_pattern *pattern);
+	struct arg *args;             /* optional fetch argument list (eg: header or cookie name) */
+	struct sample_fetch *smp;     /* the sample fetch we depend on */
+	struct list patterns;         /* list of acl_patterns */
 	struct eb_root pattern_tree;  /* may be used for lookup in large datasets */
+	struct list list;             /* chaining */
+	const char *kw;               /* points to the ACL kw's name or fetch's name (must not free) */
 };
 
 /* The acl will be linked to from the proxy where it is declared */
@@ -284,7 +206,8 @@ struct acl {
 	char *name;		    /* acl name */
 	struct list expr;	    /* list of acl_exprs */
 	int cache_idx;              /* ACL index in cache */
-	unsigned int requires;      /* or'ed bit mask of all acl_expr's ACL_USE_* */
+	unsigned int use;           /* or'ed bit mask of all acl_expr's SMP_USE_* */
+	unsigned int val;           /* or'ed bit mask of all acl_expr's SMP_VAL_* */
 };
 
 /* the condition will be linked to from an action in a proxy */
@@ -303,7 +226,8 @@ struct acl_cond {
 	struct list list;           /* Some specific tests may use multiple conditions */
 	struct list suites;         /* list of acl_term_suites */
 	int pol;                    /* polarity: ACL_COND_IF / ACL_COND_UNLESS */
-	unsigned int requires;      /* or'ed bit mask of all acl's ACL_USE_* */
+	unsigned int use;           /* or'ed bit mask of all suites's SMP_USE_* */
+	unsigned int val;           /* or'ed bit mask of all suites's SMP_VAL_* */
 	const char *file;           /* config file where the condition is declared */
 	int line;                   /* line in the config file where the condition is declared */
 };

@@ -165,6 +165,21 @@ static int ssl_sock_advertise_npn_protos(SSL *s, const unsigned char **data,
 }
 #endif
 
+#ifdef OPENSSL_ALPN_NEGOTIATED
+/* This callback is used so that the server advertises the list of
+ * negociable protocols for ALPN.
+ */
+static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **data,
+                                          unsigned int *len, void *arg)
+{
+	struct bind_conf *conf = arg;
+
+	*data = (const unsigned char *)conf->alpn_str;
+	*len = conf->alpn_len;
+	return SSL_TLSEXT_ERR_OK;
+}
+#endif
+
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 /* Sets the SSL ctx of <ssl> to match the advertised server name. Returns a
  * warning when no match is found, which implies the default (first) cert
@@ -258,10 +273,36 @@ end:
 }
 #endif
 
+int ssl_sock_add_cert_sni(SSL_CTX *ctx, struct bind_conf *s, char *name, int len, int order)
+{
+	struct sni_ctx *sc;
+	int wild = 0;
+	int j;
+
+	if (len) {
+		if (*name == '*') {
+			wild = 1;
+			name++;
+			len--;
+		}
+		sc = malloc(sizeof(struct sni_ctx) + len + 1);
+		for (j = 0; j < len; j++)
+			sc->name.key[j] = tolower(name[j]);
+		sc->name.key[len] = 0;
+		sc->order = order++;
+		sc->ctx = ctx;
+		if (wild)
+			ebst_insert(&s->sni_w_ctx, &sc->name);
+		else
+			ebst_insert(&s->sni_ctx, &sc->name);
+	}
+	return order;
+}
+
 /* Loads a certificate key and CA chain from a file. Returns 0 on error, -1 if
  * an early error happens and the caller must call SSL_CTX_free() by itelf.
  */
-int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct bind_conf *s)
+int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct bind_conf *s, char *sni_filter)
 {
 	BIO *in;
 	X509 *x = NULL, *ca;
@@ -270,7 +311,6 @@ int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct bind_co
 	int order = 0;
 	X509_NAME *xname;
 	char *str;
-	struct sni_ctx *sc;
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	STACK_OF(GENERAL_NAME) *names;
 #endif
@@ -286,71 +326,43 @@ int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct bind_co
 	if (x == NULL)
 		goto end;
 
-#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-	names = X509_get_ext_d2i(x, NID_subject_alt_name, NULL, NULL);
-	if (names) {
-		for (i = 0; i < sk_GENERAL_NAME_num(names); i++) {
-			GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
-			if (name->type == GEN_DNS) {
-				if (ASN1_STRING_to_UTF8((unsigned char **)&str, name->d.dNSName) >= 0) {
-					if ((len = strlen(str))) {
-						int j;
-
-						if (*str != '*') {
-							sc = malloc(sizeof(struct sni_ctx) + len + 1);
-							for (j = 0; j < len; j++)
-								sc->name.key[j] = tolower(str[j]);
-							sc->name.key[len] = 0;
-							sc->order = order++;
-							sc->ctx = ctx;
-							ebst_insert(&s->sni_ctx, &sc->name);
-						}
-						else {
-							sc = malloc(sizeof(struct sni_ctx) + len);
-							for (j = 1; j < len; j++)
-								sc->name.key[j-1] = tolower(str[j]);
-							sc->name.key[len-1] = 0;
-							sc->order = order++;
-							sc->ctx = ctx;
-							ebst_insert(&s->sni_w_ctx, &sc->name);
-						}
-					}
-					OPENSSL_free(str);
-				}
-			}
+	if (sni_filter) {
+		while (*sni_filter) {
+			while (isspace(*sni_filter))
+				sni_filter++;
+			str = sni_filter;
+			while (!isspace(*sni_filter) && *sni_filter)
+				sni_filter++;
+			len = sni_filter - str;
+			order = ssl_sock_add_cert_sni(ctx, s, str, len, order);
 		}
-		sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
 	}
-#endif /* SSL_CTRL_SET_TLSEXT_HOSTNAME */
-
-	xname = X509_get_subject_name(x);
-	i = -1;
-	while ((i = X509_NAME_get_index_by_NID(xname, NID_commonName, i)) != -1) {
-		X509_NAME_ENTRY *entry = X509_NAME_get_entry(xname, i);
-		if (ASN1_STRING_to_UTF8((unsigned char **)&str, entry->value) >= 0) {
-			if ((len = strlen(str))) {
-				int j;
-
-				if (*str != '*') {
-					sc = malloc(sizeof(struct sni_ctx) + len + 1);
-					for (j = 0; j < len; j++)
-						sc->name.key[j] = tolower(str[j]);
-					sc->name.key[len] = 0;
-					sc->order = order++;
-					sc->ctx = ctx;
-					ebst_insert(&s->sni_ctx, &sc->name);
-				}
-				else {
-					sc = malloc(sizeof(struct sni_ctx) + len);
-					for (j = 1; j < len; j++)
-						sc->name.key[j-1] = tolower(str[j]);
-					sc->name.key[len-1] = 0;
-					sc->order = order++;
-					sc->ctx = ctx;
-					ebst_insert(&s->sni_w_ctx, &sc->name);
+	else {
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
+		names = X509_get_ext_d2i(x, NID_subject_alt_name, NULL, NULL);
+		if (names) {
+			for (i = 0; i < sk_GENERAL_NAME_num(names); i++) {
+				GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
+				if (name->type == GEN_DNS) {
+					if (ASN1_STRING_to_UTF8((unsigned char **)&str, name->d.dNSName) >= 0) {
+						len = strlen(str);
+						order = ssl_sock_add_cert_sni(ctx, s, str, len, order);
+						OPENSSL_free(str);
+					}
 				}
 			}
-			OPENSSL_free(str);
+			sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
+		}
+#endif /* SSL_CTRL_SET_TLSEXT_HOSTNAME */
+		xname = X509_get_subject_name(x);
+		i = -1;
+		while ((i = X509_NAME_get_index_by_NID(xname, NID_commonName, i)) != -1) {
+			X509_NAME_ENTRY *entry = X509_NAME_get_entry(xname, i);
+			if (ASN1_STRING_to_UTF8((unsigned char **)&str, entry->value) >= 0) {
+				len = strlen(str);
+				order = ssl_sock_add_cert_sni(ctx, s, str, len, order);
+				OPENSSL_free(str);
+			}
 		}
 	}
 
@@ -387,7 +399,7 @@ end:
 	return ret;
 }
 
-static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf, struct proxy *curproxy, char **err)
+static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf, struct proxy *curproxy, char *sni_filter, char **err)
 {
 	int ret;
 	SSL_CTX *ctx;
@@ -406,7 +418,7 @@ static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf
 		return 1;
 	}
 
-	ret = ssl_sock_load_cert_chain_file(ctx, path, bind_conf);
+	ret = ssl_sock_load_cert_chain_file(ctx, path, bind_conf, sni_filter);
 	if (ret <= 0) {
 		memprintf(err, "%sunable to load SSL certificate from PEM file '%s'.\n",
 		          err && *err ? *err : "", path);
@@ -457,7 +469,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, struct proxy *cu
 	int cfgerr = 0;
 
 	if (!(dir = opendir(path)))
-		return ssl_sock_load_cert_file(path, bind_conf, curproxy, err);
+		return ssl_sock_load_cert_file(path, bind_conf, curproxy, NULL, err);
 
 	/* strip trailing slashes, including first one */
 	for (end = path + strlen(path) - 1; end >= path && *end == '/'; end--)
@@ -473,7 +485,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, struct proxy *cu
 		}
 		if (!S_ISREG(buf.st_mode))
 			continue;
-		cfgerr += ssl_sock_load_cert_file(fp, bind_conf, curproxy, err);
+		cfgerr += ssl_sock_load_cert_file(fp, bind_conf, curproxy, NULL, err);
 	}
 	closedir(dir);
 	return cfgerr;
@@ -493,6 +505,82 @@ static int ssl_initialize_random()
 		random_initialized = 1;
 
 	return random_initialized;
+}
+
+int ssl_sock_load_cert_list_file(char *file, struct bind_conf *bind_conf, struct proxy *curproxy, char **err)
+{
+	char thisline[65536];
+	FILE *f;
+	int linenum = 0;
+	int cfgerr = 0;
+
+	if ((f = fopen(file, "r")) == NULL) {
+		memprintf(err, "cannot open file '%s' : %s", file, strerror(errno));
+		return 1;
+	}
+
+	while (fgets(thisline, sizeof(thisline), f) != NULL) {
+		int arg;
+		char *end;
+		char *args[MAX_LINE_ARGS + 1];
+		char *line = thisline;
+
+		linenum++;
+		end = line + strlen(line);
+		if (end-line == sizeof(thisline)-1 && *(end-1) != '\n') {
+			/* Check if we reached the limit and the last char is not \n.
+			 * Watch out for the last line without the terminating '\n'!
+			 */
+			memprintf(err, "line %d too long in file '%s', limit is %d characters",
+				  linenum, file, (int)sizeof(thisline)-1);
+			cfgerr = 1;
+			break;
+		}
+
+		/* skip leading spaces */
+		while (isspace(*line))
+			line++;
+
+		arg = 0;
+		args[arg] = line;
+
+		while (*line && arg < MAX_LINE_ARGS) {
+			if (*line == '#' || *line == '\n' || *line == '\r') {
+				/* end of string, end of loop */
+				*line = 0;
+				break;
+			}
+			else if (isspace(*line)) {
+				/* a non-escaped space is an argument separator */
+				*line++ = '\0';
+				while (isspace(*line))
+					line++;
+				args[++arg] = line;
+			}
+			else {
+				line++;
+			}
+		}
+
+		/* empty line */
+		if (!**args)
+			continue;
+
+		if (arg > 2) {
+			memprintf(err, "too many args on line %d in file '%s', only one SNI filter is supported (was '%s')",
+				  linenum, file, args[2]);
+			cfgerr = 1;
+			break;
+		}
+
+		cfgerr = ssl_sock_load_cert_file(args[0], bind_conf, curproxy, arg > 1 ? args[1] : NULL, err);
+		if (cfgerr) {
+			memprintf(err, "error processing line %d in file '%s' : %s", linenum, file, *err);
+			break;
+		}
+	}
+	fclose(f);
+	return cfgerr;
 }
 
 #ifndef SSL_OP_CIPHER_SERVER_PREFERENCE                 /* needs OpenSSL >= 0.9.7 */
@@ -618,6 +706,10 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 #ifdef OPENSSL_NPN_NEGOTIATED
 	if (bind_conf->npn_str)
 		SSL_CTX_set_next_protos_advertised_cb(ctx, ssl_sock_advertise_npn_protos, bind_conf);
+#endif
+#ifdef OPENSSL_ALPN_NEGOTIATED
+	if (bind_conf->alpn_str)
+		SSL_CTX_set_alpn_advertised_cb(ctx, ssl_sock_advertise_alpn_protos, bind_conf);
 #endif
 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
@@ -2180,6 +2272,28 @@ smp_fetch_ssl_fc_npn(struct proxy *px, struct session *l4, void *l7, unsigned in
 }
 #endif
 
+#ifdef OPENSSL_ALPN_NEGOTIATED
+static int
+smp_fetch_ssl_fc_alpn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                      const struct arg *args, struct sample *smp)
+{
+	smp->flags = 0;
+	smp->type = SMP_T_CSTR;
+
+	if (!l4 || !l4->si[0].conn->xprt_ctx || l4->si[0].conn->xprt != &ssl_sock)
+		return 0;
+
+	smp->data.str.str = NULL;
+	SSL_get0_alpn_negotiated(l4->si[0].conn->xprt_ctx,
+	                         (const unsigned char **)&smp->data.str.str, (unsigned *)&smp->data.str.len);
+
+	if (!smp->data.str.str)
+		return 0;
+
+	return 1;
+}
+#endif
+
 static int
 smp_fetch_ssl_fc_protocol(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                           const struct arg *args, struct sample *smp)
@@ -2384,6 +2498,22 @@ static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bin
 
 	if (ssl_sock_load_cert(args[cur_arg + 1], conf, px, err) > 0)
 		return ERR_ALERT | ERR_FATAL;
+
+	return 0;
+}
+
+/* parse the "crt-list" bind keyword */
+static int bind_parse_crt_list(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (ssl_sock_load_cert_list_file(args[cur_arg + 1], conf, px, err) > 0) {
+		memprintf(err, "'%s' : %s", args[cur_arg], *err);
+		return ERR_ALERT | ERR_FATAL;
+	}
 
 	return 0;
 }
@@ -2594,6 +2724,54 @@ static int bind_parse_npn(char **args, int cur_arg, struct proxy *px, struct bin
 #else
 	if (err)
 		memprintf(err, "'%s' : library does not support TLS NPN extension", args[cur_arg]);
+	return ERR_ALERT | ERR_FATAL;
+#endif
+}
+
+/* parse the "alpn" bind keyword */
+static int bind_parse_alpn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+#ifdef OPENSSL_ALPN_NEGOTIATED
+	char *p1, *p2;
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing the comma-delimited ALPN protocol suite", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	free(conf->alpn_str);
+
+	/* the ALPN string is built as a suite of (<len> <name>)* */
+	conf->alpn_len = strlen(args[cur_arg + 1]) + 1;
+	conf->alpn_str = calloc(1, conf->alpn_len);
+	memcpy(conf->alpn_str + 1, args[cur_arg + 1], conf->alpn_len);
+
+	/* replace commas with the name length */
+	p1 = conf->alpn_str;
+	p2 = p1 + 1;
+	while (1) {
+		p2 = memchr(p1 + 1, ',', conf->alpn_str + conf->alpn_len - (p1 + 1));
+		if (!p2)
+			p2 = p1 + 1 + strlen(p1 + 1);
+
+		if (p2 - (p1 + 1) > 255) {
+			*p2 = '\0';
+			memprintf(err, "'%s' : ALPN protocol name too long : '%s'", args[cur_arg], p1 + 1);
+			return ERR_ALERT | ERR_FATAL;
+		}
+
+		*p1 = p2 - (p1 + 1);
+		p1 = p2;
+
+		if (!*p2)
+			break;
+
+		*(p2++) = '\0';
+	}
+	return 0;
+#else
+	if (err)
+		memprintf(err, "'%s' : library does not support TLS ALPN extension", args[cur_arg]);
 	return ERR_ALERT | ERR_FATAL;
 #endif
 }
@@ -2838,39 +3016,42 @@ static int srv_parse_verify(char **args, int *cur_arg, struct proxy *px, struct 
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
-	{ "ssl_c_ca_err",           smp_fetch_ssl_c_ca_err,       0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_ca_err_depth",     smp_fetch_ssl_c_ca_err_depth, 0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_err",              smp_fetch_ssl_c_err,          0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_i_dn",             smp_fetch_ssl_c_i_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_key_alg",          smp_fetch_ssl_c_key_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_notafter",         smp_fetch_ssl_c_notafter,     0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_notbefore",        smp_fetch_ssl_c_notbefore,    0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_sig_alg",          smp_fetch_ssl_c_sig_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_s_dn",             smp_fetch_ssl_c_s_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_serial",           smp_fetch_ssl_c_serial,       0,    NULL,    SMP_T_BIN,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_used",             smp_fetch_ssl_c_used,         0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_verify",           smp_fetch_ssl_c_verify,       0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_c_version",          smp_fetch_ssl_c_version,      0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_i_dn",             smp_fetch_ssl_f_i_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_key_alg",          smp_fetch_ssl_f_key_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_notafter",         smp_fetch_ssl_f_notafter,     0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_notbefore",        smp_fetch_ssl_f_notbefore,    0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_sig_alg",          smp_fetch_ssl_f_sig_alg,      0,    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_s_dn",             smp_fetch_ssl_f_s_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_serial",           smp_fetch_ssl_f_serial,       0,    NULL,    SMP_T_BIN, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_f_version",          smp_fetch_ssl_f_version,      0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc",                 smp_fetch_ssl_fc,             0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc_alg_keysize",     smp_fetch_ssl_fc_alg_keysize, 0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc_cipher",          smp_fetch_ssl_fc_cipher,      0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc_has_crt",         smp_fetch_ssl_fc_has_crt,     0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc_has_sni",         smp_fetch_ssl_fc_has_sni,     0,    NULL,    SMP_T_BOOL, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_c_ca_err",           smp_fetch_ssl_c_ca_err,       0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_c_ca_err_depth",     smp_fetch_ssl_c_ca_err_depth, 0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_c_err",              smp_fetch_ssl_c_err,          0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_c_i_dn",             smp_fetch_ssl_c_i_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_c_key_alg",          smp_fetch_ssl_c_key_alg,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_c_notafter",         smp_fetch_ssl_c_notafter,     0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_c_notbefore",        smp_fetch_ssl_c_notbefore,    0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_c_sig_alg",          smp_fetch_ssl_c_sig_alg,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_c_s_dn",             smp_fetch_ssl_c_s_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_c_serial",           smp_fetch_ssl_c_serial,       0,                   NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
+	{ "ssl_c_used",             smp_fetch_ssl_c_used,         0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
+	{ "ssl_c_verify",           smp_fetch_ssl_c_verify,       0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_c_version",          smp_fetch_ssl_c_version,      0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_f_i_dn",             smp_fetch_ssl_f_i_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_f_key_alg",          smp_fetch_ssl_f_key_alg,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_f_notafter",         smp_fetch_ssl_f_notafter,     0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_f_notbefore",        smp_fetch_ssl_f_notbefore,    0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_f_sig_alg",          smp_fetch_ssl_f_sig_alg,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_f_s_dn",             smp_fetch_ssl_f_s_dn,         ARG2(0,STR,SINT),    NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_f_serial",           smp_fetch_ssl_f_serial,       0,                   NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
+	{ "ssl_f_version",          smp_fetch_ssl_f_version,      0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_fc",                 smp_fetch_ssl_fc,             0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
+	{ "ssl_fc_alg_keysize",     smp_fetch_ssl_fc_alg_keysize, 0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_fc_cipher",          smp_fetch_ssl_fc_cipher,      0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+	{ "ssl_fc_has_crt",         smp_fetch_ssl_fc_has_crt,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
+	{ "ssl_fc_has_sni",         smp_fetch_ssl_fc_has_sni,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 #ifdef OPENSSL_NPN_NEGOTIATED
-	{ "ssl_fc_npn",             smp_fetch_ssl_fc_npn,         0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
+	{ "ssl_fc_npn",             smp_fetch_ssl_fc_npn,         0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
 #endif
-	{ "ssl_fc_protocol",        smp_fetch_ssl_fc_protocol,    0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc_use_keysize",     smp_fetch_ssl_fc_use_keysize, 0,    NULL,    SMP_T_UINT, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc_session_id",      smp_fetch_ssl_fc_session_id,  0,    NULL,    SMP_T_CBIN, SMP_CAP_REQ|SMP_CAP_RES },
-	{ "ssl_fc_sni",             smp_fetch_ssl_fc_sni,         0,    NULL,    SMP_T_CSTR, SMP_CAP_REQ|SMP_CAP_RES },
+#ifdef OPENSSL_ALPN_NEGOTIATED
+	{ "ssl_fc_alpn",            smp_fetch_ssl_fc_alpn,        0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+#endif
+	{ "ssl_fc_protocol",        smp_fetch_ssl_fc_protocol,    0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+	{ "ssl_fc_use_keysize",     smp_fetch_ssl_fc_use_keysize, 0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
+	{ "ssl_fc_session_id",      smp_fetch_ssl_fc_session_id,  0,                   NULL,    SMP_T_CBIN, SMP_USE_L5CLI },
+	{ "ssl_fc_sni",             smp_fetch_ssl_fc_sni,         0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
 	{ NULL, NULL, 0, 0, 0 },
 }};
 
@@ -2878,41 +3059,44 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {{ },{
-	{ "ssl_c_ca_err",           acl_parse_int, smp_fetch_ssl_c_ca_err,       acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_ca_err_depth",     acl_parse_int, smp_fetch_ssl_c_ca_err_depth, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_err",              acl_parse_int, smp_fetch_ssl_c_err,          acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_i_dn",             acl_parse_str, smp_fetch_ssl_c_i_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
-	{ "ssl_c_key_alg",          acl_parse_str, smp_fetch_ssl_c_key_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_notafter",         acl_parse_str, smp_fetch_ssl_c_notafter,     acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_notbefore",        acl_parse_str, smp_fetch_ssl_c_notbefore,    acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_sig_alg",          acl_parse_str, smp_fetch_ssl_c_sig_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_s_dn",             acl_parse_str, smp_fetch_ssl_c_s_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
-	{ "ssl_c_serial",           acl_parse_bin, smp_fetch_ssl_c_serial,       acl_match_bin,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_used",             acl_parse_int, smp_fetch_ssl_c_used,         acl_match_nothing, ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_verify",           acl_parse_int, smp_fetch_ssl_c_verify,       acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_c_version",          acl_parse_int, smp_fetch_ssl_c_version,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_f_i_dn",             acl_parse_str, smp_fetch_ssl_f_i_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
-	{ "ssl_f_key_alg",          acl_parse_str, smp_fetch_ssl_f_key_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_f_notafter",         acl_parse_str, smp_fetch_ssl_f_notafter,     acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_f_notbefore",        acl_parse_str, smp_fetch_ssl_f_notbefore,    acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_f_sig_alg",          acl_parse_str, smp_fetch_ssl_f_sig_alg,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_f_s_dn",             acl_parse_str, smp_fetch_ssl_f_s_dn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, ARG2(0,STR,SINT) },
-	{ "ssl_f_serial",           acl_parse_bin, smp_fetch_ssl_f_serial,       acl_match_bin,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_f_version",          acl_parse_int, smp_fetch_ssl_f_version,      acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_fc",                 acl_parse_int, smp_fetch_ssl_fc,             acl_match_nothing, ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_fc_alg_keysize",     acl_parse_str, smp_fetch_ssl_fc_alg_keysize, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_fc_cipher",          acl_parse_str, smp_fetch_ssl_fc_cipher,      acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_fc_has_crt",         acl_parse_int, smp_fetch_ssl_fc_has_crt,     acl_match_nothing, ACL_USE_L6REQ_PERMANENT, 0 },
-	{ "ssl_fc_has_sni",         acl_parse_int, smp_fetch_ssl_fc_has_sni,     acl_match_nothing, ACL_USE_L6REQ_PERMANENT, 0 },
+	{ "ssl_c_ca_err",           NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_c_ca_err_depth",     NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_c_err",              NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_c_i_dn",             NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_c_key_alg",          NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_c_notafter",         NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_c_notbefore",        NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_c_sig_alg",          NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_c_s_dn",             NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_c_serial",           NULL,         acl_parse_bin,     acl_match_bin     },
+	{ "ssl_c_used",             NULL,         acl_parse_nothing, acl_match_nothing },
+	{ "ssl_c_verify",           NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_c_version",          NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_f_i_dn",             NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_f_key_alg",          NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_f_notafter",         NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_f_notbefore",        NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_f_sig_alg",          NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_f_s_dn",             NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_f_serial",           NULL,         acl_parse_bin,     acl_match_bin     },
+	{ "ssl_f_version",          NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_fc",                 NULL,         acl_parse_nothing, acl_match_nothing },
+	{ "ssl_fc_alg_keysize",     NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_fc_cipher",          NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_fc_has_crt",         NULL,         acl_parse_nothing, acl_match_nothing },
+	{ "ssl_fc_has_sni",         NULL,         acl_parse_nothing, acl_match_nothing },
 #ifdef OPENSSL_NPN_NEGOTIATED
-	{ "ssl_fc_npn",             acl_parse_str, smp_fetch_ssl_fc_npn,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
+	{ "ssl_fc_npn",             NULL,         acl_parse_str,     acl_match_str     },
 #endif
-	{ "ssl_fc_protocol",        acl_parse_str, smp_fetch_ssl_fc_protocol,    acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_fc_use_keysize",     acl_parse_str, smp_fetch_ssl_fc_use_keysize, acl_match_int,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_fc_sni",             acl_parse_str, smp_fetch_ssl_fc_sni,         acl_match_str,     ACL_USE_L6REQ_PERMANENT|ACL_MAY_LOOKUP, 0 },
-	{ "ssl_fc_sni_end",         acl_parse_str, smp_fetch_ssl_fc_sni,         acl_match_end,     ACL_USE_L6REQ_PERMANENT, 0 },
-	{ "ssl_fc_sni_reg",         acl_parse_reg, smp_fetch_ssl_fc_sni,         acl_match_reg,     ACL_USE_L6REQ_PERMANENT, 0 },
-	{ NULL, NULL, NULL, NULL },
+#ifdef OPENSSL_ALPN_NEGOTIATED
+	{ "ssl_fc_alpn",            NULL,         acl_parse_str,     acl_match_str     },
+#endif
+	{ "ssl_fc_protocol",        NULL,         acl_parse_str,     acl_match_str     },
+	{ "ssl_fc_use_keysize",     NULL,         acl_parse_int,     acl_match_int     },
+	{ "ssl_fc_sni",             "ssl_fc_sni", acl_parse_str,     acl_match_str     },
+	{ "ssl_fc_sni_end",         "ssl_fc_sni", acl_parse_str,     acl_match_end     },
+	{ "ssl_fc_sni_reg",         "ssl_fc_sni", acl_parse_reg,     acl_match_reg     },
+	{ /* END */ },
 }};
 
 /* Note: must not be declared <const> as its list will be overwritten.
@@ -2923,12 +3107,14 @@ static struct acl_kw_list acl_kws = {{ },{
  * not enabled.
  */
 static struct bind_kw_list bind_kws = { "SSL", { }, {
+	{ "alpn",                  bind_parse_alpn,           1 }, /* set ALPN supported protocols */
 	{ "ca-file",               bind_parse_ca_file,        1 }, /* set CAfile to process verify on client cert */
 	{ "ca-ignore-err",         bind_parse_ignore_err,     1 }, /* set error IDs to ignore on verify depth > 0 */
 	{ "ciphers",               bind_parse_ciphers,        1 }, /* set SSL cipher suite */
 	{ "crl-file",              bind_parse_crl_file,       1 }, /* set certificat revocation list file use on client cert verify */
 	{ "crt",                   bind_parse_crt,            1 }, /* load SSL certificates from this location */
 	{ "crt-ignore-err",        bind_parse_ignore_err,     1 }, /* set error IDs to ingore on verify depth == 0 */
+	{ "crt-list",              bind_parse_crt_list,       1 }, /* load a list of crt from this location */
 	{ "ecdhe",                 bind_parse_ecdhe,          1 }, /* defines named curve for elliptic curve Diffie-Hellman */
 	{ "force-sslv3",           bind_parse_force_sslv3,    0 }, /* force SSLv3 */
 	{ "force-tlsv10",          bind_parse_force_tlsv10,   0 }, /* force TLSv10 */

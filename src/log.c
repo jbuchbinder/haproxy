@@ -307,9 +307,9 @@ void add_to_logformat_list(char *start, char *end, int type, struct list *list_f
 /*
  * Parse the sample fetch expression <text> and add a node to <list_format> upon
  * success. At the moment, sample converters are not yet supported but fetch arguments
- * should work.
+ * should work. The curpx->conf.args.ctx must be set by the caller.
  */
-void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options)
+void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options, int cap)
 {
 	char *cmd[2];
 	struct sample_expr *expr;
@@ -320,7 +320,7 @@ void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct pro
 	cmd[1] = "";
 	cmd_arg = 0;
 
-	expr = sample_parse_expr(cmd, &cmd_arg, trash.str, trash.size);
+	expr = sample_parse_expr(cmd, &cmd_arg, trash.str, trash.size, &curpx->conf.args);
 	if (!expr) {
 		Warning("log-format: sample fetch <%s> failed with : %s\n", text, trash.str);
 		return;
@@ -335,16 +335,19 @@ void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct pro
 		node->arg = my_strndup(arg, arg_len);
 		parse_logformat_var_args(node->arg, node);
 	}
-	if (expr->fetch->cap & SMP_CAP_REQ)
+	if (expr->fetch->val & cap & SMP_VAL_REQUEST)
 		node->options |= LOG_OPT_REQ_CAP; /* fetch method is request-compatible */
 
-	if (expr->fetch->cap & SMP_CAP_RES)
+	if (expr->fetch->val & cap & SMP_VAL_RESPONSE)
 		node->options |= LOG_OPT_RES_CAP; /* fetch method is response-compatible */
+
+	if (!(expr->fetch->val & cap))
+		Warning("log-format: sample fetch <%s> may not be reliably used %s because it needs '%s' which is not available here.\n",
+			text, cap == SMP_VAL_FE_LOG_END ? "with 'log-format'" : "here", sample_src_names(expr->fetch->use));
 
 	/* check if we need to allocate an hdr_idx struct for HTTP parsing */
 	/* Note, we may also need to set curpx->to_log with certain fetches */
-	if (expr->fetch->cap & SMP_CAP_L7)
-		curpx->acl_requires |= ACL_USE_L7_ANY;
+	curpx->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
 
 	/* FIXME: temporary workaround for missing LW_XPRT flag needed with some
 	 * sample fetches (eg: ssl*). We always set it for now on, but this will
@@ -357,14 +360,16 @@ void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct pro
 /*
  * Parse the log_format string and fill a linked list.
  * Variable name are preceded by % and composed by characters [a-zA-Z0-9]* : %varname
- * You can set arguments using { } : %{many arguments}varname
+ * You can set arguments using { } : %{many arguments}varname.
+ * The curproxy->conf.args.ctx must be set by the caller.
  *
  *  str: the string to parse
  *  curproxy: the proxy affected
  *  list_format: the destination list
  *  options: LOG_OPT_* to force on every node
+ *  cap: all SMP_VAL_* flags supported by the consumer
  */
-void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list *list_format, int options)
+void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list *list_format, int options, int cap)
 {
 	char *sp, *str, *backfmt; /* start pointer for text parts */
 	char *arg = NULL; /* start pointer for args */
@@ -473,7 +478,7 @@ void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list
 				parse_logformat_var(arg, arg_len, var, var_len, curproxy, list_format, &options);
 				break;
 			case LF_STEXPR:
-				add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options);
+				add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options, cap);
 				break;
 			case LF_TEXT:
 			case LF_SEPARATOR:

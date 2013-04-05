@@ -19,9 +19,14 @@
 
 #include <common/chunk.h>
 #include <common/standard.h>
+#include <common/uri_auth.h>
 
 #include <proto/arg.h>
+#include <proto/auth.h>
+#include <proto/log.h>
+#include <proto/proxy.h>
 #include <proto/sample.h>
+#include <proto/stick_table.h>
 
 /* static sample used in sample_process() when <p> is NULL */
 static struct sample temp_smp;
@@ -36,13 +41,285 @@ static struct sample_conv_kw_list sample_convs = {
 	.list = LIST_HEAD_INIT(sample_convs.list)
 };
 
-/*
- * Registers the sample fetch keyword list <kwl> as a list of valid keywords for next
- * parsing sessions.
+const unsigned int fetch_cap[SMP_SRC_ENTRIES] = {
+	[SMP_SRC_INTRN] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_LISTN] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_FTEND] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_L4CLI] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_L5CLI] = (SMP_VAL___________ | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_TRACK] = (SMP_VAL_FE_CON_ACC | SMP_VAL_FE_SES_ACC | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_L6REQ] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________),
+
+	[SMP_SRC_HRQHV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________),
+
+	[SMP_SRC_HRQHP] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_FE_REQ_CNT |
+	                   SMP_VAL_FE_HRQ_HDR | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_HRQBO] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL_FE_HRQ_BDY | SMP_VAL_FE_SET_BCK |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________),
+
+	[SMP_SRC_BKEND] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL_BE_REQ_CNT | SMP_VAL_BE_HRQ_HDR | SMP_VAL_BE_HRQ_BDY |
+	                   SMP_VAL_BE_SET_SRV | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_SERVR] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL_BE_SRV_CON | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_L4SRV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_L5SRV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_L6RES] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL___________),
+
+	[SMP_SRC_HRSHV] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL___________),
+
+	[SMP_SRC_HRSHP] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL_BE_RES_CNT |
+	                   SMP_VAL_BE_HRS_HDR | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_HRSBO] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL_BE_HRS_BDY | SMP_VAL_BE_STO_RUL |
+	                   SMP_VAL_FE_RES_CNT | SMP_VAL_FE_HRS_HDR | SMP_VAL_FE_HRS_BDY |
+	                   SMP_VAL___________),
+
+	[SMP_SRC_RQFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_RSFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_TXFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL_FE_LOG_END),
+
+	[SMP_SRC_SSFIN] = (SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL___________ | SMP_VAL___________ | SMP_VAL___________ |
+	                   SMP_VAL_FE_LOG_END),
+};
+
+static const char *fetch_src_names[SMP_SRC_ENTRIES] = {
+	[SMP_SRC_INTRN] = "internal state",
+	[SMP_SRC_LISTN] = "listener",
+	[SMP_SRC_FTEND] = "frontend",
+	[SMP_SRC_L4CLI] = "client address",
+	[SMP_SRC_L5CLI] = "client-side connection",
+	[SMP_SRC_TRACK] = "track counters",
+	[SMP_SRC_L6REQ] = "request buffer",
+	[SMP_SRC_HRQHV] = "HTTP request headers",
+	[SMP_SRC_HRQHP] = "HTTP request",
+	[SMP_SRC_HRQBO] = "HTTP request body",
+	[SMP_SRC_BKEND] = "backend",
+	[SMP_SRC_SERVR] = "server",
+	[SMP_SRC_L4SRV] = "server address",
+	[SMP_SRC_L5SRV] = "server-side connection",
+	[SMP_SRC_L6RES] = "response buffer",
+	[SMP_SRC_HRSHV] = "HTTP response headers",
+	[SMP_SRC_HRSHP] = "HTTP response",
+	[SMP_SRC_HRSBO] = "HTTP response body",
+	[SMP_SRC_RQFIN] = "request buffer statistics",
+	[SMP_SRC_RSFIN] = "response buffer statistics",
+	[SMP_SRC_TXFIN] = "transaction statistics",
+	[SMP_SRC_SSFIN] = "session statistics",
+};
+
+static const char *fetch_ckp_names[SMP_CKP_ENTRIES] = {
+	[SMP_CKP_FE_CON_ACC] = "frontend tcp-request connection rule",
+	[SMP_CKP_FE_SES_ACC] = "frontend tcp-request session rule",
+	[SMP_CKP_FE_REQ_CNT] = "frontend tcp-request content rule",
+	[SMP_CKP_FE_HRQ_HDR] = "frontend http-request header rule",
+	[SMP_CKP_FE_HRQ_BDY] = "frontend http-request body rule",
+	[SMP_CKP_FE_SET_BCK] = "frontend use-backend rule",
+	[SMP_CKP_BE_REQ_CNT] = "backend tcp-request content rule",
+	[SMP_CKP_BE_HRQ_HDR] = "backend http-request header rule",
+	[SMP_CKP_BE_HRQ_BDY] = "backend http-request body rule",
+	[SMP_CKP_BE_SET_SRV] = "backend use-server, balance or stick-match rule",
+	[SMP_CKP_BE_SRV_CON] = "server source selection",
+	[SMP_CKP_BE_RES_CNT] = "backend tcp-response content rule",
+	[SMP_CKP_BE_HRS_HDR] = "backend http-response header rule",
+	[SMP_CKP_BE_HRS_BDY] = "backend http-response body rule",
+	[SMP_CKP_BE_STO_RUL] = "backend stick-store rule",
+	[SMP_CKP_FE_RES_CNT] = "frontend tcp-response content rule",
+	[SMP_CKP_FE_HRS_HDR] = "frontend http-response header rule",
+	[SMP_CKP_FE_HRS_BDY] = "frontend http-response body rule",
+	[SMP_CKP_FE_LOG_END] = "logs",
+};
+
+/* fill the trash with a comma-delimited list of source names for the <use> bit
+ * field which must be composed of a non-null set of SMP_USE_* flags. The return
+ * value is the pointer to the string in the trash buffer.
  */
-void sample_register_fetches(struct sample_fetch_kw_list *pfkl)
+const char *sample_src_names(unsigned int use)
 {
-	LIST_ADDQ(&sample_fetches.list, &pfkl->list);
+	int bit;
+
+	trash.len = 0;
+	trash.str[0] = '\0';
+	for (bit = 0; bit < SMP_SRC_ENTRIES; bit++) {
+		if (!(use & ~((1 << bit) - 1)))
+			break; /* no more bits */
+
+		if (!(use & (1 << bit)))
+			continue; /* bit not set */
+
+		trash.len += snprintf(trash.str + trash.len, trash.size - trash.len, "%s%s",
+				      (use & ((1 << bit) - 1)) ? "," : "",
+		                      fetch_src_names[bit]);
+	}
+	return trash.str;
+}
+
+/* return a pointer to the correct sample checkpoint name, or "unknown" when
+ * the flags are invalid. Only the lowest bit is used, higher bits are ignored
+ * if set.
+ */
+const char *sample_ckp_names(unsigned int use)
+{
+	int bit;
+
+	for (bit = 0; bit < SMP_CKP_ENTRIES; bit++)
+		if (use & (1 << bit))
+			return fetch_ckp_names[bit];
+	return "unknown sample check place, please report this bug";
+}
+
+/*
+ * Registers the sample fetch keyword list <kwl> as a list of valid keywords
+ * for next parsing sessions. The fetch keywords capabilities are also computed
+ * from their ->use field.
+ */
+void sample_register_fetches(struct sample_fetch_kw_list *kwl)
+{
+	struct sample_fetch *sf;
+	int bit;
+
+	for (sf = kwl->kw; sf->kw != NULL; sf++) {
+		for (bit = 0; bit < SMP_SRC_ENTRIES; bit++)
+			if (sf->use & (1 << bit))
+				sf->val |= fetch_cap[bit];
+	}
+	LIST_ADDQ(&sample_fetches.list, &kwl->list);
 }
 
 /*
@@ -253,8 +530,9 @@ static sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
  * Parse a sample expression configuration:
  *        fetch keyword followed by format conversion keywords.
  * Returns a pointer on allocated sample expression structure.
+ * The caller must have set al->ctx.
  */
-struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_size)
+struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_size, struct arg_list *al)
 {
 	const char *endw;
 	const char *end;
@@ -326,7 +604,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_s
 			goto out_error;
 		}
 
-		if (make_arg_list(endw + 1, end - endw - 2, fetch->arg_mask, &expr->arg_p, &err_msg, NULL, &err_arg) < 0) {
+		al->kw = expr->fetch->kw;
+		al->conv = NULL;
+		if (make_arg_list(endw + 1, end - endw - 2, fetch->arg_mask, &expr->arg_p, &err_msg, NULL, &err_arg, al) < 0) {
 			p = my_strndup(str[*idx], endw - str[*idx]);
 			if (p) {
 				snprintf(err, err_size, "invalid arg %d in fetch method '%s' : %s.", err_arg+1, p, err_msg);
@@ -421,7 +701,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, char *err, int err_s
 				goto out_error;
 			}
 
-			if (make_arg_list(endw + 1, end - endw - 2, conv->arg_mask, &conv_expr->arg_p, &err_msg, NULL, &err_arg) < 0) {
+			al->kw = expr->fetch->kw;
+			al->conv = conv_expr->conv->kw;
+			if (make_arg_list(endw + 1, end - endw - 2, conv->arg_mask, &conv_expr->arg_p, &err_msg, NULL, &err_arg, al) < 0) {
 				p = my_strndup(str[*idx], endw - str[*idx]);
 				if (p) {
 					snprintf(err, err_size, "invalid arg %d in conv method '%s' : %s.", err_arg+1, p, err_msg);
@@ -512,6 +794,214 @@ struct sample *sample_process(struct proxy *px, struct session *l4, void *l7,
 			return NULL;
 	}
 	return p;
+}
+
+/*
+ * Resolve all remaining arguments in proxy <p>. Returns the number of
+ * errors or 0 if everything is fine.
+ */
+int smp_resolve_args(struct proxy *p)
+{
+	struct arg_list *cur, *bak;
+	const char *ctx, *where;
+	const char *conv_ctx, *conv_pre, *conv_pos;
+	struct userlist *ul;
+	struct arg *arg;
+	int cfgerr = 0;
+
+	list_for_each_entry_safe(cur, bak, &p->conf.args.list, list) {
+		struct proxy *px;
+		struct server *srv;
+		char *pname, *sname;
+
+		arg = cur->arg;
+
+		/* prepare output messages */
+		conv_pre = conv_pos = conv_ctx = "";
+		if (cur->conv) {
+			conv_ctx = cur->conv;
+			conv_pre = "conversion keyword '";
+			conv_pos = "' for ";
+		}
+
+		where = "in";
+		ctx = "sample fetch keyword";
+		switch (cur->ctx) {
+		case ARGC_STK:where = "in stick rule in"; break;
+		case ARGC_TRK: where = "in tracking rule in"; break;
+		case ARGC_LOG: where = "in log-format string in"; break;
+		case ARGC_HDR: where = "in HTTP header format string in"; break;
+		case ARGC_UIF: where = "in unique-id-format string in"; break;
+		case ARGC_ACL: ctx = "ACL keyword"; break;
+		}
+
+		/* set a few default settings */
+		px = p;
+		pname = p->id;
+
+		switch (arg->type) {
+		case ARGT_SRV:
+			if (!arg->data.str.len) {
+				Alert("parsing [%s:%d] : missing server name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				continue;
+			}
+
+			/* we support two formats : "bck/srv" and "srv" */
+			sname = strrchr(arg->data.str.str, '/');
+
+			if (sname) {
+				*sname++ = '\0';
+				pname = arg->data.str.str;
+
+				px = findproxy(pname, PR_CAP_BE);
+				if (!px) {
+					Alert("parsing [%s:%d] : unable to find proxy '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+					      cur->file, cur->line, pname,
+					      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+					cfgerr++;
+					break;
+				}
+			}
+			else
+				sname = arg->data.str.str;
+
+			srv = findserver(px, sname);
+			if (!srv) {
+				Alert("parsing [%s:%d] : unable to find server '%s' in proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line, sname, pname,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			free(arg->data.str.str);
+			arg->data.str.str = NULL;
+			arg->unresolved = 0;
+			arg->data.srv = srv;
+			break;
+
+		case ARGT_FE:
+			if (arg->data.str.len) {
+				pname = arg->data.str.str;
+				px = findproxy(pname, PR_CAP_FE);
+			}
+
+			if (!px) {
+				Alert("parsing [%s:%d] : unable to find frontend '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line, pname,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			if (!(px->cap & PR_CAP_FE)) {
+				Alert("parsing [%s:%d] : proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s', has not frontend capability.\n",
+				      cur->file, cur->line, pname,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			free(arg->data.str.str);
+			arg->data.str.str = NULL;
+			arg->unresolved = 0;
+			arg->data.prx = px;
+			break;
+
+		case ARGT_BE:
+			if (arg->data.str.len) {
+				pname = arg->data.str.str;
+				px = findproxy(pname, PR_CAP_BE);
+			}
+
+			if (!px) {
+				Alert("parsing [%s:%d] : unable to find backend '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line, pname,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			if (!(px->cap & PR_CAP_BE)) {
+				Alert("parsing [%s:%d] : proxy '%s', referenced in arg %d of %s%s%s%s '%s' %s proxy '%s', has not backend capability.\n",
+				      cur->file, cur->line, pname,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			free(arg->data.str.str);
+			arg->data.str.str = NULL;
+			arg->unresolved = 0;
+			arg->data.prx = px;
+			break;
+
+		case ARGT_TAB:
+			if (arg->data.str.len) {
+				pname = arg->data.str.str;
+				px = find_stktable(pname);
+			}
+
+			if (!px) {
+				Alert("parsing [%s:%d] : unable to find table '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line, pname,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			if (!px->table.size) {
+				Alert("parsing [%s:%d] : no table in proxy '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line, pname,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			free(arg->data.str.str);
+			arg->data.str.str = NULL;
+			arg->unresolved = 0;
+			arg->data.prx = px;
+			break;
+
+		case ARGT_USR:
+			if (!arg->data.str.len) {
+				Alert("parsing [%s:%d] : missing userlist name in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			if (p->uri_auth && p->uri_auth->userlist &&
+			    !strcmp(p->uri_auth->userlist->name, arg->data.str.str))
+				ul = p->uri_auth->userlist;
+			else
+				ul = auth_find_userlist(arg->data.str.str);
+
+			if (!ul) {
+				Alert("parsing [%s:%d] : unable to find userlist '%s' referenced in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
+				      cur->file, cur->line, arg->data.str.str,
+				      cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
+				cfgerr++;
+				break;
+			}
+
+			free(arg->data.str.str);
+			arg->data.str.str = NULL;
+			arg->unresolved = 0;
+			arg->data.usr = ul;
+			break;
+		}
+
+		LIST_DEL(&cur->list);
+		free(cur);
+	} /* end of args processing */
+
+	return cfgerr;
 }
 
 /*
