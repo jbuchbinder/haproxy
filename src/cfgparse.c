@@ -1812,7 +1812,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			if (defproxy.conn_src.iface_name)
 				curproxy->conn_src.iface_name = strdup(defproxy.conn_src.iface_name);
 			curproxy->conn_src.iface_len = defproxy.conn_src.iface_len;
-			curproxy->conn_src.opts = defproxy.conn_src.opts & ~CO_SRC_TPROXY_MASK;
+			curproxy->conn_src.opts = defproxy.conn_src.opts;
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
+			curproxy->conn_src.tproxy_addr = defproxy.conn_src.tproxy_addr;
+#endif
 		}
 
 		if (curproxy->cap & PR_CAP_FE) {
@@ -1837,12 +1840,17 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				curproxy->defbe.name = strdup(defproxy.defbe.name);
 
 			/* get either a pointer to the logformat string or a copy of it */
-			curproxy->logformat_string = defproxy.logformat_string;
-			if (curproxy->logformat_string &&
-			    curproxy->logformat_string != default_http_log_format &&
-			    curproxy->logformat_string != default_tcp_log_format &&
-			    curproxy->logformat_string != clf_http_log_format)
-				curproxy->logformat_string = strdup(curproxy->logformat_string);
+			curproxy->conf.logformat_string = defproxy.conf.logformat_string;
+			if (curproxy->conf.logformat_string &&
+			    curproxy->conf.logformat_string != default_http_log_format &&
+			    curproxy->conf.logformat_string != default_tcp_log_format &&
+			    curproxy->conf.logformat_string != clf_http_log_format)
+				curproxy->conf.logformat_string = strdup(curproxy->conf.logformat_string);
+
+			if (defproxy.conf.lfs_file) {
+				curproxy->conf.lfs_file = strdup(defproxy.conf.lfs_file);
+				curproxy->conf.lfs_line = defproxy.conf.lfs_line;
+			}
 		}
 
 		if (curproxy->cap & PR_CAP_BE) {
@@ -1867,9 +1875,14 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			LIST_ADDQ(&curproxy->logsrvs, &node->list);
 		}
 
-		curproxy->uniqueid_format_string = defproxy.uniqueid_format_string;
-		if (curproxy->uniqueid_format_string)
-			curproxy->uniqueid_format_string = strdup(curproxy->uniqueid_format_string);
+		curproxy->conf.uniqueid_format_string = defproxy.conf.uniqueid_format_string;
+		if (curproxy->conf.uniqueid_format_string)
+			curproxy->conf.uniqueid_format_string = strdup(curproxy->conf.uniqueid_format_string);
+
+		if (defproxy.conf.uif_file) {
+			curproxy->conf.uif_file = strdup(defproxy.conf.uif_file);
+			curproxy->conf.uif_line = defproxy.conf.uif_line;
+		}
 
 		/* copy default header unique id */
 		if (defproxy.header_unique_id)
@@ -1912,12 +1925,14 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		free(defproxy.expect_str);
 		if (defproxy.expect_regex) regfree(defproxy.expect_regex);
 
-		if (defproxy.logformat_string != default_http_log_format &&
-		    defproxy.logformat_string != default_tcp_log_format &&
-		    defproxy.logformat_string != clf_http_log_format)
-			free(defproxy.logformat_string);
+		if (defproxy.conf.logformat_string != default_http_log_format &&
+		    defproxy.conf.logformat_string != default_tcp_log_format &&
+		    defproxy.conf.logformat_string != clf_http_log_format)
+			free(defproxy.conf.logformat_string);
 
-		free(defproxy.uniqueid_format_string);
+		free(defproxy.conf.uniqueid_format_string);
+		free(defproxy.conf.lfs_file);
+		free(defproxy.conf.uif_file);
 
 		for (rc = 0; rc < HTTP_ERR_SIZE; rc++)
 			chunk_destroy(&defproxy.errmsg[rc]);
@@ -2620,6 +2635,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		    !LIST_PREV(&curproxy->http_req_rules, struct http_req_rule *, list)->cond &&
 		    (LIST_PREV(&curproxy->http_req_rules, struct http_req_rule *, list)->action == HTTP_REQ_ACT_ALLOW ||
 		     LIST_PREV(&curproxy->http_req_rules, struct http_req_rule *, list)->action == HTTP_REQ_ACT_DENY ||
+		     LIST_PREV(&curproxy->http_req_rules, struct http_req_rule *, list)->action == HTTP_REQ_ACT_REDIR ||
 		     LIST_PREV(&curproxy->http_req_rules, struct http_req_rule *, list)->action == HTTP_REQ_ACT_AUTH)) {
 			Warning("parsing [%s:%d]: previous '%s' action is final and has no condition attached, further entries are NOOP.\n",
 			        file, linenum, args[0]);
@@ -2638,6 +2654,37 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	                                          file, linenum);
 
 		LIST_ADDQ(&curproxy->http_req_rules, &rule->list);
+	}
+	else if (!strcmp(args[0], "http-response")) {	/* response access control */
+		struct http_res_rule *rule;
+
+		if (curproxy == &defproxy) {
+			Alert("parsing [%s:%d]: '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		if (!LIST_ISEMPTY(&curproxy->http_res_rules) &&
+		    !LIST_PREV(&curproxy->http_res_rules, struct http_res_rule *, list)->cond &&
+		    (LIST_PREV(&curproxy->http_res_rules, struct http_res_rule *, list)->action == HTTP_RES_ACT_ALLOW ||
+		     LIST_PREV(&curproxy->http_res_rules, struct http_res_rule *, list)->action == HTTP_RES_ACT_DENY)) {
+			Warning("parsing [%s:%d]: previous '%s' action is final and has no condition attached, further entries are NOOP.\n",
+			        file, linenum, args[0]);
+			err_code |= ERR_WARN;
+		}
+
+		rule = parse_http_res_cond((const char **)args + 1, file, linenum, curproxy);
+
+		if (!rule) {
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		err_code |= warnif_cond_conflicts(rule->cond,
+	                                          (curproxy->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR,
+	                                          file, linenum);
+
+		LIST_ADDQ(&curproxy->http_res_rules, &rule->list);
 	}
 	else if (!strcmp(args[0], "http-send-name-header")) { /* send server name in request header */
 		/* set the header name and length into the proxy structure */
@@ -3401,19 +3448,27 @@ stats_error_parsing:
 					goto out;
 				}
 			}
-			if (curproxy->logformat_string != default_http_log_format &&
-			    curproxy->logformat_string != default_tcp_log_format &&
-			    curproxy->logformat_string != clf_http_log_format)
-				free(curproxy->logformat_string);
-			curproxy->logformat_string = logformat;
+			if (curproxy->conf.logformat_string != default_http_log_format &&
+			    curproxy->conf.logformat_string != default_tcp_log_format &&
+			    curproxy->conf.logformat_string != clf_http_log_format)
+				free(curproxy->conf.logformat_string);
+			curproxy->conf.logformat_string = logformat;
+
+			free(curproxy->conf.lfs_file);
+			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
+			curproxy->conf.lfs_line = curproxy->conf.args.line;
 		}
 		else if (!strcmp(args[1], "tcplog")) {
 			/* generate a detailed TCP log */
-			if (curproxy->logformat_string != default_http_log_format &&
-			    curproxy->logformat_string != default_tcp_log_format &&
-			    curproxy->logformat_string != clf_http_log_format)
-				free(curproxy->logformat_string);
-			curproxy->logformat_string = default_tcp_log_format;
+			if (curproxy->conf.logformat_string != default_http_log_format &&
+			    curproxy->conf.logformat_string != default_tcp_log_format &&
+			    curproxy->conf.logformat_string != clf_http_log_format)
+				free(curproxy->conf.logformat_string);
+			curproxy->conf.logformat_string = default_tcp_log_format;
+
+			free(curproxy->conf.lfs_file);
+			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
+			curproxy->conf.lfs_line = curproxy->conf.args.line;
 		}
 		else if (!strcmp(args[1], "tcpka")) {
 			/* enable TCP keep-alives on client and server sessions */
@@ -4337,9 +4392,9 @@ stats_error_parsing:
 			else if (!strcmp(args[cur_arg], "weight")) {
 				int w;
 				w = atol(args[cur_arg + 1]);
-				if (w < 0 || w > 256) {
-					Alert("parsing [%s:%d] : weight of server %s is not within 0 and 256 (%d).\n",
-					      file, linenum, newsrv->id, w);
+				if (w < 0 || w > SRV_UWGHT_MAX) {
+					Alert("parsing [%s:%d] : weight of server %s is not within 0 and %d (%d).\n",
+					      file, linenum, newsrv->id, SRV_UWGHT_MAX, w);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
@@ -4535,8 +4590,8 @@ stats_error_parsing:
 				cur_arg += 2;
 				while (*(args[cur_arg])) {
 					if (!strcmp(args[cur_arg], "usesrc")) {  /* address to use outside */
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
-#if !defined(CONFIG_HAP_LINUX_TPROXY)
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
+#if !defined(CONFIG_HAP_TRANSPARENT)
 						if (!is_addr(&newsrv->conn_src.source_addr)) {
 							Alert("parsing [%s:%d] : '%s' requires an explicit '%s' address.\n",
 							      file, linenum, "usesrc", "source");
@@ -4625,7 +4680,7 @@ stats_error_parsing:
 							newsrv->conn_src.opts |= CO_SRC_TPROXY_ADDR;
 						}
 						global.last_checks |= LSTCHK_NETADM;
-#if !defined(CONFIG_HAP_LINUX_TPROXY)
+#if !defined(CONFIG_HAP_TRANSPARENT)
 						global.last_checks |= LSTCHK_CTTPROXY;
 #endif
 						cur_arg += 2;
@@ -4635,7 +4690,7 @@ stats_error_parsing:
 						      file, linenum, "usesrc");
 						err_code |= ERR_ALERT | ERR_FATAL;
 						goto out;
-#endif /* defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY) */
+#endif /* defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT) */
 					} /* "usesrc" */
 
 					if (!strcmp(args[cur_arg], "interface")) { /* specifically bind to this interface */
@@ -4829,20 +4884,12 @@ stats_error_parsing:
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		free(curproxy->uniqueid_format_string);
-		curproxy->uniqueid_format_string = strdup(args[1]);
+		free(curproxy->conf.uniqueid_format_string);
+		curproxy->conf.uniqueid_format_string = strdup(args[1]);
 
-		/* get a chance to improve log-format error reporting by
-		 * reporting the correct line-number when possible.
-		 */
-		if (curproxy != &defproxy) {
-			curproxy->conf.args.ctx = ARGC_UIF;
-			if (curproxy->uniqueid_format_string)
-				parse_logformat_string(curproxy->uniqueid_format_string, curproxy, &curproxy->format_unique_id, 0,
-						       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR);
-			free(curproxy->uniqueid_format_string);
-			curproxy->uniqueid_format_string = NULL;
-		}
+		free(curproxy->conf.uif_file);
+		curproxy->conf.uif_file = strdup(curproxy->conf.args.file);
+		curproxy->conf.uif_line = curproxy->conf.args.line;
 	}
 
 	else if (strcmp(args[0], "unique-id-header") == 0) {
@@ -4867,11 +4914,15 @@ stats_error_parsing:
 			goto out;
 		}
 
-		if (curproxy->logformat_string != default_http_log_format &&
-		    curproxy->logformat_string != default_tcp_log_format &&
-		    curproxy->logformat_string != clf_http_log_format)
-			free(curproxy->logformat_string);
-		curproxy->logformat_string = strdup(args[1]);
+		if (curproxy->conf.logformat_string != default_http_log_format &&
+		    curproxy->conf.logformat_string != default_tcp_log_format &&
+		    curproxy->conf.logformat_string != clf_http_log_format)
+			free(curproxy->conf.logformat_string);
+		curproxy->conf.logformat_string = strdup(args[1]);
+
+		free(curproxy->conf.lfs_file);
+		curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
+		curproxy->conf.lfs_line = curproxy->conf.args.line;
 
 		/* get a chance to improve log-format error reporting by
 		 * reporting the correct line-number when possible.
@@ -4880,14 +4931,6 @@ stats_error_parsing:
 			Warning("parsing [%s:%d] : backend '%s' : 'log-format' directive is ignored in backends.\n",
 				file, linenum, curproxy->id);
 			err_code |= ERR_WARN;
-		}
-		else if (curproxy->cap & PR_CAP_FE) {
-			curproxy->conf.args.ctx = ARGC_LOG;
-			if (curproxy->logformat_string)
-				parse_logformat_string(curproxy->logformat_string, curproxy, &curproxy->logformat, LOG_OPT_MANDATORY,
-						       SMP_VAL_FE_LOG_END);
-			free(curproxy->logformat_string);
-			curproxy->logformat_string = NULL;
 		}
 	}
 
@@ -5035,8 +5078,8 @@ stats_error_parsing:
 		cur_arg = 2;
 		while (*(args[cur_arg])) {
 			if (!strcmp(args[cur_arg], "usesrc")) {  /* address to use outside */
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
-#if !defined(CONFIG_HAP_LINUX_TPROXY)
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
+#if !defined(CONFIG_HAP_TRANSPARENT)
 				if (!is_addr(&curproxy->conn_src.source_addr)) {
 					Alert("parsing [%s:%d] : '%s' requires an explicit 'source' address.\n",
 					      file, linenum, "usesrc");
@@ -5125,7 +5168,7 @@ stats_error_parsing:
 					curproxy->conn_src.opts |= CO_SRC_TPROXY_ADDR;
 				}
 				global.last_checks |= LSTCHK_NETADM;
-#if !defined(CONFIG_HAP_LINUX_TPROXY)
+#if !defined(CONFIG_HAP_TRANSPARENT)
 				global.last_checks |= LSTCHK_CTTPROXY;
 #endif
 #else	/* no TPROXY support */
@@ -6324,7 +6367,7 @@ int check_config_validity()
 		list_for_each_entry(trule, &curproxy->tcp_req.l4_rules, list) {
 			struct proxy *target;
 
-			if (trule->action != TCP_ACT_TRK_SC1 && trule->action != TCP_ACT_TRK_SC2)
+			if (trule->action < TCP_ACT_TRK_SC0 || trule->action > TCP_ACT_TRK_SCMAX)
 				continue;
 
 			if (trule->act_prm.trk_ctr.table.n)
@@ -6335,7 +6378,7 @@ int check_config_validity()
 			if (!target) {
 				Alert("Proxy '%s': unable to find table '%s' referenced by track-sc%d.\n",
 				      curproxy->id, trule->act_prm.trk_ctr.table.n,
-				      trule->action == TCP_ACT_TRK_SC1 ? 1 : 2);
+				      1 + tcp_trk_idx(trule->action));
 				cfgerr++;
 			}
 			else if (target->table.size == 0) {
@@ -6346,7 +6389,7 @@ int check_config_validity()
 			else if (!stktable_compatible_sample(trule->act_prm.trk_ctr.expr,  target->table.type)) {
 				Alert("Proxy '%s': stick-table '%s' uses a type incompatible with the 'track-sc%d' rule.\n",
 				      curproxy->id, trule->act_prm.trk_ctr.table.n ? trule->act_prm.trk_ctr.table.n : curproxy->id,
-				      trule->action == TCP_ACT_TRK_SC1 ? 1 : 2);
+				      1 + tcp_trk_idx(trule->action));
 				cfgerr++;
 			}
 			else {
@@ -6363,7 +6406,7 @@ int check_config_validity()
 		list_for_each_entry(trule, &curproxy->tcp_req.inspect_rules, list) {
 			struct proxy *target;
 
-			if (trule->action != TCP_ACT_TRK_SC1 && trule->action != TCP_ACT_TRK_SC2)
+			if (trule->action < TCP_ACT_TRK_SC0 || trule->action > TCP_ACT_TRK_SCMAX)
 				continue;
 
 			if (trule->act_prm.trk_ctr.table.n)
@@ -6374,7 +6417,7 @@ int check_config_validity()
 			if (!target) {
 				Alert("Proxy '%s': unable to find table '%s' referenced by track-sc%d.\n",
 				      curproxy->id, trule->act_prm.trk_ctr.table.n,
-				      trule->action == TCP_ACT_TRK_SC1 ? 1 : 2);
+				      1 + tcp_trk_idx(trule->action));
 				cfgerr++;
 			}
 			else if (target->table.size == 0) {
@@ -6385,7 +6428,7 @@ int check_config_validity()
 			else if (!stktable_compatible_sample(trule->act_prm.trk_ctr.expr,  target->table.type)) {
 				Alert("Proxy '%s': stick-table '%s' uses a type incompatible with the 'track-sc%d' rule.\n",
 				      curproxy->id, trule->act_prm.trk_ctr.table.n ? trule->act_prm.trk_ctr.table.n : curproxy->id,
-				      trule->action == TCP_ACT_TRK_SC1 ? 1 : 2);
+				      1 + tcp_trk_idx(trule->action));
 				cfgerr++;
 			}
 			else {
@@ -6471,22 +6514,35 @@ out_uri_auth_compat:
 
 		/* compile the log format */
 		if (!(curproxy->cap & PR_CAP_FE)) {
-			if (curproxy->logformat_string != default_http_log_format &&
-			    curproxy->logformat_string != default_tcp_log_format &&
-			    curproxy->logformat_string != clf_http_log_format)
-				free(curproxy->logformat_string);
-			curproxy->logformat_string = NULL;
+			if (curproxy->conf.logformat_string != default_http_log_format &&
+			    curproxy->conf.logformat_string != default_tcp_log_format &&
+			    curproxy->conf.logformat_string != clf_http_log_format)
+				free(curproxy->conf.logformat_string);
+			curproxy->conf.logformat_string = NULL;
+			free(curproxy->conf.lfs_file);
+			curproxy->conf.lfs_file = NULL;
+			curproxy->conf.lfs_line = 0;
 		}
 
-		curproxy->conf.args.ctx = ARGC_LOG;
-		if (curproxy->logformat_string)
-			parse_logformat_string(curproxy->logformat_string, curproxy, &curproxy->logformat, LOG_OPT_MANDATORY,
+		if (curproxy->conf.logformat_string) {
+			curproxy->conf.args.ctx = ARGC_LOG;
+			curproxy->conf.args.file = curproxy->conf.lfs_file;
+			curproxy->conf.args.line = curproxy->conf.lfs_line;
+			parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat, LOG_OPT_MANDATORY,
 					       SMP_VAL_FE_LOG_END);
+			curproxy->conf.args.file = NULL;
+			curproxy->conf.args.line = 0;
+		}
 
-		curproxy->conf.args.ctx = ARGC_UIF;
-		if (curproxy->uniqueid_format_string)
-			parse_logformat_string(curproxy->uniqueid_format_string, curproxy, &curproxy->format_unique_id, 0,
+		if (curproxy->conf.uniqueid_format_string) {
+			curproxy->conf.args.ctx = ARGC_UIF;
+			curproxy->conf.args.file = curproxy->conf.uif_file;
+			curproxy->conf.args.line = curproxy->conf.uif_line;
+			parse_logformat_string(curproxy->conf.uniqueid_format_string, curproxy, &curproxy->format_unique_id, 0,
 					       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR);
+			curproxy->conf.args.file = NULL;
+			curproxy->conf.args.line = 0;
+		}
 
 		/* only now we can check if some args remain unresolved */
 		cfgerr += smp_resolve_args(curproxy);
@@ -6802,7 +6858,7 @@ out_uri_auth_compat:
 				}
 			}
 
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
 			if (curproxy->conn_src.bind_hdr_occ) {
 				curproxy->conn_src.bind_hdr_occ = 0;
 				Warning("config : %s '%s' : ignoring use of header %s as source IP in non-HTTP mode.\n",
@@ -6829,7 +6885,7 @@ out_uri_auth_compat:
 				err_code |= ERR_WARN;
 			}
 
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
 			if (curproxy->mode != PR_MODE_HTTP && newsrv->conn_src.bind_hdr_occ) {
 				newsrv->conn_src.bind_hdr_occ = 0;
 				Warning("config : %s '%s' : server %s cannot use header %s as source IP in non-HTTP mode.\n",

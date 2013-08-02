@@ -488,7 +488,7 @@ void bind_dump_kws(char **out)
 /* set temp integer to the number of connexions to the same listening socket */
 static int
 smp_fetch_dconn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->type = SMP_T_UINT;
 	smp->data.uint = l4->listener->nbconn;
@@ -498,7 +498,7 @@ smp_fetch_dconn(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 /* set temp integer to the id of the socket (listener) */
 static int
 smp_fetch_so_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->type = SMP_T_UINT;
 	smp->data.uint = l4->listener->luid;
@@ -643,7 +643,7 @@ static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct bi
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct sample_fetch_kw_list smp_kws = {{ },{
+static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "dst_conn", smp_fetch_dconn, 0, NULL, SMP_T_UINT, SMP_USE_FTEND, },
 	{ "so_id",    smp_fetch_so_id, 0, NULL, SMP_T_UINT, SMP_USE_FTEND, },
 	{ /* END */ },
@@ -652,9 +652,7 @@ static struct sample_fetch_kw_list smp_kws = {{ },{
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct acl_kw_list acl_kws = {{ },{
-	{ "dst_conn",  NULL, acl_parse_int, acl_match_int },
-	{ "so_id",     NULL, acl_parse_int, acl_match_int },
+static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 

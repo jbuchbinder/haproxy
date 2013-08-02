@@ -30,6 +30,7 @@
 #include <types/global.h>
 #include <types/compression.h>
 
+#include <proto/acl.h>
 #include <proto/compression.h>
 #include <proto/freq_ctr.h>
 #include <proto/proto_http.h>
@@ -512,7 +513,7 @@ int deflate_init(struct comp_ctx **comp_ctx, int level)
 
 	strm = &(*comp_ctx)->strm;
 
-	if (deflateInit(strm, level) != Z_OK) {
+	if (deflateInit2(strm, level, Z_DEFLATED, global.tune.zlibwindowsize, global.tune.zlibmemlevel, Z_DEFAULT_STRATEGY) != Z_OK) {
 		deinit_comp_ctx(comp_ctx);
 		return -1;
 	}
@@ -609,3 +610,45 @@ int deflate_end(struct comp_ctx **comp_ctx)
 
 #endif /* USE_ZLIB */
 
+/* boolean, returns true if compression is used (either gzip or deflate) in the response */
+static int
+smp_fetch_res_comp(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                 const struct arg *args, struct sample *smp, const char *kw)
+{
+	smp->type = SMP_T_BOOL;
+	smp->data.uint = (l4->comp_algo != NULL);
+	return 1;
+}
+
+/* string, returns algo */
+static int
+smp_fetch_res_comp_algo(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                 const struct arg *args, struct sample *smp, const char *kw)
+{
+	if (!l4->comp_algo)
+		return 0;
+
+	smp->type = SMP_T_STR;
+	smp->data.str.str = l4->comp_algo->name;
+	smp->data.str.len = l4->comp_algo->name_len;
+	return 1;
+}
+
+/* Note: must not be declared <const> as its list will be overwritten */
+static struct acl_kw_list acl_kws = {ILH, {
+	{ /* END */ },
+}};
+
+/* Note: must not be declared <const> as its list will be overwritten */
+static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
+	{ "res.comp",             smp_fetch_res_comp,      0,                NULL,    SMP_T_BOOL, SMP_USE_HRSHP },
+	{ "res.comp_algo",        smp_fetch_res_comp_algo, 0,                NULL,    SMP_T_STR, SMP_USE_HRSHP },
+	{ /* END */ },
+}};
+
+__attribute__((constructor))
+static void __comp_fetch_init(void)
+{
+	acl_register_keywords(&acl_kws);
+	sample_register_fetches(&sample_fetch_keywords);
+}

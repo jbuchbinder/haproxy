@@ -259,6 +259,9 @@ void display_build_opts()
 
 #ifdef USE_OPENSSL
 	printf("Built with OpenSSL version : " OPENSSL_VERSION_TEXT "\n");
+	printf("Running on OpenSSL version : %s%s\n",
+	       SSLeay_version(SSLEAY_VERSION),
+	       ((OPENSSL_VERSION_NUMBER ^ SSLeay()) >> 8) ? " (VERSIONS DIFFER!)" : "");
 	printf("OpenSSL library supports TLS extensions : "
 #if OPENSSL_VERSION_NUMBER < 0x00907000L
 	       "no (library version too old)"
@@ -292,17 +295,49 @@ void display_build_opts()
 
 #ifdef USE_PCRE
 	printf("Built with PCRE version : %s", pcre_version());
-	printf("\nPCRE library supports JIT : "
-#ifndef USE_PCRE_JIT
-	       "no (USE_PCRE_JIT not set)"
+	printf("\nPCRE library supports JIT : ");
+#ifdef USE_PCRE_JIT
+	{
+		int r;
+		pcre_config(PCRE_CONFIG_JIT, &r);
+		if (r)
+			printf("yes");
+		else
+			printf("no (libpcre build without JIT?)");
+	}
 #else
-	       "yes"
+	printf("no (USE_PCRE_JIT not set)");
 #endif
-	       "\n");
+	printf("\n");
 #else
 	printf("Built without PCRE support (using libc's regex instead)\n");
 #endif
 
+#if defined(CONFIG_HAP_TRANSPARENT) || defined(CONFIG_HAP_CTTPROXY)
+	printf("Built with transparent proxy support using:"
+#if defined(CONFIG_HAP_CTTPROXY)
+	       " CTTPROXY"
+#endif
+#if defined(IP_TRANSPARENT)
+	       " IP_TRANSPARENT"
+#endif
+#if defined(IPV6_TRANSPARENT)
+	       " IPV6_TRANSPARENT"
+#endif
+#if defined(IP_FREEBIND)
+	       " IP_FREEBIND"
+#endif
+#if defined(IP_BINDANY)
+	       " IP_BINDANY"
+#endif
+#if defined(IPV6_BINDANY)
+	       " IPV6_BINDANY"
+#endif
+#if defined(SO_BINDANY)
+	       " SO_BINDANY"
+#endif
+	       "\n");
+#endif
 	putchar('\n');
 
 	list_pollers(stdout);
@@ -816,7 +851,7 @@ void init(int argc, char **argv)
 		      "  is too low on this platform to support maxconn and the number of listeners\n"
 		      "  and servers. You should rebuild haproxy specifying your system using TARGET=\n"
 		      "  in order to support other polling systems (poll, epoll, kqueue) or reduce the\n"
-		      "  global maxconn setting to accomodate the system's limitation. For reference,\n"
+		      "  global maxconn setting to accommodate the system's limitation. For reference,\n"
 		      "  FD_SETSIZE=%d on this system, global.maxconn=%d resulting in a maximum of\n"
 		      "  %d file descriptors. You should thus reduce global.maxconn by %d. Also,\n"
 		      "  check build settings using 'haproxy -vv'.\n\n",
@@ -932,12 +967,14 @@ void deinit(void)
 		free(p->capture_name);
 		free(p->monitor_uri);
 		free(p->rdp_cookie_name);
-		if (p->logformat_string != default_http_log_format &&
-		    p->logformat_string != default_tcp_log_format &&
-		    p->logformat_string != clf_http_log_format)
-			free(p->logformat_string);
+		if (p->conf.logformat_string != default_http_log_format &&
+		    p->conf.logformat_string != default_tcp_log_format &&
+		    p->conf.logformat_string != clf_http_log_format)
+			free(p->conf.logformat_string);
 
-		free(p->uniqueid_format_string);
+		free(p->conf.lfs_file);
+		free(p->conf.uniqueid_format_string);
+		free(p->conf.uif_file);
 
 		for (i = 0; i < HTTP_ERR_SIZE; i++)
 			chunk_destroy(&p->errmsg[i]);
@@ -1161,6 +1198,7 @@ void deinit(void)
 	free(global.pidfile); global.pidfile = NULL;
 	free(global.node);    global.node = NULL;
 	free(global.desc);    global.desc = NULL;
+	free(fdinfo);         fdinfo  = NULL;
 	free(fdtab);          fdtab   = NULL;
 	free(oldpids);        oldpids = NULL;
 	free(global_listener_queue_task); global_listener_queue_task = NULL;

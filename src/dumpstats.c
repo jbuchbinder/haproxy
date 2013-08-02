@@ -337,6 +337,13 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 		int cur_arg = 2;
 		unsigned int set = 0;
 
+		if (!global.stats_fe) {
+			if ((global.stats_fe = alloc_stats_fe("GLOBAL", file, line)) == NULL) {
+				memprintf(err, "'%s %s' : out of memory trying to allocate a frontend", args[0], args[1]);
+				return -1;
+			}
+		}
+
 		while (*args[cur_arg]) {
 			unsigned int low, high;
 
@@ -583,6 +590,7 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 	unsigned char ip6_key[sizeof(struct in6_addr)];
 	long long value;
 	int data_type;
+	int cur_arg;
 	void *ptr;
 	struct freq_ctr_period *frqp;
 
@@ -673,31 +681,6 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 		break;
 
 	case STAT_CLI_O_SET:
-		if (strncmp(args[5], "data.", 5) != 0) {
-			si->applet.ctx.cli.msg = "\"data.<type>\" followed by a value expected\n";
-			si->applet.st0 = STAT_CLI_PRINT;
-			return;
-		}
-
-		data_type = stktable_get_data_type(args[5] + 5);
-		if (data_type < 0) {
-			si->applet.ctx.cli.msg = "Unknown data type\n";
-			si->applet.st0 = STAT_CLI_PRINT;
-			return;
-		}
-
-		if (!px->table.data_ofs[data_type]) {
-			si->applet.ctx.cli.msg = "Data type not stored in this table\n";
-			si->applet.st0 = STAT_CLI_PRINT;
-			return;
-		}
-
-		if (!*args[6] || strl2llrc(args[6], strlen(args[6]), &value) != 0) {
-			si->applet.ctx.cli.msg = "Require a valid integer value to store\n";
-			si->applet.st0 = STAT_CLI_PRINT;
-			return;
-		}
-
 		if (ts)
 			stktable_touch(&px->table, ts, 1);
 		else {
@@ -711,24 +694,56 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 			stktable_store(&px->table, ts, 1);
 		}
 
-		ptr = stktable_data_ptr(&px->table, ts, data_type);
-		switch (stktable_data_types[data_type].std_type) {
-		case STD_T_SINT:
-			stktable_data_cast(ptr, std_t_sint) = value;
-			break;
-		case STD_T_UINT:
-			stktable_data_cast(ptr, std_t_uint) = value;
-			break;
-		case STD_T_ULL:
-			stktable_data_cast(ptr, std_t_ull) = value;
-			break;
-		case STD_T_FRQP:
-			/* We only reset the previous value so that it slowly fades out */
-			frqp = &stktable_data_cast(ptr, std_t_frqp);
-			frqp->curr_tick = now_ms;
-			frqp->prev_ctr = value;
-			frqp->curr_ctr = 0;
-			break;
+		for (cur_arg = 5; *args[cur_arg]; cur_arg += 2) {
+			if (strncmp(args[cur_arg], "data.", 5) != 0) {
+				si->applet.ctx.cli.msg = "\"data.<type>\" followed by a value expected\n";
+				si->applet.st0 = STAT_CLI_PRINT;
+				return;
+			}
+
+			data_type = stktable_get_data_type(args[cur_arg] + 5);
+			if (data_type < 0) {
+				si->applet.ctx.cli.msg = "Unknown data type\n";
+				si->applet.st0 = STAT_CLI_PRINT;
+				return;
+			}
+
+			if (!px->table.data_ofs[data_type]) {
+				si->applet.ctx.cli.msg = "Data type not stored in this table\n";
+				si->applet.st0 = STAT_CLI_PRINT;
+				return;
+			}
+
+			if (!*args[cur_arg+1] || strl2llrc(args[cur_arg+1], strlen(args[cur_arg+1]), &value) != 0) {
+				si->applet.ctx.cli.msg = "Require a valid integer value to store\n";
+				si->applet.st0 = STAT_CLI_PRINT;
+				return;
+			}
+
+			ptr = stktable_data_ptr(&px->table, ts, data_type);
+
+			switch (stktable_data_types[data_type].std_type) {
+			case STD_T_SINT:
+				stktable_data_cast(ptr, std_t_sint) = value;
+				break;
+			case STD_T_UINT:
+				stktable_data_cast(ptr, std_t_uint) = value;
+				break;
+			case STD_T_ULL:
+				stktable_data_cast(ptr, std_t_ull) = value;
+				break;
+			case STD_T_FRQP:
+				/* We set both the current and previous values. That way
+				 * the reported frequency is stable during all the period
+				 * then slowly fades out. This allows external tools to
+				 * push measures without having to update them too often.
+				 */
+				frqp = &stktable_data_cast(ptr, std_t_frqp);
+				frqp->curr_tick = now_ms;
+				frqp->prev_ctr = 0;
+				frqp->curr_ctr = value;
+				break;
+			}
 		}
 		break;
 
@@ -741,8 +756,8 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 
 static void stats_sock_table_data_request(struct stream_interface *si, char **args, int action)
 {
-	if (action != STAT_CLI_O_TAB) {
-		si->applet.ctx.cli.msg = "content-based lookup is only supported with the \"show\" action";
+	if (action != STAT_CLI_O_TAB && action != STAT_CLI_O_CLR) {
+		si->applet.ctx.cli.msg = "content-based lookup is only supported with the \"show\" and \"clear\" actions";
 		si->applet.st0 = STAT_CLI_PRINT;
 		return;
 	}
@@ -1779,7 +1794,7 @@ static int stats_dump_fe_stats(struct stream_interface *si, struct proxy *px)
 
 		chunk_appendf(&trash,
 		              /* sessions rate : current */
-		              "<td><u>%s<div><table class=det>"
+		              "<td><u>%s<div class=tips><table class=det>"
 		              "<tr><th>Current connection rate:</th><td>%s/s</td></tr>"
 		              "<tr><th>Current session rate:</th><td>%s/s</td></tr>"
 		              "",
@@ -1795,7 +1810,7 @@ static int stats_dump_fe_stats(struct stream_interface *si, struct proxy *px)
 		chunk_appendf(&trash,
 		              "</table></div></u></td>"
 		              /* sessions rate : max */
-		              "<td><u>%s<div><table class=det>"
+		              "<td><u>%s<div class=tips><table class=det>"
 		              "<tr><th>Max connection rate:</th><td>%s/s</td></tr>"
 		              "<tr><th>Max session rate:</th><td>%s/s</td></tr>"
 		              "",
@@ -1817,7 +1832,7 @@ static int stats_dump_fe_stats(struct stream_interface *si, struct proxy *px)
 		chunk_appendf(&trash,
 		              /* sessions: current, max, limit, total */
 		              "<td>%s</td><td>%s</td><td>%s</td>"
-		              "<td><u>%s<div><table class=det>"
+		              "<td><u>%s<div class=tips><table class=det>"
 		              "<tr><th>Cum. connections:</th><td>%s</td></tr>"
 		              "<tr><th>Cum. sessions:</th><td>%s</td></tr>"
 		              "",
@@ -1863,7 +1878,7 @@ static int stats_dump_fe_stats(struct stream_interface *si, struct proxy *px)
 
 		chunk_appendf(&trash,
 			      /* bytes:out + compression stats (via hover): comp_in, comp_out, comp_byp */
-		              "<td>%s%s<div>compression: in=%lld out=%lld bypassed=%lld savings=%d%%</div>%s</td>",
+		              "<td>%s%s<div class=tips>compression: in=%lld out=%lld bypassed=%lld savings=%d%%</div>%s</td>",
 		              (px->fe_counters.comp_in || px->fe_counters.comp_byp) ? "<u>":"",
 		              U2H(px->fe_counters.bytes_out),
 		              px->fe_counters.comp_in, px->fe_counters.comp_out, px->fe_counters.comp_byp,
@@ -1983,7 +1998,7 @@ static int stats_dump_li_stats(struct stream_interface *si, struct proxy *px, st
 			char str[INET6_ADDRSTRLEN];
 			int port;
 
-			chunk_appendf(&trash, "<div>");
+			chunk_appendf(&trash, "<div class=tips>");
 
 			port = get_host_port(&l->addr);
 			switch (addr_to_str(&l->addr, str, sizeof(str))) {
@@ -2109,6 +2124,8 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 
 		if ((sv->state & SRV_MAINTAIN) || (ref->state & SRV_MAINTAIN))
 			chunk_appendf(&trash, "<tr class=\"maintain\">");
+		else if (sv->eweight == 0)
+			chunk_appendf(&trash, "<tr class=\"softstop\">");
 		else
 			chunk_appendf(&trash,
 			              "<tr class=\"%s%d\">",
@@ -2128,7 +2145,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 		              px->id, sv->id, sv->id);
 
 		if (flags & ST_SHLGNDS) {
-			chunk_appendf(&trash, "<div>");
+			chunk_appendf(&trash, "<div class=tips>");
 
 			switch (addr_to_str(&sv->addr, str, sizeof(str))) {
 			case AF_INET:
@@ -2177,7 +2194,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 		chunk_appendf(&trash,
 		              /* sessions: current, max, limit, total */
 		              "<td>%s</td><td>%s</td><td>%s</td>"
-		              "<td><u>%s<div><table class=det>"
+		              "<td><u>%s<div class=tips><table class=det>"
 		              "<tr><th>Cum. sessions:</th><td>%s</td></tr>"
 		              "",
 		              U2H(sv->cur_sess), U2H(sv->counters.cur_sess_max), LIM2A(sv->maxconn, "-"),
@@ -2222,7 +2239,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 		              /* errors : request, connect */
 		              "<td></td><td>%s</td>"
 		              /* errors : response */
-		              "<td><u>%s<div>Connection resets during transfers: %lld client, %lld server</div></u></td>"
+		              "<td><u>%s<div class=tips>Connection resets during transfers: %lld client, %lld server</div></u></td>"
 		              /* warnings: retries, redispatches */
 		              "<td>%lld</td><td>%lld</td>"
 		              "",
@@ -2265,7 +2282,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 			if (sv->check.status >= HCHK_STATUS_CHECKED && sv->check.duration >= 0)
 				chunk_appendf(&trash, " in %lums", sv->check.duration);
 
-			chunk_appendf(&trash, "<div>%s",
+			chunk_appendf(&trash, "<div class=tips>%s",
 				      get_check_status_description(sv->check.status));
 			if (*sv->check.desc) {
 				chunk_appendf(&trash, ": ");
@@ -2295,7 +2312,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 				chunk_appendf(&trash, "/%lld", ref->counters.failed_hana);
 
 			chunk_appendf(&trash,
-			              "<div>Failed Health Checks%s</div></u></td>"
+			              "<div class=tips>Failed Health Checks%s</div></u></td>"
 			              "<td>%lld</td><td>%s</td>"
 			              "",
 			              ref->observe ? "/Health Analyses" : "",
@@ -2493,7 +2510,7 @@ static int stats_dump_be_stats(struct stream_interface *si, struct proxy *px, in
 
 		if (flags & ST_SHLGNDS) {
 			/* balancing */
-			chunk_appendf(&trash, "<div>balancing: %s",
+			chunk_appendf(&trash, "<div class=tips>balancing: %s",
 			              backend_lb_algo_str(px->lbprm.algo & BE_LB_ALGO));
 
 			/* cookie */
@@ -2520,7 +2537,7 @@ static int stats_dump_be_stats(struct stream_interface *si, struct proxy *px, in
 		chunk_appendf(&trash,
 		              /* sessions: current, max, limit, total */
 		              "<td>%s</td><td>%s</td><td>%s</td>"
-		              "<td><u>%s<div><table class=det>"
+		              "<td><u>%s<div class=tips><table class=det>"
 		              "<tr><th>Cum. sessions:</th><td>%s</td></tr>"
 		              "",
 		              U2H(px->beconn), U2H(px->be_counters.conn_max), U2H(px->fullconn),
@@ -2565,7 +2582,7 @@ static int stats_dump_be_stats(struct stream_interface *si, struct proxy *px, in
 
 		chunk_appendf(&trash,
 			      /* bytes:out + compression stats (via hover): comp_in, comp_out, comp_byp */
-		              "<td>%s%s<div>compression: in=%lld out=%lld bypassed=%lld savings=%d%%</div>%s</td>",
+		              "<td>%s%s<div class=tips>compression: in=%lld out=%lld bypassed=%lld savings=%d%%</div>%s</td>",
 		              (px->be_counters.comp_in || px->be_counters.comp_byp) ? "<u>":"",
 		              U2H(px->be_counters.bytes_out),
 		              px->be_counters.comp_in, px->be_counters.comp_out, px->be_counters.comp_byp,
@@ -2579,7 +2596,7 @@ static int stats_dump_be_stats(struct stream_interface *si, struct proxy *px, in
 		              /* errors : request, connect */
 		              "<td></td><td>%s</td>"
 		              /* errors : response */
-		              "<td><u>%s<div>Connection resets during transfers: %lld client, %lld server</div></u></td>"
+		              "<td><u>%s<div class=tips>Connection resets during transfers: %lld client, %lld server</div></u></td>"
 		              /* warnings: retries, redispatches */
 		              "<td>%lld</td><td>%lld</td>"
 		              /* backend status: reflect backend status (up/down): we display UP
@@ -2695,11 +2712,25 @@ static int stats_dump_be_stats(struct stream_interface *si, struct proxy *px, in
  */
 static void stats_dump_html_px_hdr(struct stream_interface *si, struct proxy *px, struct uri_auth *uri)
 {
+	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
+
 	if (px->cap & PR_CAP_BE && px->srv && (si->applet.ctx.stats.flags & STAT_ADMIN)) {
 		/* A form to enable/disable this proxy servers */
+
+		/* scope_txt = search pattern + search query, si->applet.ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
+		scope_txt[0] = 0;
+		if (si->applet.ctx.stats.scope_len) {
+			strcpy(scope_txt, STAT_SCOPE_PATTERN);
+			memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si->ob->buf) + si->applet.ctx.stats.scope_str, si->applet.ctx.stats.scope_len);
+			scope_txt[strlen(STAT_SCOPE_PATTERN) + si->applet.ctx.stats.scope_len] = 0;
+		}
+
 		chunk_appendf(&trash,
-			      "<form action=\"%s\" method=\"post\">",
-			      uri->uri_prefix);
+			      "<form action=\"%s%s%s%s\" method=\"post\">",
+			      uri->uri_prefix,
+			      (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			      (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			      scope_txt);
 	}
 
 	/* print a new table */
@@ -2717,7 +2748,7 @@ static void stats_dump_html_px_hdr(struct stream_interface *si, struct proxy *px
 
 	if (uri->flags & ST_SHLGNDS) {
 		/* cap, mode, id */
-		chunk_appendf(&trash, "<div>cap: %s, mode: %s, id: %d",
+		chunk_appendf(&trash, "<div class=tips>cap: %s, mode: %s, id: %d",
 		              proxy_cap_str(px->cap), proxy_mode_str(px->mode),
 		              px->uuid);
 		chunk_appendf(&trash, "</div>");
@@ -2768,19 +2799,19 @@ static void stats_dump_html_px_end(struct stream_interface *si, struct proxy *px
 	if ((px->cap & PR_CAP_BE) && px->srv && (si->applet.ctx.stats.flags & STAT_ADMIN)) {
 		/* close the form used to enable/disable this proxy servers */
 		chunk_appendf(&trash,
-		              "Choose the action to perform on the checked servers : "
-		              "<select name=action>"
-		              "<option value=\"\"></option>"
-		              "<option value=\"disable\">Disable</option>"
-		              "<option value=\"enable\">Enable</option>"
-		              "<option value=\"stop\">Soft Stop</option>"
-		              "<option value=\"start\">Soft Start</option>"
-		              "<option value=\"shutdown\">Kill Sessions</option>"
-		              "</select>"
-		              "<input type=\"hidden\" name=\"b\" value=\"#%d\">"
-		              "&nbsp;<input type=\"submit\" value=\"Apply\">"
-		              "</form>",
-		              px->uuid);
+			      "Choose the action to perform on the checked servers : "
+			      "<select name=action>"
+			      "<option value=\"\"></option>"
+			      "<option value=\"disable\">Disable</option>"
+			      "<option value=\"enable\">Enable</option>"
+			      "<option value=\"stop\">Soft Stop</option>"
+			      "<option value=\"start\">Soft Start</option>"
+			      "<option value=\"shutdown\">Kill Sessions</option>"
+			      "</select>"
+			      "<input type=\"hidden\" name=\"b\" value=\"#%d\">"
+			      "&nbsp;<input type=\"submit\" value=\"Apply\">"
+			      "</form>",
+			      px->uuid);
 	}
 
 	chunk_appendf(&trash, "<p>\n");
@@ -2828,6 +2859,13 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 			if (scope == NULL)
 				return 1;
 		}
+
+		/* if the user has requested a limited output and the proxy
+		 * name does not match, skip it.
+		 */
+		if (si->applet.ctx.stats.scope_len &&
+		    strnistr(px->id, strlen(px->id), bo_ptr(si->ob->buf) + si->applet.ctx.stats.scope_str, si->applet.ctx.stats.scope_len) == NULL)
+			return 1;
 
 		if ((si->applet.ctx.stats.flags & STAT_BOUND) &&
 		    (si->applet.ctx.stats.iid != -1) &&
@@ -3040,6 +3078,7 @@ static void stats_dump_html_head(struct uri_auth *uri)
 	              ".backup5	{background: #90b0e0;}\n"  /* NOLB state shows same as going down */
 	              ".backup6	{background: #e0e0e0;}\n"
 	              ".maintain	{background: #c07820;}\n"
+	              ".softstop	{background: #0067FF;}\n"
 	              ".rls      {letter-spacing: 0.2em; margin-right: 1px;}\n" /* right letter spacing (used for grouping digits) */
 	              "\n"
 	              "a.px:link {color: #ffff40; text-decoration: none;}"
@@ -3064,7 +3103,7 @@ static void stats_dump_html_head(struct uri_auth *uri)
 	              "table.det th { text-align: left; border-width: 0px; padding: 0px 1px 0px 0px; font-style:normal;font-size:11px;font-weight:bold;font-family: sans-serif;}\n"
 	              "table.det td { text-align: right; border-width: 0px; padding: 0px 0px 0px 4px; white-space: nowrap; font-style:normal;font-size:11px;font-weight:normal;font-family: monospace;}\n"
 	              "u {text-decoration:none; border-bottom: 1px dotted black;}\n"
-		      "div {\n"
+		      "div.tips {\n"
 		      " display:block;\n"
 		      " visibility:hidden;\n"
 		      " z-index:2147483647;\n"
@@ -3077,7 +3116,7 @@ static void stats_dump_html_head(struct uri_auth *uri)
 		      " -moz-border-radius:3px;-webkit-border-radius:3px;border-radius:3px;\n"
 		      " -moz-box-shadow:gray 2px 2px 3px;-webkit-box-shadow:gray 2px 2px 3px;box-shadow:gray 2px 2px 3px;\n"
 		      "}\n"
-		      "u:hover div {visibility:visible;}\n"
+		      "u:hover div.tips {visibility:visible;}\n"
 	              "-->\n"
 	              "</style></head>\n",
 	              (uri->flags & ST_SHNODE) ? " on " : "",
@@ -3092,6 +3131,7 @@ static void stats_dump_html_head(struct uri_auth *uri)
 static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *uri)
 {
 	unsigned int up = (now.tv_sec - start_date.tv_sec);
+	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
 
 	/* WARNING! this has to fit the first packet too.
 	 * We are around 3.5 kB, add adding entries will
@@ -3125,6 +3165,8 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              "<td class=\"active6\"></td><td class=\"noborder\">not checked </td>"
 	              "</tr><tr>\n"
 	              "<td class=\"maintain\"></td><td class=\"noborder\" colspan=\"3\">active or backup DOWN for maintenance (MAINT) &nbsp;</td>"
+	              "</tr><tr>\n"
+	              "<td class=\"softstop\"></td><td class=\"noborder\" colspan=\"3\">active or backup SOFT STOPPED for maintenance &nbsp;</td>"
 	              "</tr></table>\n"
 	              "Note: UP with load-balancing disabled is reported as \"NOLB\"."
 	              "</td>"
@@ -3147,44 +3189,70 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              run_queue_cur, nb_tasks_cur, idle_pct
 	              );
 
+	/* scope_txt = search query, si->applet.ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
+	memcpy(scope_txt, bo_ptr(si->ob->buf) + si->applet.ctx.stats.scope_str, si->applet.ctx.stats.scope_len);
+	scope_txt[si->applet.ctx.stats.scope_len] = '\0';
+
+	chunk_appendf(&trash,
+		      "<li><form method=\"GET\" action=\"%s%s%s\">Scope : <input value=\"%s\" name=\"" STAT_SCOPE_INPUT_NAME "\" size=\"8\" maxlength=\"%d\" tabindex=\"1\"/></form>\n",
+		      uri->uri_prefix,
+		      (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+		      (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+		      (si->applet.ctx.stats.scope_len > 0) ? scope_txt : "",
+		      STAT_SCOPE_TXT_MAXLEN);
+
+	/* scope_txt = search pattern + search query, si->applet.ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
+	scope_txt[0] = 0;
+	if (si->applet.ctx.stats.scope_len) {
+		strcpy(scope_txt, STAT_SCOPE_PATTERN);
+		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si->ob->buf) + si->applet.ctx.stats.scope_str, si->applet.ctx.stats.scope_len);
+		scope_txt[strlen(STAT_SCOPE_PATTERN) + si->applet.ctx.stats.scope_len] = 0;
+	}
+
 	if (si->applet.ctx.stats.flags & STAT_HIDE_DOWN)
 		chunk_appendf(&trash,
-		              "<li><a href=\"%s%s%s\">Show all servers</a><br>\n",
+		              "<li><a href=\"%s%s%s%s\">Show all servers</a><br>\n",
 		              uri->uri_prefix,
 		              "",
-		              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "");
+		              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			      scope_txt);
 	else
 		chunk_appendf(&trash,
-		              "<li><a href=\"%s%s%s\">Hide 'DOWN' servers</a><br>\n",
+		              "<li><a href=\"%s%s%s%s\">Hide 'DOWN' servers</a><br>\n",
 		              uri->uri_prefix,
 		              ";up",
-		              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "");
+		              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			      scope_txt);
 
 	if (uri->refresh > 0) {
 		if (si->applet.ctx.stats.flags & STAT_NO_REFRESH)
 			chunk_appendf(&trash,
-			              "<li><a href=\"%s%s%s\">Enable refresh</a><br>\n",
+			              "<li><a href=\"%s%s%s%s\">Enable refresh</a><br>\n",
 			              uri->uri_prefix,
 			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
-			              "");
+			              "",
+				      scope_txt);
 		else
 			chunk_appendf(&trash,
-			              "<li><a href=\"%s%s%s\">Disable refresh</a><br>\n",
+			              "<li><a href=\"%s%s%s%s\">Disable refresh</a><br>\n",
 			              uri->uri_prefix,
 			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
-			              ";norefresh");
+			              ";norefresh",
+				      scope_txt);
 	}
 
 	chunk_appendf(&trash,
-	              "<li><a href=\"%s%s%s\">Refresh now</a><br>\n",
+	              "<li><a href=\"%s%s%s%s\">Refresh now</a><br>\n",
 	              uri->uri_prefix,
 	              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
-	              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "");
+	              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+		      scope_txt);
 
 	chunk_appendf(&trash,
-	              "<li><a href=\"%s;csv%s\">CSV export</a><br>\n",
+	              "<li><a href=\"%s;csv%s%s\">CSV export</a><br>\n",
 	              uri->uri_prefix,
-	              (uri->refresh > 0) ? ";norefresh" : "");
+	              (uri->refresh > 0) ? ";norefresh" : "",
+		      scope_txt);
 
 	chunk_appendf(&trash,
 	              "</ul></td>"
@@ -3204,58 +3272,79 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 		case STAT_STATUS_DONE:
 			chunk_appendf(&trash,
 			              "<p><div class=active3>"
-			              "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action processed successfully."
-			              "</div>\n", uri->uri_prefix);
+			              "</div>\n", uri->uri_prefix,
+			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
 			break;
 		case STAT_STATUS_NONE:
 			chunk_appendf(&trash,
 			              "<p><div class=active2>"
-			              "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Nothing has changed."
-			              "</div>\n", uri->uri_prefix);
+			              "</div>\n", uri->uri_prefix,
+			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
 			break;
 		case STAT_STATUS_PART:
 			chunk_appendf(&trash,
 			              "<p><div class=active2>"
-			              "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action partially processed.<br>"
 			              "Some server names are probably unknown or ambiguous (duplicated names in the backend)."
-			              "</div>\n", uri->uri_prefix);
+			              "</div>\n", uri->uri_prefix,
+			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
 			break;
 		case STAT_STATUS_ERRP:
 			chunk_appendf(&trash,
 			              "<p><div class=active0>"
-			              "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action not processed because of invalid parameters."
 			              "<ul>"
 			              "<li>The action is maybe unknown.</li>"
 			              "<li>The backend name is probably unknown or ambiguous (duplicated names).</li>"
 			              "<li>Some server names are probably unknown or ambiguous (duplicated names in the backend).</li>"
 			              "</ul>"
-			              "</div>\n", uri->uri_prefix);
+			              "</div>\n", uri->uri_prefix,
+			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
 			break;
 		case STAT_STATUS_EXCD:
 			chunk_appendf(&trash,
 			              "<p><div class=active0>"
-			              "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Action not processed : the buffer couldn't store all the data.<br>"
 			              "You should retry with less servers at a time.</b>"
-			              "</div>\n", uri->uri_prefix);
+			              "</div>\n", uri->uri_prefix,
+			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
 			break;
 		case STAT_STATUS_DENY:
 			chunk_appendf(&trash,
 			              "<p><div class=active0>"
-			              "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Action denied.</b>"
-			              "</div>\n", uri->uri_prefix);
+			              "</div>\n", uri->uri_prefix,
+			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
 			break;
 		default:
 			chunk_appendf(&trash,
 			              "<p><div class=active6>"
-			              "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Unexpected result."
-			              "</div>\n", uri->uri_prefix);
+			              "</div>\n", uri->uri_prefix,
+			              (si->applet.ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (si->applet.ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
 		}
 		chunk_appendf(&trash, "<p>\n");
 	}
@@ -3946,17 +4035,19 @@ static void cli_release_handler(struct stream_interface *si)
 	}
 }
 
-/* This function dumps all tables' states onto the stream interface's
- * read buffer. The xprt_ctx must have been zeroed first, and the flags
- * properly set. It returns 0 if the output buffer is full and it needs
- * to be called again, otherwise non-zero.
+/* This function is used to either dump tables states (when action is set
+ * to STAT_CLI_O_TAB) or clear tables (when action is STAT_CLI_O_CLR).
+ * The xprt_ctx must have been zeroed first, and the flags properly set.
+ * It returns 0 if the output buffer is full and it needs to be called
+ * again, otherwise non-zero.
  */
-static int stats_table_request(struct stream_interface *si, int show)
+static int stats_table_request(struct stream_interface *si, int action)
 {
 	struct session *s = si->conn->xprt_ctx;
 	struct ebmb_node *eb;
 	int dt;
 	int skip_entry;
+	int show = action == STAT_CLI_O_TAB;
 
 	/*
 	 * We have 3 possible states in si->conn->xprt_st :
@@ -4356,7 +4447,7 @@ static struct si_applet cli_applet = {
 	.release = cli_release_handler,
 };
 
-static struct cfg_kw_list cfg_kws = {{ },{
+static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "stats", stats_parse_global },
 	{ 0, NULL, NULL },
 }};

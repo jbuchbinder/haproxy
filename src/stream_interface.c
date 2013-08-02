@@ -807,6 +807,14 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 	    !(si->flags & SI_FL_WAIT_DATA))       /* not waiting for data */
 		return;
 
+	if (si->conn->flags & (CO_FL_DATA_WR_ENA|CO_FL_CURR_WR_ENA)) {
+		/* already subscribed to write notifications, will be called
+		 * anyway, so let's avoid calling it especially if the reader
+		 * is not ready.
+		 */
+		return;
+	}
+
 	if (!(si->conn->flags & (CO_FL_HANDSHAKE|CO_FL_WAIT_L4_CONN|CO_FL_WAIT_L6_CONN))) {
 		/* Before calling the data-level operations, we have to prepare
 		 * the polling flags to ensure we properly detect changes.
@@ -926,7 +934,8 @@ static void si_conn_recv_cb(struct connection *conn)
 	 * using a buffer.
 	 */
 	if (conn->xprt->rcv_pipe &&
-	    chn->to_forward >= MIN_SPLICE_FORWARD && chn->flags & CF_KERN_SPLICING) {
+	    (chn->pipe || chn->to_forward >= MIN_SPLICE_FORWARD) &&
+	    chn->flags & CF_KERN_SPLICING) {
 		if (buffer_not_empty(chn->buf)) {
 			/* We're embarrassed, there are already data pending in
 			 * the buffer and we don't want to have them at two
@@ -964,20 +973,29 @@ static void si_conn_recv_cb(struct connection *conn)
 		if (conn->flags & CO_FL_ERROR)
 			goto out_error;
 
-		if (conn->flags & CO_FL_WAIT_ROOM) /* most likely the pipe is full */
+		if (conn->flags & CO_FL_WAIT_ROOM) {
+			/* the pipe is full or we have read enough data that it
+			 * could soon be full. Let's stop before needing to poll.
+			 */
 			si->flags |= SI_FL_WAIT_ROOM;
+			__conn_data_stop_recv(conn);
+		}
 
 		/* splice not possible (anymore), let's go on on standard copy */
 	}
 
  abort_splice:
-	/* release the pipe if we can, which is almost always the case */
-	if (chn->pipe && !chn->pipe->data) {
+	if (chn->pipe && unlikely(!chn->pipe->data)) {
 		put_pipe(chn->pipe);
 		chn->pipe = NULL;
 	}
 
-	while (!chn->pipe && !(conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_DATA_RD_SH | CO_FL_WAIT_RD | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE))) {
+	/* Important note : if we're called with POLL_IN|POLL_HUP, it means the read polling
+	 * was enabled, which implies that the recv buffer was not full. So we have a guarantee
+	 * that if such an event is not handled above in splice, it will be handled here by
+	 * recv().
+	 */
+	while (!(conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_DATA_RD_SH | CO_FL_WAIT_RD | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE))) {
 		max = bi_avail(chn);
 
 		if (!max) {

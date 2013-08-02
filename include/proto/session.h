@@ -59,7 +59,7 @@ static inline void session_store_counters(struct session *s)
 	void *ptr;
 	int i;
 
-	for (i = 0; i < sizeof(s->stkctr) / sizeof(s->stkctr[0]); i++) {
+	for (i = 0; i < MAX_SESS_STKCTR; i++) {
 		if (!s->stkctr[i].entry)
 			continue;
 		ptr = stktable_data_ptr(s->stkctr[i].table, s->stkctr[i].entry, STKTABLE_DT_CONN_CUR);
@@ -80,17 +80,14 @@ static inline void session_stop_backend_counters(struct session *s)
 	void *ptr;
 	int i;
 
-	if (!(s->flags & (SN_BE_TRACK_SC1|SN_BE_TRACK_SC2)))
+	if (likely(!(s->flags & SN_BE_TRACK_ANY)))
 		return;
 
-	for (i = 0; i < sizeof(s->stkctr) / sizeof(s->stkctr[0]); i++) {
+	for (i = 0; i < MAX_SESS_STKCTR; i++) {
 		if (!s->stkctr[i].entry)
 			continue;
 
-		if ((i == 0) && !(s->flags & SN_BE_TRACK_SC1))
-			continue;
-
-		if ((i == 1) && !(s->flags & SN_BE_TRACK_SC2))
+		if (!(s->flags & (SN_BE_TRACK_SC0 << i)))
 			continue;
 
 		ptr = stktable_data_ptr(s->stkctr[i].table, s->stkctr[i].entry, STKTABLE_DT_CONN_CUR);
@@ -100,7 +97,7 @@ static inline void session_stop_backend_counters(struct session *s)
 		stksess_kill_if_expired(s->stkctr[i].table, s->stkctr[i].entry);
 		s->stkctr[i].entry = NULL;
 	}
-	s->flags &= ~(SN_BE_TRACK_SC1|SN_BE_TRACK_SC2);
+	s->flags &= ~SN_BE_TRACK_ANY;
 }
 
 /* Increase total and concurrent connection count for stick entry <ts> of table
@@ -148,7 +145,7 @@ static void inline session_inc_http_req_ctr(struct session *s)
 	void *ptr;
 	int i;
 
-	for (i = 0; i < sizeof(s->stkctr) / sizeof(s->stkctr[0]); i++) {
+	for (i = 0; i < MAX_SESS_STKCTR; i++) {
 		if (!s->stkctr[i].entry)
 			continue;
 
@@ -169,17 +166,14 @@ static void inline session_inc_be_http_req_ctr(struct session *s)
 	void *ptr;
 	int i;
 
-	if (likely(!(s->flags & (SN_BE_TRACK_SC1|SN_BE_TRACK_SC2))))
+	if (likely(!(s->flags & SN_BE_TRACK_ANY)))
 		return;
 
-	for (i = 0; i < sizeof(s->stkctr) / sizeof(s->stkctr[0]); i++) {
+	for (i = 0; i < MAX_SESS_STKCTR; i++) {
 		if (!s->stkctr[i].entry)
 			continue;
 
-		if ((i == 0) && !(s->flags & SN_BE_TRACK_SC1))
-			continue;
-
-		if ((i == 1) && !(s->flags & SN_BE_TRACK_SC2))
+		if (!(s->flags & (SN_BE_TRACK_SC0 << i)))
 			continue;
 
 		ptr = stktable_data_ptr(s->stkctr[i].table, s->stkctr[i].entry, STKTABLE_DT_HTTP_REQ_CNT);
@@ -204,7 +198,7 @@ static void inline session_inc_http_err_ctr(struct session *s)
 	void *ptr;
 	int i;
 
-	for (i = 0; i < sizeof(s->stkctr) / sizeof(s->stkctr[0]); i++) {
+	for (i = 0; i < MAX_SESS_STKCTR; i++) {
 		if (!s->stkctr[i].entry)
 			continue;
 

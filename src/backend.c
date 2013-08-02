@@ -408,7 +408,6 @@ struct server *get_server_rch(struct session *s)
 	const char      *p;
 	int              ret;
 	struct sample    smp;
-	struct arg       args[2];
 	int rewind;
 
 	/* tot_weight appears to mean srv_count */
@@ -417,14 +416,9 @@ struct server *get_server_rch(struct session *s)
 
 	memset(&smp, 0, sizeof(smp));
 
-	args[0].type = ARGT_STR;
-	args[0].data.str.str = px->hh_name;
-	args[0].data.str.len = px->hh_len;
-	args[1].type = ARGT_STOP;
-
 	b_rew(s->req->buf, rewind = s->req->buf->o);
 
-	ret = smp_fetch_rdp_cookie(px, s, NULL, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, args, &smp);
+	ret = fetch_rdp_cookie_name(s, &smp, px->hh_name, px->hh_len);
 	len = smp.data.str.len;
 
 	b_adv(s->req->buf, rewind);
@@ -884,7 +878,7 @@ int assign_server_and_queue(struct session *s)
  */
 static void assign_tproxy_address(struct session *s)
 {
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_LINUX_TPROXY)
+#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
 	struct server *srv = objt_server(s->target);
 	struct conn_src *src;
 
@@ -1111,7 +1105,6 @@ int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
 	struct server *srv = px->srv;
 	struct sockaddr_in addr;
 	char *p;
-	struct arg       args[2];
 
 	DPRINTF(stderr,"[%u] %s: session=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%d analysers=%02x\n",
 		now_ms, __FUNCTION__,
@@ -1127,12 +1120,7 @@ int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
 
 	memset(&smp, 0, sizeof(smp));
 
-	args[0].type = ARGT_STR;
-	args[0].data.str.str = s->be->rdp_cookie_name;
-	args[0].data.str.len = s->be->rdp_cookie_len;
-	args[1].type = ARGT_STOP;
-
-	ret = smp_fetch_rdp_cookie(px, s, NULL, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, args, &smp);
+	ret = fetch_rdp_cookie_name(s, &smp, s->be->rdp_cookie_name, s->be->rdp_cookie_len);
 	if (ret == 0 || (smp.flags & SMP_F_MAY_CHANGE) || smp.data.str.len == 0)
 		goto no_cookie;
 
@@ -1379,7 +1367,7 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
  */
 static int
 smp_fetch_nbsrv(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -1402,7 +1390,7 @@ smp_fetch_nbsrv(struct proxy *px, struct session *l4, void *l7, unsigned int opt
  */
 static int
 smp_fetch_srv_is_up(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                    const struct arg *args, struct sample *smp)
+                    const struct arg *args, struct sample *smp, const char *kw)
 {
 	struct server *srv = args->data.srv;
 
@@ -1422,7 +1410,7 @@ smp_fetch_srv_is_up(struct proxy *px, struct session *l4, void *l7, unsigned int
  */
 static int
 smp_fetch_connslots(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                    const struct arg *args, struct sample *smp)
+                    const struct arg *args, struct sample *smp, const char *kw)
 {
 	struct server *iterator;
 
@@ -1450,7 +1438,7 @@ smp_fetch_connslots(struct proxy *px, struct session *l4, void *l7, unsigned int
 /* set temp integer to the id of the backend */
 static int
 smp_fetch_be_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TXN;
 	smp->type = SMP_T_UINT;
@@ -1461,7 +1449,7 @@ smp_fetch_be_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 /* set temp integer to the id of the server */
 static int
 smp_fetch_srv_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                 const struct arg *args, struct sample *smp)
+                 const struct arg *args, struct sample *smp, const char *kw)
 {
 	if (!objt_server(l4->target))
 		return 0;
@@ -1478,7 +1466,7 @@ smp_fetch_srv_id(struct proxy *px, struct session *l4, void *l7, unsigned int op
  */
 static int
 smp_fetch_be_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                       const struct arg *args, struct sample *smp)
+                       const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -1492,7 +1480,7 @@ smp_fetch_be_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned 
  */
 static int
 smp_fetch_be_conn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                  const struct arg *args, struct sample *smp)
+                  const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -1506,7 +1494,7 @@ smp_fetch_be_conn(struct proxy *px, struct session *l4, void *l7, unsigned int o
  */
 static int
 smp_fetch_queue_size(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                     const struct arg *args, struct sample *smp)
+                     const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -1524,7 +1512,7 @@ smp_fetch_queue_size(struct proxy *px, struct session *l4, void *l7, unsigned in
  */
 static int
 smp_fetch_avg_queue_size(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                         const struct arg *args, struct sample *smp)
+                         const struct arg *args, struct sample *smp, const char *kw)
 {
 	int nbsrv;
 
@@ -1553,7 +1541,7 @@ smp_fetch_avg_queue_size(struct proxy *px, struct session *l4, void *l7, unsigne
  */
 static int
 smp_fetch_srv_conn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                   const struct arg *args, struct sample *smp)
+                   const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -1567,7 +1555,7 @@ smp_fetch_srv_conn(struct proxy *px, struct session *l4, void *l7, unsigned int 
  */
 static int
 smp_fetch_srv_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                        const struct arg *args, struct sample *smp)
+                        const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
@@ -1579,7 +1567,7 @@ smp_fetch_srv_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct sample_fetch_kw_list smp_kws = {{ },{
+static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "avg_queue",     smp_fetch_avg_queue_size, ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "be_conn",       smp_fetch_be_conn,        ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
 	{ "be_id",         smp_fetch_be_id,          0,           NULL, SMP_T_UINT, SMP_USE_BKEND, },
@@ -1598,18 +1586,7 @@ static struct sample_fetch_kw_list smp_kws = {{ },{
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct acl_kw_list acl_kws = {{ },{
-	{ "avg_queue",     NULL, acl_parse_int,     acl_match_int     },
-	{ "be_conn",       NULL, acl_parse_int,     acl_match_int     },
-	{ "be_id",         NULL, acl_parse_int,     acl_match_int     },
-	{ "be_sess_rate",  NULL, acl_parse_int,     acl_match_int     },
-	{ "connslots",     NULL, acl_parse_int,     acl_match_int     },
-	{ "nbsrv",         NULL, acl_parse_int,     acl_match_int     },
-	{ "queue",         NULL, acl_parse_int,     acl_match_int     },
-	{ "srv_conn",      NULL, acl_parse_int,     acl_match_int     },
-	{ "srv_id",        NULL, acl_parse_int,     acl_match_int     },
-	{ "srv_is_up",     NULL, acl_parse_nothing, acl_match_nothing },
-	{ "srv_sess_rate", NULL, acl_parse_int,     acl_match_int     },
+static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 

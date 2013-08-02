@@ -152,7 +152,8 @@ static int stktable_trash_oldest(struct stktable *t, int to_batch)
  * Allocate and initialise a new sticky session.
  * The new sticky session is returned or NULL in case of lack of memory.
  * Sticky sessions should only be allocated this way, and must be freed using
- * stksess_free(). Increase table <t> sticky session counter.
+ * stksess_free(). Table <t>'s sticky session counter is increased. If <key>
+ * is not NULL, it is assigned to the new session.
  */
 struct stksess *stksess_new(struct stktable *t, struct stktable_key *key)
 {
@@ -170,7 +171,8 @@ struct stksess *stksess_new(struct stktable *t, struct stktable_key *key)
 	if (ts) {
 		t->current++;
 		stksess_init(t, ts);
-		stksess_setkey(t, ts, key);
+		if (key)
+			stksess_setkey(t, ts, key);
 	}
 
 	return ts;
@@ -683,6 +685,7 @@ int stktable_compatible_sample(struct sample_expr *expr, unsigned long table_typ
 struct stktable_data_type stktable_data_types[STKTABLE_DATA_TYPES] = {
 	[STKTABLE_DT_SERVER_ID]     = { .name = "server_id",      .std_type = STD_T_SINT  },
 	[STKTABLE_DT_GPC0]          = { .name = "gpc0",           .std_type = STD_T_UINT  },
+	[STKTABLE_DT_GPC0_RATE]     = { .name = "gpc0_rate",      .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
 	[STKTABLE_DT_CONN_CNT]      = { .name = "conn_cnt",       .std_type = STD_T_UINT  },
 	[STKTABLE_DT_CONN_RATE]     = { .name = "conn_rate",      .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
 	[STKTABLE_DT_CONN_CUR]      = { .name = "conn_cur",       .std_type = STD_T_UINT  },

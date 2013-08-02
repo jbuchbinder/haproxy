@@ -406,13 +406,16 @@ int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 	}
 	if (curproxy->to_log & (LW_REQ | LW_RESP)) {
 		curproxy->to_log &= ~(LW_REQ | LW_RESP);
-		Warning("config : 'option httplog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
+		Warning("parsing [%s:%d] : 'option httplog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
+			curproxy->conf.lfs_file, curproxy->conf.lfs_line,
 			proxy_type_str(curproxy), curproxy->id);
 	}
-	if (curproxy->logformat_string == default_http_log_format ||
-	    curproxy->logformat_string == clf_http_log_format) {
-		curproxy->logformat_string = default_tcp_log_format;
-		Warning("config : 'option httplog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
+	if (curproxy->conf.logformat_string == default_http_log_format ||
+	    curproxy->conf.logformat_string == clf_http_log_format) {
+		/* Note: we don't change the directive's file:line number */
+		curproxy->conf.logformat_string = default_tcp_log_format;
+		Warning("parsing [%s:%d] : 'option httplog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
+			curproxy->conf.lfs_file, curproxy->conf.lfs_line,
 			proxy_type_str(curproxy), curproxy->id);
 	}
 
@@ -430,6 +433,7 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->pendconns);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
+	LIST_INIT(&p->http_res_rules);
 	LIST_INIT(&p->block_cond);
 	LIST_INIT(&p->redirect_rules);
 	LIST_INIT(&p->mon_fail_cond);
@@ -855,7 +859,7 @@ int session_set_backend(struct session *s, struct proxy *be)
 	return 1;
 }
 
-static struct cfg_kw_list cfg_kws = {{ },{
+static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "timeout", proxy_parse_timeout },
 	{ CFG_LISTEN, "clitimeout", proxy_parse_timeout },
 	{ CFG_LISTEN, "contimeout", proxy_parse_timeout },

@@ -34,6 +34,7 @@ int tcp_connect_server(struct connection *conn, int data, int delack);
 int tcp_connect_probe(struct connection *conn);
 int tcp_get_src(int fd, struct sockaddr *sa, socklen_t salen, int dir);
 int tcp_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir);
+int tcp_drain(int fd);
 int tcp_inspect_request(struct session *s, struct channel *req, int an_bit);
 int tcp_inspect_response(struct session *s, struct channel *rep, int an_bit);
 int tcp_exec_req_rules(struct session *s);
@@ -58,6 +59,13 @@ static inline struct stktable_key *addr_to_stktable_key(struct sockaddr_storage 
 	return static_table_key;
 }
 
+/* for a tcp-request action TCP_ACT_TRK_*, return a tracking index starting at
+ * zero for SC1. Unknown actions also return zero.
+ */
+static inline int tcp_trk_idx(int trk_action)
+{
+	return trk_action - TCP_ACT_TRK_SC0;
+}
 
 #endif /* _PROTO_PROTO_TCP_H */
 

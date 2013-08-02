@@ -596,26 +596,19 @@ switchstate:
 			}
 			case PEER_SESSION_WAITMSG: {
 				struct peer_session *ps = (struct peer_session *)si->conn->xprt_ctx;
+				struct stksess *ts, *newts = NULL;
 				char c;
 				int totl = 0;
 
 				reql = bo_getblk(si->ob, (char *)&c, sizeof(c), totl);
-				if (reql <= 0) { /* closed or EOL not found */
-					if (reql == 0) {
-						/* nothing to read */
-						goto incomplete;
-					}
-					si->applet.st0 = PEER_SESSION_END;
-					goto switchstate;
-				}
+				if (reql <= 0) /* closed or EOL not found */
+					goto incomplete;
+
 				totl += reql;
 
 				if ((c & 0x80) || (c == 'D')) {
 					/* Here we have data message */
 					unsigned int pushack;
-					struct stksess *ts;
-					struct stksess *newts;
-					struct stktable_key stkey;
 					int srvid;
 					uint32_t netinteger;
 
@@ -625,90 +618,65 @@ switchstate:
 					}
 					else {
 						reql = bo_getblk(si->ob, (char *)&netinteger, sizeof(netinteger), totl);
-						if (reql <= 0) { /* closed or EOL not found */
-							if (reql == 0) {
-								goto incomplete;
-							}
-							si->applet.st0 = PEER_SESSION_END;
-							goto switchstate;
-						}
+						if (reql <= 0) /* closed or EOL not found */
+							goto incomplete;
+
 						totl += reql;
 						pushack = ntohl(netinteger);
 					}
 
-					/* read key */
+					/* read key. We try to read it directly
+					 * to the target memory location so that
+					 * we are certain there is always enough
+					 * space. However, if the allocation fails,
+					 * we fall back to trash and we ignore the
+					 * input data not to block the sync of other
+					 * tables (think about a full table with
+					 * "nopurge" for example).
+					 */
 					if (ps->table->table->type == STKTABLE_TYPE_STRING) {
-						/* type string */
-						stkey.key = stkey.data.buf;
-
+						/* read size first */
 						reql = bo_getblk(si->ob, (char *)&netinteger, sizeof(netinteger), totl);
-						if (reql <= 0) { /* closed or EOL not found */
-							if (reql == 0) {
-								goto incomplete;
-							}
-							si->applet.st0 = PEER_SESSION_END;
-							goto switchstate;
-						}
-						totl += reql;
-						stkey.key_len = ntohl(netinteger);
+						if (reql <= 0) /* closed or EOL not found */
+							goto incomplete;
 
-						reql = bo_getblk(si->ob, stkey.key, stkey.key_len, totl);
-						if (reql <= 0) { /* closed or EOL not found */
-							if (reql == 0) {
-								goto incomplete;
-							}
-							si->applet.st0 = PEER_SESSION_END;
-							goto switchstate;
-						}
+						totl += reql;
+						newts = stksess_new(ps->table->table, NULL);
+						reql = bo_getblk(si->ob, newts ? (char *)newts->key.key : trash.str, ntohl(netinteger), totl);
+						if (reql <= 0) /* closed or EOL not found */
+							goto incomplete;
+
+						/* always truncate the string to the approprite size */
+						if (newts)
+							newts->key.key[MIN(ntohl(netinteger), ps->table->table->key_size)] = 0;
+
 						totl += reql;
 					}
 					else if (ps->table->table->type == STKTABLE_TYPE_INTEGER) {
-						/* type integer */
-						stkey.key_len = (size_t)-1;
-						stkey.key = &stkey.data.integer;
-
-						reql = bo_getblk(si->ob, (char *)&netinteger, sizeof(netinteger), totl);
-						if (reql <= 0) { /* closed or EOL not found */
-							if (reql == 0) {
-								goto incomplete;
-							}
-							si->applet.st0 = PEER_SESSION_END;
-							goto switchstate;
-						}
+						newts = stksess_new(ps->table->table, NULL);
+						reql = bo_getblk(si->ob, newts ? (char *)newts->key.key : trash.str, sizeof(netinteger), totl);
+						if (reql <= 0) /* closed or EOL not found */
+							goto incomplete;
 						totl += reql;
-						stkey.data.integer = ntohl(netinteger);
 					}
 					else {
-						/* type ip */
-						stkey.key_len = (size_t)-1;
-						stkey.key = stkey.data.buf;
-
-						reql = bo_getblk(si->ob, (char *)&stkey.data.buf, ps->table->table->key_size, totl);
-						if (reql <= 0) { /* closed or EOL not found */
-							if (reql == 0) {
-								goto incomplete;
-							}
-							si->applet.st0 = PEER_SESSION_END;
-							goto switchstate;
-						}
+						/* type ip or binary */
+						newts = stksess_new(ps->table->table, NULL);
+						reql = bo_getblk(si->ob, newts ? (char *)newts->key.key : trash.str, ps->table->table->key_size, totl);
+						if (reql <= 0) /* closed or EOL not found */
+							goto incomplete;
 						totl += reql;
-
 					}
 
 					/* read server id */
 					reql = bo_getblk(si->ob, (char *)&netinteger, sizeof(netinteger), totl);
-					if (reql <= 0) { /* closed or EOL not found */
-						if (reql == 0) {
-							goto incomplete;
-						}
-						si->applet.st0 = PEER_SESSION_END;
-						goto switchstate;
-					}
+					if (reql <= 0) /* closed or EOL not found */
+						goto incomplete;
+
 					totl += reql;
 					srvid = ntohl(netinteger);
 
 					/* update entry */
-					newts = stksess_new(ps->table->table, &stkey);
 					if (newts) {
 						/* lookup for existing entry */
 						ts = stktable_lookup(ps->table->table, newts);
@@ -716,12 +684,15 @@ switchstate:
 							 /* the entry already exist, we can free ours */
 							stktable_touch(ps->table->table, ts, 0);
 							stksess_free(ps->table->table, newts);
+							newts = NULL;
 						}
 						else {
 							struct eb32_node *eb;
 
 							/* create new entry */
 							ts = stktable_store(ps->table->table, newts, 0);
+							newts = NULL; /* don't reuse it */
+
 							ts->upd.key= (++ps->table->table->update)+(2^31);
 							eb = eb32_insert(&ps->table->table->updates, &ts->upd);
 							if (eb != &ts->upd) {
@@ -806,13 +777,9 @@ switchstate:
 					uint32_t netinteger;
 
 					reql = bo_getblk(si->ob, (char *)&netinteger, sizeof(netinteger), totl);
-					if (reql <= 0) { /* closed or EOL not found */
-						if (reql == 0) {
-							goto incomplete;
-						}
-						si->applet.st0 = PEER_SESSION_END;
-						goto switchstate;
-					}
+					if (reql <= 0) /* closed or EOL not found */
+						goto incomplete;
+
 					totl += reql;
 
 					/* Consider remote is up to date with "acked" version */
@@ -828,8 +795,23 @@ switchstate:
 				bo_skip(si->ob, totl);
 
 				/* loop on that state to peek next message */
-				continue;
+				goto switchstate;
+
 incomplete:
+				/* we get here when a bo_getblk() returns <= 0 in reql */
+
+				/* first, we may have to release newts */
+				if (newts) {
+					stksess_free(ps->table->table, newts);
+					newts = NULL;
+				}
+
+				if (reql < 0) {
+					/* there was an error */
+					si->applet.st0 = PEER_SESSION_END;
+					goto switchstate;
+				}
+
 				/* Nothing to read, now we start to write */
 
 				/* Confirm finished or partial messages */
@@ -1112,7 +1094,7 @@ static struct session *peer_session_create(struct peer *peer, struct peer_sessio
 	struct task *t;
 
 	if ((s = pool_alloc2(pool2_session)) == NULL) { /* disable this proxy for a while */
-		Alert("out of memory in event_accept().\n");
+		Alert("out of memory in peer_session_create().\n");
 		goto out_close;
 	}
 
@@ -1131,7 +1113,7 @@ static struct session *peer_session_create(struct peer *peer, struct peer_sessio
 	 * it as soon as possible, which means closing it immediately for TCP.
 	 */
 	if ((t = task_new()) == NULL) { /* disable this proxy for a while */
-		Alert("out of memory in event_accept().\n");
+		Alert("out of memory in peer_session_create().\n");
 		goto out_free_session;
 	}
 
@@ -1196,14 +1178,14 @@ static struct session *peer_session_create(struct peer *peer, struct peer_sessio
 
 	/* init store persistence */
 	s->store_count = 0;
-	s->stkctr[0].entry = NULL;
-	s->stkctr[1].entry = NULL;
+	memset(s->stkctr, 0, sizeof(s->stkctr));
 
 	/* FIXME: the logs are horribly complicated now, because they are
 	 * defined in <p>, <p>, and later <be> and <be>.
 	 */
 
 	s->logs.logwait = 0;
+	s->logs.level = 0;
 	s->do_log = NULL;
 
 	/* default error reporting function, may be changed by analysers */

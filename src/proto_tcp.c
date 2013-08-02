@@ -77,6 +77,7 @@ static struct protocol proto_tcpv4 = {
 	.enable_all = enable_all_listeners,
 	.get_src = tcp_get_src,
 	.get_dst = tcp_get_dst,
+	.drain = tcp_drain,
 	.listeners = LIST_HEAD_INIT(proto_tcpv4.listeners),
 	.nb_listeners = 0,
 };
@@ -98,6 +99,7 @@ static struct protocol proto_tcpv6 = {
 	.enable_all = enable_all_listeners,
 	.get_src = tcp_get_src,
 	.get_dst = tcp_get_dst,
+	.drain = tcp_drain,
 	.listeners = LIST_HEAD_INIT(proto_tcpv6.listeners),
 	.nb_listeners = 0,
 };
@@ -122,15 +124,30 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
 	struct sockaddr_storage bind_addr;
 	int foreign_ok = 0;
 	int ret;
-
-#ifdef CONFIG_HAP_LINUX_TPROXY
 	static int ip_transp_working = 1;
 	static int ip6_transp_working = 1;
+
 	switch (local->ss_family) {
 	case AF_INET:
 		if (flags && ip_transp_working) {
-			if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one)) == 0
-			    || setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one)) == 0)
+			/* This deserves some explanation. Some platforms will support
+			 * multiple combinations of certain methods, so we try the
+			 * supported ones until one succeeds.
+			 */
+			if (0
+#if defined(IP_TRANSPARENT)
+			    || (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one)) == 0)
+#endif
+#if defined(IP_FREEBIND)
+			    || (setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one)) == 0)
+#endif
+#if defined(IP_BINDANY)
+			    || (setsockopt(fd, IPPROTO_IP, IP_BINDANY, &one, sizeof(one)) == 0)
+#endif
+#if defined(SO_BINDANY)
+			    || (setsockopt(fd, SOL_SOCKET, SO_BINDANY, &one, sizeof(one)) == 0)
+#endif
+			    )
 				foreign_ok = 1;
 			else
 				ip_transp_working = 0;
@@ -138,14 +155,24 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
 		break;
 	case AF_INET6:
 		if (flags && ip6_transp_working) {
-			if (setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) == 0)
+			if (0
+#if defined(IPV6_TRANSPARENT)
+			    || (setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) == 0)
+#endif
+#if defined(IPV6_BINDANY)
+			    || (setsockopt(fd, IPPROTO_IPV6, IPV6_BINDANY, &one, sizeof(one)) == 0)
+#endif
+#if defined(SO_BINDANY)
+			    || (setsockopt(fd, SOL_SOCKET, SO_BINDANY, &one, sizeof(one)) == 0)
+#endif
+			    )
 				foreign_ok = 1;
 			else
 				ip6_transp_working = 0;
 		}
 		break;
 	}
-#endif
+
 	if (flags) {
 		memset(&bind_addr, 0, sizeof(bind_addr));
 		bind_addr.ss_family = remote->ss_family;
@@ -488,6 +515,41 @@ int tcp_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 		return getsockname(fd, sa, &salen);
 }
 
+/* Tries to drain any pending incoming data from the socket to reach the
+ * receive shutdown. Returns non-zero if the shutdown was found, otherwise
+ * zero. This is useful to decide whether we can close a connection cleanly
+ * are we must kill it hard.
+ */
+int tcp_drain(int fd)
+{
+	int turns = 2;
+	int len;
+
+	while (turns) {
+#ifdef MSG_TRUNC_CLEARS_INPUT
+		len = recv(fd, NULL, INT_MAX, MSG_DONTWAIT | MSG_NOSIGNAL | MSG_TRUNC);
+		if (len == -1 && errno == EFAULT)
+#endif
+			len = recv(fd, trash.str, trash.size, MSG_DONTWAIT | MSG_NOSIGNAL);
+
+		if (len == 0)                /* cool, shutdown received */
+			return 1;
+
+		if (len < 0) {
+			if (errno == EAGAIN) /* connection not closed yet */
+				return 0;
+			if (errno == EINTR)  /* oops, try again */
+				continue;
+			/* other errors indicate a dead connection, fine. */
+			return 1;
+		}
+		/* OK we read some data, let's try again once */
+		turns--;
+	}
+	/* some data are still present, give up */
+	return 0;
+}
+
 /* This is the callback which is set when a connection establishment is pending
  * and we have nothing to send, or if we have an init function we want to call
  * once the connection is established. It updates the FD polling status. It
@@ -621,25 +683,47 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	if (!ext)
 		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
-#ifdef CONFIG_HAP_LINUX_TPROXY
+
 	if (!ext && (listener->options & LI_O_FOREIGN)) {
 		switch (listener->addr.ss_family) {
 		case AF_INET:
-			if ((setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one)) == -1)
-			    && (setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one)) == -1)) {
+			if (1
+#if defined(IP_TRANSPARENT)
+			    && (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one)) == -1)
+#endif
+#if defined(IP_FREEBIND)
+			    && (setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one)) == -1)
+#endif
+#if defined(IP_BINDANY)
+			    && (setsockopt(fd, IPPROTO_IP, IP_BINDANY, &one, sizeof(one)) == -1)
+#endif
+#if defined(SO_BINDANY)
+			    && (setsockopt(fd, SOL_SOCKET, SO_BINDANY, &one, sizeof(one)) == -1)
+#endif
+			    ) {
 				msg = "cannot make listening socket transparent";
 				err |= ERR_ALERT;
 			}
 		break;
 		case AF_INET6:
-			if (setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) == -1) {
+			if (1
+#if defined(IPV6_TRANSPARENT)
+			    && (setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) == -1)
+#endif
+#if defined(IPV6_BINDANY)
+			    && (setsockopt(fd, IPPROTO_IPV6, IPV6_BINDANY, &one, sizeof(one)) == -1)
+#endif
+#if defined(SO_BINDANY)
+			    && (setsockopt(fd, SOL_SOCKET, SO_BINDANY, &one, sizeof(one)) == -1)
+#endif
+			    ) {
 				msg = "cannot make listening socket transparent";
 				err |= ERR_ALERT;
 			}
 		break;
 		}
 	}
-#endif
+
 #ifdef SO_BINDTODEVICE
 	/* Note: this might fail if not CAP_NET_RAW */
 	if (!ext && listener->interface) {
@@ -854,8 +938,8 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 					s->flags |= SN_FINST_R;
 				return 0;
 			}
-			else if ((rule->action == TCP_ACT_TRK_SC1 && !s->stkctr[0].entry) ||
-			         (rule->action == TCP_ACT_TRK_SC2 && !s->stkctr[1].entry)) {
+			else if ((rule->action >= TCP_ACT_TRK_SC0 && rule->action <= TCP_ACT_TRK_SCMAX) &&
+				 !s->stkctr[tcp_trk_idx(rule->action)].entry) {
 				/* Note: only the first valid tracking parameter of each
 				 * applies.
 				 */
@@ -865,15 +949,9 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 				key = stktable_fetch_key(t, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->act_prm.trk_ctr.expr);
 
 				if (key && (ts = stktable_get_entry(t, key))) {
-					if (rule->action == TCP_ACT_TRK_SC1) {
-						session_track_stkctr(&s->stkctr[0], t, ts);
-						if (s->fe != s->be)
-							s->flags |= SN_BE_TRACK_SC1;
-					} else {
-						session_track_stkctr(&s->stkctr[1], t, ts);
-						if (s->fe != s->be)
-							s->flags |= SN_BE_TRACK_SC2;
-					}
+					session_track_stkctr(&s->stkctr[tcp_trk_idx(rule->action)], t, ts);
+					if (s->fe != s->be)
+						s->flags |= SN_BE_TRACK_SC0 << tcp_trk_idx(rule->action);
 				}
 			}
 			else {
@@ -1014,8 +1092,8 @@ int tcp_exec_req_rules(struct session *s)
 				result = 0;
 				break;
 			}
-			else if ((rule->action == TCP_ACT_TRK_SC1 && !s->stkctr[0].entry) ||
-			         (rule->action == TCP_ACT_TRK_SC2 && !s->stkctr[1].entry)) {
+			else if ((rule->action >= TCP_ACT_TRK_SC0 && rule->action <= TCP_ACT_TRK_SCMAX) &&
+				 !s->stkctr[tcp_trk_idx(rule->action)].entry) {
 				/* Note: only the first valid tracking parameter of each
 				 * applies.
 				 */
@@ -1024,12 +1102,12 @@ int tcp_exec_req_rules(struct session *s)
 				t = rule->act_prm.trk_ctr.table.t;
 				key = stktable_fetch_key(t, s->be, s, &s->txn, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->act_prm.trk_ctr.expr);
 
-				if (key && (ts = stktable_get_entry(t, key))) {
-					if (rule->action == TCP_ACT_TRK_SC1)
-						session_track_stkctr(&s->stkctr[0], t, ts);
-					else
-						session_track_stkctr(&s->stkctr[1], t, ts);
-				}
+				if (key && (ts = stktable_get_entry(t, key)))
+					session_track_stkctr(&s->stkctr[tcp_trk_idx(rule->action)], t, ts);
+			}
+			else if (rule->action == TCP_ACT_EXPECT_PX) {
+				s->si[0].conn->flags |= CO_FL_ACCEPT_PROXY;
+				conn_sock_want_recv(s->si[0].conn);
 			}
 			else {
 				/* otherwise it's an accept */
@@ -1106,7 +1184,9 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 		arg++;
 		rule->action = TCP_ACT_REJECT;
 	}
-	else if (strcmp(args[arg], "track-sc1") == 0 || strcmp(args[arg], "track-sc2") == 0) {
+	else if (strncmp(args[arg], "track-sc", 8) == 0 &&
+		 args[arg][9] == '\0' && args[arg][8] >= '0' &&
+		 args[arg][8] <= '0' + MAX_SESS_STKCTR) { /* track-sc 0..9 */
 		struct sample_expr *expr;
 		int kw = arg;
 
@@ -1124,7 +1204,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 		if (!(expr->fetch->val & where)) {
 			memprintf(err,
 			          "'%s %s %s' : fetch method '%s' extracts information from '%s', none of which is available here",
-			          args[0], args[1], args[kw], args[arg], sample_src_names(expr->fetch->use));
+			          args[0], args[1], args[kw], args[arg-1], sample_src_names(expr->fetch->use));
 			free(expr);
 			return -1;
 		}
@@ -1146,17 +1226,31 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 			arg++;
 		}
 		rule->act_prm.trk_ctr.expr = expr;
+		rule->action = TCP_ACT_TRK_SC0 + args[kw][8] - '0';
+	}
+	else if (strcmp(args[arg], "expect-proxy") == 0) {
+		if (strcmp(args[arg+1], "layer4") != 0) {
+			memprintf(err,
+				  "'%s %s %s' only supports 'layer4' in %s '%s' (got '%s')",
+				  args[0], args[1], args[arg], proxy_type_str(curpx), curpx->id, args[arg+1]);
+			return -1;
+		}
 
-		if (args[kw][8] == '1')
-			rule->action = TCP_ACT_TRK_SC1;
-		else
-			rule->action = TCP_ACT_TRK_SC2;
+		if (!(where & SMP_VAL_FE_CON_ACC)) {
+			memprintf(err,
+				  "'%s %s' is not allowed in '%s %s' rules in %s '%s'",
+				  args[arg], args[arg+1], args[0], args[1], proxy_type_str(curpx), curpx->id);
+			return -1;
+		}
+
+		arg += 2;
+		rule->action = TCP_ACT_EXPECT_PX;
 	}
 	else {
 		memprintf(err,
-		          "'%s %s' expects 'accept', 'reject', 'track-sc1' "
-		          "or 'track-sc2' in %s '%s' (got '%s')",
-		          args[0], args[1], proxy_type_str(curpx), curpx->id, args[arg]);
+		          "'%s %s' expects 'accept', 'reject', 'track-sc0' ... 'track-sc%d' "
+		          " in %s '%s' (got '%s')",
+		          args[0], args[1], MAX_SESS_STKCTR, proxy_type_str(curpx), curpx->id, args[arg]);
 		return -1;
 	}
 
@@ -1429,7 +1523,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		else
 			memprintf(err,
 			          "'%s' expects 'inspect-delay', 'connection', or 'content' in %s '%s' (got '%s')",
-			          args[0], args[1], proxy_type_str(curpx), curpx->id);
+			          args[0], proxy_type_str(curpx), curpx->id, args[1]);
 		goto error;
 	}
 
@@ -1447,7 +1541,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 /* fetch the connection's source IPv4/IPv6 address */
 static int
 smp_fetch_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-              const struct arg *args, struct sample *smp)
+              const struct arg *args, struct sample *smp, const char *kw)
 {
 	switch (l4->si[0].conn->addr.from.ss_family) {
 	case AF_INET:
@@ -1469,7 +1563,7 @@ smp_fetch_src(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 /* set temp integer to the connection's source port */
 static int
 smp_fetch_sport(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	smp->type = SMP_T_UINT;
 	if (!(smp->data.uint = get_host_port(&l4->si[0].conn->addr.from)))
@@ -1482,7 +1576,7 @@ smp_fetch_sport(struct proxy *px, struct session *l4, void *l7, unsigned int opt
 /* fetch the connection's destination IPv4/IPv6 address */
 static int
 smp_fetch_dst(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-              const struct arg *args, struct sample *smp)
+              const struct arg *args, struct sample *smp, const char *kw)
 {
 	conn_get_to_addr(l4->si[0].conn);
 
@@ -1506,7 +1600,7 @@ smp_fetch_dst(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
 /* set temp integer to the frontend connexion's destination port */
 static int
 smp_fetch_dport(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp)
+                const struct arg *args, struct sample *smp, const char *kw)
 {
 	conn_get_to_addr(l4->si[0].conn);
 
@@ -1546,7 +1640,7 @@ static int bind_parse_v6only(char **args, int cur_arg, struct proxy *px, struct 
 }
 #endif
 
-#ifdef CONFIG_HAP_LINUX_TPROXY
+#ifdef CONFIG_HAP_TRANSPARENT
 /* parse the "transparent" bind keyword */
 static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
@@ -1639,7 +1733,7 @@ static int bind_parse_interface(char **args, int cur_arg, struct proxy *px, stru
 }
 #endif
 
-static struct cfg_kw_list cfg_kws = {{ },{
+static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "tcp-request",  tcp_parse_tcp_req },
 	{ CFG_LISTEN, "tcp-response", tcp_parse_tcp_rep },
 	{ 0, NULL, NULL },
@@ -1649,11 +1743,7 @@ static struct cfg_kw_list cfg_kws = {{ },{
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
-static struct acl_kw_list acl_kws = {{ },{
-	{ "dst",      NULL, acl_parse_ip,  acl_match_ip  },
-	{ "dst_port", NULL, acl_parse_int, acl_match_int },
-	{ "src",      NULL, acl_parse_ip,  acl_match_ip  },
-	{ "src_port", NULL, acl_parse_int, acl_match_int },
+static struct acl_kw_list acl_kws = {ILH, {
 	{ /* END */ },
 }};
 
@@ -1663,7 +1753,7 @@ static struct acl_kw_list acl_kws = {{ },{
  * common denominator, the type that can be casted into all other ones. For
  * instance v4/v6 must be declared v4.
  */
-static struct sample_fetch_kw_list sample_fetch_keywords = {{ },{
+static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "dst",      smp_fetch_dst,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
 	{ "dst_port", smp_fetch_dport, 0, NULL, SMP_T_UINT, SMP_USE_L4CLI },
 	{ "src",      smp_fetch_src,   0, NULL, SMP_T_IPV4, SMP_USE_L4CLI },
@@ -1695,7 +1785,7 @@ static struct bind_kw_list bind_kws = { "TCP", { }, {
 #ifdef TCP_FASTOPEN
 	{ "tfo",           bind_parse_tfo,          0 }, /* enable TCP_FASTOPEN of listening socket */
 #endif
-#ifdef CONFIG_HAP_LINUX_TPROXY
+#ifdef CONFIG_HAP_TRANSPARENT
 	{ "transparent",   bind_parse_transparent,  0 }, /* transparently bind to the specified addresses */
 #endif
 #ifdef IPV6_V6ONLY

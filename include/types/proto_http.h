@@ -236,6 +236,7 @@ enum {
 	HTTP_AUTH_DIGEST,
 };
 
+/* actions for "http-request" */
 enum {
 	HTTP_REQ_ACT_UNKNOWN = 0,
 	HTTP_REQ_ACT_ALLOW,
@@ -245,7 +246,25 @@ enum {
 	HTTP_REQ_ACT_ADD_HDR,
 	HTTP_REQ_ACT_SET_HDR,
 	HTTP_REQ_ACT_REDIR,
+	HTTP_REQ_ACT_SET_NICE,
+	HTTP_REQ_ACT_SET_LOGL,
+	HTTP_REQ_ACT_SET_TOS,
+	HTTP_REQ_ACT_SET_MARK,
 	HTTP_REQ_ACT_MAX /* must always be last */
+};
+
+/* actions for "http-response" */
+enum {
+	HTTP_RES_ACT_UNKNOWN = 0,
+	HTTP_RES_ACT_ALLOW,
+	HTTP_RES_ACT_DENY,
+	HTTP_RES_ACT_ADD_HDR,
+	HTTP_RES_ACT_SET_HDR,
+	HTTP_RES_ACT_SET_NICE,
+	HTTP_RES_ACT_SET_LOGL,
+	HTTP_RES_ACT_SET_TOS,
+	HTTP_RES_ACT_SET_MARK,
+	HTTP_RES_ACT_MAX /* must always be last */
 };
 
 /*
@@ -357,6 +376,27 @@ struct http_req_rule {
 			struct list fmt;       /* log-format compatible expression */
 		} hdr_add;                     /* args used by "add-header" and "set-header" */
 		struct redirect_rule *redir;   /* redirect rule or "http-request redirect" */
+		int nice;                      /* nice value for HTTP_REQ_ACT_SET_NICE */
+		int loglevel;                  /* log-level value for HTTP_REQ_ACT_SET_LOGL */
+		int tos;                       /* tos value for HTTP_REQ_ACT_SET_TOS */
+		int mark;                      /* nfmark value for HTTP_REQ_ACT_SET_MARK */
+	} arg;                                 /* arguments used by some actions */
+};
+
+struct http_res_rule {
+	struct list list;
+	struct acl_cond *cond;                 /* acl condition to meet */
+	unsigned int action;                   /* HTTP_RES_* */
+	union {
+		struct {
+			char *name;            /* header name */
+			int name_len;          /* header name's length */
+			struct list fmt;       /* log-format compatible expression */
+		} hdr_add;                     /* args used by "add-header" and "set-header" */
+		int nice;                      /* nice value for HTTP_RES_ACT_SET_NICE */
+		int loglevel;                  /* log-level value for HTTP_RES_ACT_SET_LOGL */
+		int tos;                       /* tos value for HTTP_RES_ACT_SET_TOS */
+		int mark;                      /* nfmark value for HTTP_RES_ACT_SET_MARK */
 	} arg;                                 /* arguments used by some actions */
 };
 
